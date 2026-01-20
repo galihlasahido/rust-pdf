@@ -2,6 +2,7 @@
 
 use crate::content::ContentBuilder;
 use crate::font::{Font, Standard14Font};
+use crate::forms::{FormField, FormFieldTrait};
 #[cfg(feature = "images")]
 use crate::image::Image;
 use crate::object::PdfStream;
@@ -19,6 +20,8 @@ pub struct Page {
     pub images: Vec<(String, Image)>,
     /// The content stream operators.
     pub content: ContentBuilder,
+    /// Form fields on this page.
+    pub form_fields: Vec<FormField>,
 }
 
 impl Page {
@@ -30,6 +33,7 @@ impl Page {
             #[cfg(feature = "images")]
             images: Vec::new(),
             content: ContentBuilder::new(),
+            form_fields: Vec::new(),
         }
     }
 
@@ -55,6 +59,21 @@ impl Page {
     #[cfg(feature = "images")]
     pub fn add_image(&mut self, name: impl Into<String>, image: Image) {
         self.images.push((name.into(), image));
+    }
+
+    /// Adds a form field to the page.
+    pub fn add_form_field(&mut self, field: FormField) {
+        self.form_fields.push(field);
+    }
+
+    /// Returns whether the page has form fields.
+    pub fn has_form_fields(&self) -> bool {
+        !self.form_fields.is_empty()
+    }
+
+    /// Returns the form fields on this page.
+    pub fn form_fields(&self) -> &[FormField] {
+        &self.form_fields
     }
 
     /// Sets the content builder for this page.
@@ -92,6 +111,7 @@ pub struct PageBuilder {
     #[cfg(feature = "images")]
     images: Vec<(String, Image)>,
     content: Option<ContentBuilder>,
+    form_fields: Vec<FormField>,
 }
 
 impl PageBuilder {
@@ -103,6 +123,7 @@ impl PageBuilder {
             #[cfg(feature = "images")]
             images: Vec::new(),
             content: None,
+            form_fields: Vec::new(),
         }
     }
 
@@ -195,6 +216,44 @@ impl PageBuilder {
         self
     }
 
+    /// Adds a form field to the page.
+    ///
+    /// The field can be any type that implements `FormFieldTrait`.
+    pub fn form_field<F: FormFieldTrait>(mut self, field: F) -> Self {
+        self.form_fields.push(field.to_form_field());
+        self
+    }
+
+    /// Adds a text field to the page.
+    pub fn text_field(self, field: crate::forms::TextField) -> Self {
+        self.form_field(field)
+    }
+
+    /// Adds a checkbox to the page.
+    pub fn checkbox(self, field: crate::forms::CheckBox) -> Self {
+        self.form_field(field)
+    }
+
+    /// Adds a radio group to the page.
+    pub fn radio_group(self, group: crate::forms::RadioGroup) -> Self {
+        self.form_field(group)
+    }
+
+    /// Adds a combo box to the page.
+    pub fn combo_box(self, field: crate::forms::ComboBox) -> Self {
+        self.form_field(field)
+    }
+
+    /// Adds a list box to the page.
+    pub fn list_box(self, field: crate::forms::ListBox) -> Self {
+        self.form_field(field)
+    }
+
+    /// Adds a push button to the page.
+    pub fn push_button(self, field: crate::forms::PushButton) -> Self {
+        self.form_field(field)
+    }
+
     /// Builds the page.
     pub fn build(self) -> Page {
         Page {
@@ -203,6 +262,7 @@ impl PageBuilder {
             #[cfg(feature = "images")]
             images: self.images,
             content: self.content.unwrap_or_default(),
+            form_fields: self.form_fields,
         }
     }
 }

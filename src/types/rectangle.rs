@@ -75,6 +75,14 @@ impl Rectangle {
     pub fn to_array(&self) -> [f64; 4] {
         [self.llx, self.lly, self.urx, self.ury]
     }
+
+    /// Returns a rectangle with the same dimensions but positioned at origin (0, 0).
+    ///
+    /// This is useful for creating appearance streams where the coordinate system
+    /// starts at (0, 0).
+    pub fn with_origin(&self) -> Self {
+        Self::from_dimensions(self.width(), self.height())
+    }
 }
 
 impl Default for Rectangle {

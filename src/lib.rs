@@ -65,6 +65,7 @@ pub mod document;
 pub mod encryption;
 pub mod error;
 pub mod font;
+pub mod forms;
 #[cfg(feature = "images")]
 pub mod image;
 pub mod object;
@@ -83,7 +84,7 @@ pub mod ffi;
 pub use color::{CmykColor, Color, GrayColor, RgbColor};
 pub use content::{ContentBuilder, GraphicsBuilder, Operator, TextBuilder, TextElement};
 pub use document::{Document, DocumentBuilder, DocumentInfo, PdfVersion};
-pub use error::{ContentError, DocumentError, ObjectError, PdfError, PdfResult, WriterError};
+pub use error::{ContentError, DocumentError, FormError, ObjectError, PdfError, PdfResult, WriterError};
 #[cfg(feature = "compression")]
 pub use error::CompressionError;
 #[cfg(feature = "images")]
@@ -99,6 +100,10 @@ pub use encryption::{EncryptionConfig, EncryptionHandler, Permissions};
 #[cfg(feature = "signatures")]
 pub use signatures::{ByteRange, Certificate, DocumentSigner, PrivateKey, SignatureAlgorithm, SignatureConfig, SignatureInfo};
 pub use font::{Font, FontMetrics, Standard14Font};
+pub use forms::{
+    AppearanceBuilder, BorderStyle, CheckBox, ComboBox, FieldFlags, FormField, FormFieldTrait,
+    FormFieldType, ListBox, PushButton, RadioButton, RadioGroup, TextField,
+};
 #[cfg(feature = "images")]
 pub use image::{ColorSpace, Image, ImageFilter, ImageXObject};
 #[cfg(feature = "parser")]
@@ -136,6 +141,10 @@ pub mod prelude {
     #[cfg(feature = "signatures")]
     pub use crate::signatures::{ByteRange, Certificate, DocumentSigner, PrivateKey, SignatureAlgorithm, SignatureConfig, SignatureInfo};
     pub use crate::font::{Font, FontMetrics, Standard14Font};
+    pub use crate::forms::{
+        AppearanceBuilder, BorderStyle, CheckBox, ComboBox, FieldFlags, FormField,
+        FormFieldTrait, FormFieldType, ListBox, PushButton, RadioButton, RadioGroup, TextField,
+    };
     #[cfg(feature = "images")]
     pub use crate::image::{ColorSpace, Image, ImageFilter, ImageXObject};
     pub use crate::object::{Object, PdfArray, PdfDictionary, PdfName, PdfStream, PdfString};

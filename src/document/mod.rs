@@ -7,7 +7,8 @@ pub use info::{DocumentInfo, DocumentInfoBuilder};
 pub use version::PdfVersion;
 
 use crate::error::{DocumentError, PdfResult};
-use crate::object::{Object, PdfArray, PdfDictionary, PdfName};
+use crate::forms::{AppearanceBuilder, FormField, FormFieldType};
+use crate::object::{Object, PdfArray, PdfDictionary, PdfName, PdfStream, PdfString};
 use crate::page::Page;
 use crate::types::ObjectId;
 use crate::writer::PdfWriter;
@@ -142,6 +143,55 @@ impl Document {
             }
         }
 
+        // Check if any page has form fields
+        let has_forms = self.pages.iter().any(|p| p.has_form_fields());
+
+        // Allocate AcroForm ID if needed
+        let acroform_id = if has_forms {
+            Some(pdf_writer.allocate_id())
+        } else {
+            None
+        };
+
+        // Allocate form field and widget IDs for each page
+        // Structure: Vec<Vec<(field_id, appearance_normal_id, appearance_down_id_opt)>>
+        let mut form_field_ids: Vec<Vec<FormFieldIds>> = Vec::new();
+        for page in &self.pages {
+            let mut page_field_ids = Vec::new();
+            for field in page.form_fields() {
+                let field_id = pdf_writer.allocate_id();
+                let ap_normal_id = pdf_writer.allocate_id();
+
+                // For checkboxes, radio buttons, we need both on and off appearances
+                let ap_down_id = match field.field_type {
+                    FormFieldType::CheckBox | FormFieldType::RadioButton => {
+                        Some(pdf_writer.allocate_id())
+                    }
+                    _ => None,
+                };
+
+                // For radio groups, allocate IDs for each button's widget
+                let radio_widget_ids: Vec<(ObjectId, ObjectId, ObjectId)> = if field.field_type == FormFieldType::RadioButton {
+                    field.radio_buttons.iter().map(|_| {
+                        let widget_id = pdf_writer.allocate_id();
+                        let ap_on = pdf_writer.allocate_id();
+                        let ap_off = pdf_writer.allocate_id();
+                        (widget_id, ap_on, ap_off)
+                    }).collect()
+                } else {
+                    Vec::new()
+                };
+
+                page_field_ids.push(FormFieldIds {
+                    field_id,
+                    ap_normal_id,
+                    ap_down_id,
+                    radio_widget_ids,
+                });
+            }
+            form_field_ids.push(page_field_ids);
+        }
+
         // Allocate info object ID if we have metadata
         let info_id = if !self.info.is_empty() {
             Some(pdf_writer.allocate_id())
@@ -161,6 +211,12 @@ impl Document {
         let mut catalog = PdfDictionary::new();
         catalog.set("Type", Object::Name(PdfName::catalog()));
         catalog.set("Pages", Object::Reference(pages_id));
+
+        // Add AcroForm reference if forms exist
+        if let Some(acroform_id) = acroform_id {
+            catalog.set("AcroForm", Object::Reference(acroform_id));
+        }
+
         pdf_writer.write_object_with_id(catalog_id, &Object::Dictionary(catalog))?;
 
         // Write pages tree
@@ -229,6 +285,24 @@ impl Document {
             // Contents
             page_dict.set("Contents", Object::Reference(content_id));
 
+            // Annotations (form fields) - Note: For radio groups, we add each button widget
+            let page_form_ids = &form_field_ids[i];
+            if !page_form_ids.is_empty() {
+                let mut annots = PdfArray::new();
+                for field_ids in page_form_ids {
+                    if !field_ids.radio_widget_ids.is_empty() {
+                        // Radio group: add each button widget as annotation
+                        for (widget_id, _, _) in &field_ids.radio_widget_ids {
+                            annots.push(Object::Reference(*widget_id));
+                        }
+                    } else {
+                        // Regular field: field itself is the widget
+                        annots.push(Object::Reference(field_ids.field_id));
+                    }
+                }
+                page_dict.set("Annots", Object::Array(annots));
+            }
+
             pdf_writer.write_object_with_id(page_id, &Object::Dictionary(page_dict))?;
 
             // Write content stream (with optional compression)
@@ -266,6 +340,57 @@ impl Document {
                     pdf_writer.write_object_with_id(*image_id, &Object::Stream(xobject.stream))?;
                 }
             }
+
+            // Write form field dictionaries and appearances for this page
+            let page_form_ids = &form_field_ids[i];
+            for (j, field_ids) in page_form_ids.iter().enumerate() {
+                let field = &page.form_fields[j];
+                write_form_field(&mut pdf_writer, field, field_ids, page_id)?;
+            }
+        }
+
+        // Write AcroForm dictionary if forms exist
+        if let Some(acroform_id) = acroform_id {
+            let mut acroform = PdfDictionary::new();
+
+            // Collect all field references
+            let mut fields = PdfArray::new();
+            for page_field_ids in &form_field_ids {
+                for field_ids in page_field_ids {
+                    fields.push(Object::Reference(field_ids.field_id));
+                }
+            }
+            acroform.set("Fields", Object::Array(fields));
+
+            // Default appearance string (DA)
+            acroform.set("DA", Object::String(PdfString::literal("/Helv 12 Tf 0 g")));
+
+            // Default resources for form fields
+            let mut dr = PdfDictionary::new();
+            let mut font_dict = PdfDictionary::new();
+
+            // Add Helvetica as default form font
+            let mut helv = PdfDictionary::new();
+            helv.set("Type", Object::Name(PdfName::new_unchecked("Font")));
+            helv.set("Subtype", Object::Name(PdfName::new_unchecked("Type1")));
+            helv.set("BaseFont", Object::Name(PdfName::new_unchecked("Helvetica")));
+            helv.set("Encoding", Object::Name(PdfName::new_unchecked("WinAnsiEncoding")));
+            font_dict.set("Helv", Object::Dictionary(helv));
+
+            // Add ZapfDingbats for checkmarks
+            let mut zadb = PdfDictionary::new();
+            zadb.set("Type", Object::Name(PdfName::new_unchecked("Font")));
+            zadb.set("Subtype", Object::Name(PdfName::new_unchecked("Type1")));
+            zadb.set("BaseFont", Object::Name(PdfName::new_unchecked("ZapfDingbats")));
+            font_dict.set("ZaDb", Object::Dictionary(zadb));
+
+            dr.set("Font", Object::Dictionary(font_dict));
+            acroform.set("DR", Object::Dictionary(dr));
+
+            // NeedAppearances flag - let viewer generate appearances if needed
+            acroform.set("NeedAppearances", Object::Boolean(false));
+
+            pdf_writer.write_object_with_id(acroform_id, &Object::Dictionary(acroform))?;
         }
 
         // Write info dictionary if present
@@ -440,6 +565,691 @@ impl DocumentBuilder {
             encryption: self.encryption,
         })
     }
+}
+
+/// Helper struct for tracking form field object IDs.
+struct FormFieldIds {
+    field_id: ObjectId,
+    ap_normal_id: ObjectId,
+    ap_down_id: Option<ObjectId>,
+    radio_widget_ids: Vec<(ObjectId, ObjectId, ObjectId)>, // (widget_id, ap_on, ap_off)
+}
+
+/// Writes a form field and its appearances to the PDF.
+fn write_form_field<W: Write>(
+    pdf_writer: &mut PdfWriter<W>,
+    field: &FormField,
+    ids: &FormFieldIds,
+    page_id: ObjectId,
+) -> PdfResult<()> {
+    match field.field_type {
+        FormFieldType::Text => {
+            write_text_field(pdf_writer, field, ids, page_id)?;
+        }
+        FormFieldType::CheckBox => {
+            write_checkbox(pdf_writer, field, ids, page_id)?;
+        }
+        FormFieldType::RadioButton => {
+            write_radio_group(pdf_writer, field, ids, page_id)?;
+        }
+        FormFieldType::ComboBox => {
+            write_combobox(pdf_writer, field, ids, page_id)?;
+        }
+        FormFieldType::ListBox => {
+            write_listbox(pdf_writer, field, ids, page_id)?;
+        }
+        FormFieldType::PushButton => {
+            write_pushbutton(pdf_writer, field, ids, page_id)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Writes a text field.
+fn write_text_field<W: Write>(
+    pdf_writer: &mut PdfWriter<W>,
+    field: &FormField,
+    ids: &FormFieldIds,
+    page_id: ObjectId,
+) -> PdfResult<()> {
+    let mut dict = PdfDictionary::new();
+
+    // Required entries
+    dict.set("Type", Object::Name(PdfName::new_unchecked("Annot")));
+    dict.set("Subtype", Object::Name(PdfName::new_unchecked("Widget")));
+    dict.set("FT", Object::Name(PdfName::new_unchecked("Tx")));
+    dict.set("T", Object::String(PdfString::literal(&field.name)));
+    dict.set("P", Object::Reference(page_id));
+
+    // Rectangle
+    let rect_array = rect_to_array(&field.rect);
+    dict.set("Rect", Object::Array(rect_array));
+
+    // Flags
+    dict.set("Ff", Object::Integer(field.flags.bits() as i64));
+
+    // Field flags (annotation)
+    dict.set("F", Object::Integer(4)); // Print flag
+
+    // Default value
+    if let Some(ref dv) = field.default_value {
+        dict.set("DV", Object::String(PdfString::literal(dv)));
+    }
+
+    // Current value
+    if let Some(ref v) = field.value {
+        dict.set("V", Object::String(PdfString::literal(v)));
+    }
+
+    // Max length
+    if let Some(max_len) = field.max_length {
+        dict.set("MaxLen", Object::Integer(max_len as i64));
+    }
+
+    // Default appearance
+    let da = format!("/Helv {} Tf {} g",
+        field.font_size,
+        if let crate::color::Color::Gray(g) = &field.text_color { g.level } else { 0.0 }
+    );
+    dict.set("DA", Object::String(PdfString::literal(da)));
+
+    // Border style
+    let mut bs = PdfDictionary::new();
+    bs.set("Type", Object::Name(PdfName::new_unchecked("Border")));
+    bs.set("W", Object::Real(field.border_width));
+    bs.set("S", Object::Name(PdfName::new_unchecked(field.border_style.pdf_code())));
+    dict.set("BS", Object::Dictionary(bs));
+
+    // Appearance characteristics
+    let mut mk = PdfDictionary::new();
+    if let Some(ref bg) = field.background_color {
+        mk.set("BG", color_to_array(bg));
+    }
+    if let Some(ref bc) = field.border_color {
+        mk.set("BC", color_to_array(bc));
+    }
+    if !mk.is_empty() {
+        dict.set("MK", Object::Dictionary(mk));
+    }
+
+    // Build and set appearance
+    let builder = AppearanceBuilder::new(field.rect.with_origin())
+        .background_color(field.background_color.unwrap_or(crate::color::Color::WHITE))
+        .border_color(field.border_color.unwrap_or(crate::color::Color::BLACK))
+        .border_style(field.border_style)
+        .border_width(field.border_width);
+
+    let ap_stream = builder.build_text_appearance(
+        field.value.as_deref(),
+        "Helv",
+        field.font_size,
+        field.text_color,
+    );
+
+    // Create appearance stream
+    let mut ap_dict = PdfDictionary::new();
+    ap_dict.set("N", Object::Reference(ids.ap_normal_id));
+    dict.set("AP", Object::Dictionary(ap_dict));
+
+    // Write field dictionary
+    pdf_writer.write_object_with_id(ids.field_id, &Object::Dictionary(dict))?;
+
+    // Write appearance stream
+    let stream = create_appearance_stream(&ap_stream, &field.rect.with_origin());
+    pdf_writer.write_object_with_id(ids.ap_normal_id, &Object::Stream(stream))?;
+
+    Ok(())
+}
+
+/// Writes a checkbox field.
+fn write_checkbox<W: Write>(
+    pdf_writer: &mut PdfWriter<W>,
+    field: &FormField,
+    ids: &FormFieldIds,
+    page_id: ObjectId,
+) -> PdfResult<()> {
+    let mut dict = PdfDictionary::new();
+
+    // Required entries
+    dict.set("Type", Object::Name(PdfName::new_unchecked("Annot")));
+    dict.set("Subtype", Object::Name(PdfName::new_unchecked("Widget")));
+    dict.set("FT", Object::Name(PdfName::new_unchecked("Btn")));
+    dict.set("T", Object::String(PdfString::literal(&field.name)));
+    dict.set("P", Object::Reference(page_id));
+
+    // Rectangle
+    let rect_array = rect_to_array(&field.rect);
+    dict.set("Rect", Object::Array(rect_array));
+
+    // Field flags (annotation)
+    dict.set("F", Object::Integer(4)); // Print flag
+
+    // Value - checked state
+    let export_value = field.export_value.as_deref().unwrap_or("Yes");
+    if field.checked {
+        dict.set("V", Object::Name(PdfName::new_unchecked(export_value)));
+        dict.set("AS", Object::Name(PdfName::new_unchecked(export_value)));
+    } else {
+        dict.set("V", Object::Name(PdfName::new_unchecked("Off")));
+        dict.set("AS", Object::Name(PdfName::new_unchecked("Off")));
+    }
+
+    // Border style
+    let mut bs = PdfDictionary::new();
+    bs.set("Type", Object::Name(PdfName::new_unchecked("Border")));
+    bs.set("W", Object::Real(field.border_width));
+    bs.set("S", Object::Name(PdfName::new_unchecked(field.border_style.pdf_code())));
+    dict.set("BS", Object::Dictionary(bs));
+
+    // Appearance characteristics
+    let mut mk = PdfDictionary::new();
+    if let Some(ref bg) = field.background_color {
+        mk.set("BG", color_to_array(bg));
+    }
+    if let Some(ref bc) = field.border_color {
+        mk.set("BC", color_to_array(bc));
+    }
+    mk.set("CA", Object::String(PdfString::literal("4"))); // Checkmark character
+    dict.set("MK", Object::Dictionary(mk));
+
+    // Build appearances
+    let builder = AppearanceBuilder::new(field.rect.with_origin())
+        .background_color(field.background_color.unwrap_or(crate::color::Color::WHITE))
+        .border_color(field.border_color.unwrap_or(crate::color::Color::BLACK))
+        .border_style(field.border_style)
+        .border_width(field.border_width);
+
+    let checked_stream = builder.build_checkbox_checked(field.text_color);
+    let unchecked_stream = builder.build_checkbox_unchecked();
+
+    // Create appearance dictionary with both states
+    let mut ap_dict = PdfDictionary::new();
+    let mut n_dict = PdfDictionary::new();
+    n_dict.set(export_value, Object::Reference(ids.ap_normal_id));
+    if let Some(ap_down_id) = ids.ap_down_id {
+        n_dict.set("Off", Object::Reference(ap_down_id));
+    }
+    ap_dict.set("N", Object::Dictionary(n_dict));
+    dict.set("AP", Object::Dictionary(ap_dict));
+
+    // Write field dictionary
+    pdf_writer.write_object_with_id(ids.field_id, &Object::Dictionary(dict))?;
+
+    // Write appearance streams
+    let stream_checked = create_appearance_stream(&checked_stream, &field.rect.with_origin());
+    pdf_writer.write_object_with_id(ids.ap_normal_id, &Object::Stream(stream_checked))?;
+
+    if let Some(ap_down_id) = ids.ap_down_id {
+        let stream_unchecked = create_appearance_stream(&unchecked_stream, &field.rect.with_origin());
+        pdf_writer.write_object_with_id(ap_down_id, &Object::Stream(stream_unchecked))?;
+    }
+
+    Ok(())
+}
+
+/// Writes a radio button group.
+fn write_radio_group<W: Write>(
+    pdf_writer: &mut PdfWriter<W>,
+    field: &FormField,
+    ids: &FormFieldIds,
+    page_id: ObjectId,
+) -> PdfResult<()> {
+    // Parent field dictionary (the group)
+    let mut parent_dict = PdfDictionary::new();
+    parent_dict.set("FT", Object::Name(PdfName::new_unchecked("Btn")));
+    parent_dict.set("T", Object::String(PdfString::literal(&field.name)));
+
+    // Radio button flags
+    let flags = field.flags.bits() as i64;
+    parent_dict.set("Ff", Object::Integer(flags));
+
+    // Kids array (references to widget annotations)
+    let mut kids = PdfArray::new();
+    for (widget_id, _, _) in &ids.radio_widget_ids {
+        kids.push(Object::Reference(*widget_id));
+    }
+    parent_dict.set("Kids", Object::Array(kids));
+
+    // Selected value
+    let selected_idx = field.selected_indices.first().copied();
+    if let Some(idx) = selected_idx {
+        if idx < field.radio_buttons.len() {
+            let value = field.radio_buttons[idx].get_export_value();
+            parent_dict.set("V", Object::Name(PdfName::new_unchecked(value)));
+        }
+    } else {
+        parent_dict.set("V", Object::Name(PdfName::new_unchecked("Off")));
+    }
+
+    // Write parent dictionary
+    pdf_writer.write_object_with_id(ids.field_id, &Object::Dictionary(parent_dict))?;
+
+    // Write each button widget
+    for (i, ((widget_id, ap_on_id, ap_off_id), button)) in ids.radio_widget_ids.iter().zip(field.radio_buttons.iter()).enumerate() {
+        let mut widget_dict = PdfDictionary::new();
+
+        widget_dict.set("Type", Object::Name(PdfName::new_unchecked("Annot")));
+        widget_dict.set("Subtype", Object::Name(PdfName::new_unchecked("Widget")));
+        widget_dict.set("Parent", Object::Reference(ids.field_id));
+        widget_dict.set("P", Object::Reference(page_id));
+
+        // Rectangle
+        let button_rect = button.get_rect();
+        let rect_array = rect_to_array(&button_rect);
+        widget_dict.set("Rect", Object::Array(rect_array));
+
+        // Annotation flags
+        widget_dict.set("F", Object::Integer(4)); // Print flag
+
+        // Appearance state
+        let export_value = button.get_export_value();
+        if selected_idx == Some(i) {
+            widget_dict.set("AS", Object::Name(PdfName::new_unchecked(export_value)));
+        } else {
+            widget_dict.set("AS", Object::Name(PdfName::new_unchecked("Off")));
+        }
+
+        // Border style
+        let mut bs = PdfDictionary::new();
+        bs.set("Type", Object::Name(PdfName::new_unchecked("Border")));
+        bs.set("W", Object::Real(field.border_width));
+        bs.set("S", Object::Name(PdfName::new_unchecked(field.border_style.pdf_code())));
+        widget_dict.set("BS", Object::Dictionary(bs));
+
+        // Appearance characteristics
+        let mut mk = PdfDictionary::new();
+        if let Some(ref bg) = field.background_color {
+            mk.set("BG", color_to_array(bg));
+        }
+        if let Some(ref bc) = field.border_color {
+            mk.set("BC", color_to_array(bc));
+        }
+        widget_dict.set("MK", Object::Dictionary(mk));
+
+        // Build appearances
+        let builder = AppearanceBuilder::new(button_rect.with_origin())
+            .background_color(field.background_color.unwrap_or(crate::color::Color::WHITE))
+            .border_color(field.border_color.unwrap_or(crate::color::Color::BLACK))
+            .border_style(field.border_style)
+            .border_width(field.border_width);
+
+        let selected_stream = builder.build_radio_selected(field.text_color);
+        let unselected_stream = builder.build_radio_unselected();
+
+        // Create appearance dictionary
+        let mut ap_dict = PdfDictionary::new();
+        let mut n_dict = PdfDictionary::new();
+        n_dict.set(export_value, Object::Reference(*ap_on_id));
+        n_dict.set("Off", Object::Reference(*ap_off_id));
+        ap_dict.set("N", Object::Dictionary(n_dict));
+        widget_dict.set("AP", Object::Dictionary(ap_dict));
+
+        // Write widget dictionary
+        pdf_writer.write_object_with_id(*widget_id, &Object::Dictionary(widget_dict))?;
+
+        // Write appearance streams
+        let stream_on = create_appearance_stream(&selected_stream, &button_rect.with_origin());
+        pdf_writer.write_object_with_id(*ap_on_id, &Object::Stream(stream_on))?;
+
+        let stream_off = create_appearance_stream(&unselected_stream, &button_rect.with_origin());
+        pdf_writer.write_object_with_id(*ap_off_id, &Object::Stream(stream_off))?;
+    }
+
+    Ok(())
+}
+
+/// Writes a combo box field.
+fn write_combobox<W: Write>(
+    pdf_writer: &mut PdfWriter<W>,
+    field: &FormField,
+    ids: &FormFieldIds,
+    page_id: ObjectId,
+) -> PdfResult<()> {
+    let mut dict = PdfDictionary::new();
+
+    // Required entries
+    dict.set("Type", Object::Name(PdfName::new_unchecked("Annot")));
+    dict.set("Subtype", Object::Name(PdfName::new_unchecked("Widget")));
+    dict.set("FT", Object::Name(PdfName::new_unchecked("Ch")));
+    dict.set("T", Object::String(PdfString::literal(&field.name)));
+    dict.set("P", Object::Reference(page_id));
+
+    // Rectangle
+    let rect_array = rect_to_array(&field.rect);
+    dict.set("Rect", Object::Array(rect_array));
+
+    // Field flags (Combo flag is set)
+    dict.set("Ff", Object::Integer(field.flags.bits() as i64));
+
+    // Annotation flags
+    dict.set("F", Object::Integer(4)); // Print flag
+
+    // Options
+    let mut opt = PdfArray::new();
+    for option in &field.options {
+        opt.push(Object::String(PdfString::literal(option)));
+    }
+    dict.set("Opt", Object::Array(opt));
+
+    // Selected value
+    if let Some(&idx) = field.selected_indices.first() {
+        if idx < field.options.len() {
+            dict.set("V", Object::String(PdfString::literal(&field.options[idx])));
+            dict.set("I", Object::Array({
+                let mut arr = PdfArray::new();
+                arr.push(Object::Integer(idx as i64));
+                arr
+            }));
+        }
+    }
+
+    // Default appearance
+    let da = format!("/Helv {} Tf {} g",
+        field.font_size,
+        if let crate::color::Color::Gray(g) = &field.text_color { g.level } else { 0.0 }
+    );
+    dict.set("DA", Object::String(PdfString::literal(da)));
+
+    // Border style
+    let mut bs = PdfDictionary::new();
+    bs.set("Type", Object::Name(PdfName::new_unchecked("Border")));
+    bs.set("W", Object::Real(field.border_width));
+    bs.set("S", Object::Name(PdfName::new_unchecked(field.border_style.pdf_code())));
+    dict.set("BS", Object::Dictionary(bs));
+
+    // Appearance characteristics
+    let mut mk = PdfDictionary::new();
+    if let Some(ref bg) = field.background_color {
+        mk.set("BG", color_to_array(bg));
+    }
+    if let Some(ref bc) = field.border_color {
+        mk.set("BC", color_to_array(bc));
+    }
+    dict.set("MK", Object::Dictionary(mk));
+
+    // Build appearance
+    let builder = AppearanceBuilder::new(field.rect.with_origin())
+        .background_color(field.background_color.unwrap_or(crate::color::Color::WHITE))
+        .border_color(field.border_color.unwrap_or(crate::color::Color::BLACK))
+        .border_style(field.border_style)
+        .border_width(field.border_width);
+
+    let selected_text = field.selected_indices.first()
+        .and_then(|&idx| field.options.get(idx))
+        .map(|s| s.as_str());
+
+    let ap_stream = builder.build_combobox_appearance(
+        selected_text,
+        "Helv",
+        field.font_size,
+        field.text_color,
+    );
+
+    // Create appearance dictionary
+    let mut ap_dict = PdfDictionary::new();
+    ap_dict.set("N", Object::Reference(ids.ap_normal_id));
+    dict.set("AP", Object::Dictionary(ap_dict));
+
+    // Write field dictionary
+    pdf_writer.write_object_with_id(ids.field_id, &Object::Dictionary(dict))?;
+
+    // Write appearance stream
+    let stream = create_appearance_stream(&ap_stream, &field.rect.with_origin());
+    pdf_writer.write_object_with_id(ids.ap_normal_id, &Object::Stream(stream))?;
+
+    Ok(())
+}
+
+/// Writes a list box field.
+fn write_listbox<W: Write>(
+    pdf_writer: &mut PdfWriter<W>,
+    field: &FormField,
+    ids: &FormFieldIds,
+    page_id: ObjectId,
+) -> PdfResult<()> {
+    let mut dict = PdfDictionary::new();
+
+    // Required entries
+    dict.set("Type", Object::Name(PdfName::new_unchecked("Annot")));
+    dict.set("Subtype", Object::Name(PdfName::new_unchecked("Widget")));
+    dict.set("FT", Object::Name(PdfName::new_unchecked("Ch")));
+    dict.set("T", Object::String(PdfString::literal(&field.name)));
+    dict.set("P", Object::Reference(page_id));
+
+    // Rectangle
+    let rect_array = rect_to_array(&field.rect);
+    dict.set("Rect", Object::Array(rect_array));
+
+    // Field flags (no Combo flag for list box)
+    dict.set("Ff", Object::Integer(field.flags.bits() as i64));
+
+    // Annotation flags
+    dict.set("F", Object::Integer(4)); // Print flag
+
+    // Options
+    let mut opt = PdfArray::new();
+    for option in &field.options {
+        opt.push(Object::String(PdfString::literal(option)));
+    }
+    dict.set("Opt", Object::Array(opt));
+
+    // Selected values
+    if !field.selected_indices.is_empty() {
+        if field.selected_indices.len() == 1 {
+            let idx = field.selected_indices[0];
+            if idx < field.options.len() {
+                dict.set("V", Object::String(PdfString::literal(&field.options[idx])));
+            }
+        } else {
+            let mut v = PdfArray::new();
+            for &idx in &field.selected_indices {
+                if idx < field.options.len() {
+                    v.push(Object::String(PdfString::literal(&field.options[idx])));
+                }
+            }
+            dict.set("V", Object::Array(v));
+        }
+
+        let mut i = PdfArray::new();
+        for &idx in &field.selected_indices {
+            i.push(Object::Integer(idx as i64));
+        }
+        dict.set("I", Object::Array(i));
+    }
+
+    // Default appearance
+    let da = format!("/Helv {} Tf {} g",
+        field.font_size,
+        if let crate::color::Color::Gray(g) = &field.text_color { g.level } else { 0.0 }
+    );
+    dict.set("DA", Object::String(PdfString::literal(da)));
+
+    // Border style
+    let mut bs = PdfDictionary::new();
+    bs.set("Type", Object::Name(PdfName::new_unchecked("Border")));
+    bs.set("W", Object::Real(field.border_width));
+    bs.set("S", Object::Name(PdfName::new_unchecked(field.border_style.pdf_code())));
+    dict.set("BS", Object::Dictionary(bs));
+
+    // Appearance characteristics
+    let mut mk = PdfDictionary::new();
+    if let Some(ref bg) = field.background_color {
+        mk.set("BG", color_to_array(bg));
+    }
+    if let Some(ref bc) = field.border_color {
+        mk.set("BC", color_to_array(bc));
+    }
+    dict.set("MK", Object::Dictionary(mk));
+
+    // Build appearance
+    let builder = AppearanceBuilder::new(field.rect.with_origin())
+        .background_color(field.background_color.unwrap_or(crate::color::Color::WHITE))
+        .border_color(field.border_color.unwrap_or(crate::color::Color::BLACK))
+        .border_style(field.border_style)
+        .border_width(field.border_width);
+
+    let ap_stream = builder.build_listbox_appearance(
+        &field.options,
+        &field.selected_indices,
+        "Helv",
+        field.font_size,
+        field.text_color,
+    );
+
+    // Create appearance dictionary
+    let mut ap_dict = PdfDictionary::new();
+    ap_dict.set("N", Object::Reference(ids.ap_normal_id));
+    dict.set("AP", Object::Dictionary(ap_dict));
+
+    // Write field dictionary
+    pdf_writer.write_object_with_id(ids.field_id, &Object::Dictionary(dict))?;
+
+    // Write appearance stream
+    let stream = create_appearance_stream(&ap_stream, &field.rect.with_origin());
+    pdf_writer.write_object_with_id(ids.ap_normal_id, &Object::Stream(stream))?;
+
+    Ok(())
+}
+
+/// Writes a push button field.
+fn write_pushbutton<W: Write>(
+    pdf_writer: &mut PdfWriter<W>,
+    field: &FormField,
+    ids: &FormFieldIds,
+    page_id: ObjectId,
+) -> PdfResult<()> {
+    let mut dict = PdfDictionary::new();
+
+    // Required entries
+    dict.set("Type", Object::Name(PdfName::new_unchecked("Annot")));
+    dict.set("Subtype", Object::Name(PdfName::new_unchecked("Widget")));
+    dict.set("FT", Object::Name(PdfName::new_unchecked("Btn")));
+    dict.set("T", Object::String(PdfString::literal(&field.name)));
+    dict.set("P", Object::Reference(page_id));
+
+    // Rectangle
+    let rect_array = rect_to_array(&field.rect);
+    dict.set("Rect", Object::Array(rect_array));
+
+    // Field flags (Push button flag)
+    dict.set("Ff", Object::Integer(field.flags.bits() as i64));
+
+    // Annotation flags
+    dict.set("F", Object::Integer(4)); // Print flag
+
+    // Border style
+    let mut bs = PdfDictionary::new();
+    bs.set("Type", Object::Name(PdfName::new_unchecked("Border")));
+    bs.set("W", Object::Real(field.border_width));
+    bs.set("S", Object::Name(PdfName::new_unchecked(field.border_style.pdf_code())));
+    dict.set("BS", Object::Dictionary(bs));
+
+    // Appearance characteristics
+    let mut mk = PdfDictionary::new();
+    if let Some(ref bg) = field.background_color {
+        mk.set("BG", color_to_array(bg));
+    }
+    if let Some(ref bc) = field.border_color {
+        mk.set("BC", color_to_array(bc));
+    }
+    if let Some(ref caption) = field.caption {
+        mk.set("CA", Object::String(PdfString::literal(caption)));
+    }
+    dict.set("MK", Object::Dictionary(mk));
+
+    // Build appearance
+    let builder = AppearanceBuilder::new(field.rect.with_origin())
+        .background_color(field.background_color.unwrap_or(crate::color::Color::gray(0.9)))
+        .border_color(field.border_color.unwrap_or(crate::color::Color::BLACK))
+        .border_style(field.border_style)
+        .border_width(field.border_width);
+
+    let caption = field.caption.as_deref().unwrap_or("Button");
+    let ap_stream = builder.build_button_appearance(
+        caption,
+        "Helv",
+        field.font_size,
+        field.text_color,
+    );
+
+    // Create appearance dictionary
+    let mut ap_dict = PdfDictionary::new();
+    ap_dict.set("N", Object::Reference(ids.ap_normal_id));
+    dict.set("AP", Object::Dictionary(ap_dict));
+
+    // Write field dictionary
+    pdf_writer.write_object_with_id(ids.field_id, &Object::Dictionary(dict))?;
+
+    // Write appearance stream
+    let stream = create_appearance_stream(&ap_stream, &field.rect.with_origin());
+    pdf_writer.write_object_with_id(ids.ap_normal_id, &Object::Stream(stream))?;
+
+    Ok(())
+}
+
+/// Converts a rectangle to a PDF array.
+fn rect_to_array(rect: &crate::types::Rectangle) -> PdfArray {
+    let mut arr = PdfArray::new();
+    arr.push(Object::Real(rect.llx));
+    arr.push(Object::Real(rect.lly));
+    arr.push(Object::Real(rect.urx));
+    arr.push(Object::Real(rect.ury));
+    arr
+}
+
+/// Converts a color to a PDF array.
+fn color_to_array(color: &crate::color::Color) -> Object {
+    let mut arr = PdfArray::new();
+    match color {
+        crate::color::Color::Gray(g) => {
+            arr.push(Object::Real(g.level));
+        }
+        crate::color::Color::Rgb(rgb) => {
+            arr.push(Object::Real(rgb.r));
+            arr.push(Object::Real(rgb.g));
+            arr.push(Object::Real(rgb.b));
+        }
+        crate::color::Color::Cmyk(cmyk) => {
+            arr.push(Object::Real(cmyk.c));
+            arr.push(Object::Real(cmyk.m));
+            arr.push(Object::Real(cmyk.y));
+            arr.push(Object::Real(cmyk.k));
+        }
+    }
+    Object::Array(arr)
+}
+
+/// Creates an appearance stream from content and bounding box.
+fn create_appearance_stream(content: &str, bbox: &crate::types::Rectangle) -> PdfStream {
+    let mut dict = PdfDictionary::new();
+    dict.set("Type", Object::Name(PdfName::new_unchecked("XObject")));
+    dict.set("Subtype", Object::Name(PdfName::new_unchecked("Form")));
+
+    let mut bbox_arr = PdfArray::new();
+    bbox_arr.push(Object::Real(0.0));
+    bbox_arr.push(Object::Real(0.0));
+    bbox_arr.push(Object::Real(bbox.width()));
+    bbox_arr.push(Object::Real(bbox.height()));
+    dict.set("BBox", Object::Array(bbox_arr));
+
+    // Add Resources with font
+    let mut resources = PdfDictionary::new();
+    let mut font_dict = PdfDictionary::new();
+
+    let mut helv = PdfDictionary::new();
+    helv.set("Type", Object::Name(PdfName::new_unchecked("Font")));
+    helv.set("Subtype", Object::Name(PdfName::new_unchecked("Type1")));
+    helv.set("BaseFont", Object::Name(PdfName::new_unchecked("Helvetica")));
+    font_dict.set("Helv", Object::Dictionary(helv));
+
+    resources.set("Font", Object::Dictionary(font_dict));
+    dict.set("Resources", Object::Dictionary(resources));
+
+    let data = content.as_bytes().to_vec();
+    dict.set("Length", Object::Integer(data.len() as i64));
+
+    PdfStream::from_raw(dict, data)
 }
 
 #[cfg(test)]

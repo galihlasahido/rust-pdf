@@ -49,6 +49,10 @@ pub enum PdfError {
     #[cfg(feature = "signatures")]
     #[error("Signature error: {0}")]
     Signature(#[from] SignatureError),
+
+    /// Error during form field operations.
+    #[error("Form error: {0}")]
+    Form(#[from] FormError),
 }
 
 /// Errors related to PDF object handling.
@@ -279,6 +283,30 @@ pub enum SignatureError {
     /// PKCS#7 encoding error.
     #[error("PKCS#7 encoding error: {0}")]
     Pkcs7Error(String),
+}
+
+/// Errors related to form fields.
+#[derive(Debug, Error)]
+pub enum FormError {
+    /// Invalid field name.
+    #[error("Invalid field name: {0}")]
+    InvalidFieldName(String),
+
+    /// Duplicate field name.
+    #[error("Duplicate field name: {0}")]
+    DuplicateFieldName(String),
+
+    /// Invalid field configuration.
+    #[error("Invalid field configuration: {0}")]
+    InvalidConfiguration(String),
+
+    /// Missing required property.
+    #[error("Missing required property: {0}")]
+    MissingProperty(String),
+
+    /// Invalid option index.
+    #[error("Invalid option index: {0}")]
+    InvalidOptionIndex(usize),
 }
 
 /// A specialized Result type for PDF operations.

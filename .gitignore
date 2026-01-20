@@ -26,3 +26,7 @@ target/
 *.dylib
 *.so
 *.dll
+
+# Test generated files are in tests/output/ and already ignored by /tests/output/*.pdf
+# PEM files in tests/output/
+/tests/output/*.pem

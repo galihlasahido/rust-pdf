@@ -681,6 +681,7 @@ name = "rust-pdf"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "bitflags",
  "cbc",
  "cms",
  "const-oid",
