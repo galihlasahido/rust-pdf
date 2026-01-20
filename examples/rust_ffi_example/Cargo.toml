@@ -1,0 +1,11 @@
+[package]
+name = "rust_pdf_ffi_example"
+version = "0.1.0"
+edition = "2021"
+
+# This example shows how to use the rust-pdf dynamic library
+# from another Rust project without access to source code.
+
+[dependencies]
+
+# No dependencies needed - we link directly to the dynamic library

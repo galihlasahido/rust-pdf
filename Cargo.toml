@@ -1,0 +1,46 @@
+[package]
+name = "rust-pdf"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "cdylib"]  # rlib for Rust, cdylib for C/FFI
+
+[features]
+default = []
+compression = ["flate2"]
+images = ["image", "compression"]
+parser = ["nom", "compression"]
+encryption = ["aes", "cbc", "sha2", "md-5", "rand", "zeroize"]
+signatures = ["encryption", "cms", "x509-cert", "rsa", "p256", "ecdsa", "const-oid", "der", "spki", "pkcs8", "signature"]
+html = []
+office = []
+full = ["compression", "images", "parser", "encryption", "signatures", "html", "office"]
+
+[dependencies]
+thiserror = "2.0"
+indexmap = "2.0"
+flate2 = { version = "1.0", optional = true, default-features = false, features = ["rust_backend"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png"] }
+nom = { version = "7.1", optional = true }
+# Encryption dependencies
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", optional = true }
+sha2 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true }
+zeroize = { version = "1.7", optional = true, features = ["derive"] }
+# Digital signature dependencies
+cms = { version = "0.2", optional = true, features = ["std"] }
+x509-cert = { version = "0.2", optional = true, features = ["std", "pem"] }
+rsa = { version = "0.9", optional = true, features = ["sha2"] }
+p256 = { version = "0.13", optional = true, features = ["ecdsa"] }
+ecdsa = { version = "0.16", optional = true }
+const-oid = { version = "0.9", optional = true }
+der = { version = "0.7", optional = true, features = ["std", "pem", "alloc"] }
+spki = { version = "0.7", optional = true, features = ["std"] }
+pkcs8 = { version = "0.10", optional = true, features = ["std", "pem"] }
+signature = { version = "2.2", optional = true }
+
+[dev-dependencies]
+tempfile = "3.0"
