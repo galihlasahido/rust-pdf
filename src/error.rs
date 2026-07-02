@@ -58,6 +58,12 @@ pub enum PdfError {
     #[cfg(feature = "render")]
     #[error("Render error: {0}")]
     Render(#[from] RenderError),
+
+    /// Error during in-place document editing (content-stream edits, page
+    /// tree surgery, incremental or full-rewrite save).
+    #[cfg(feature = "parser")]
+    #[error("Editor error: {0}")]
+    Editor(#[from] EditorError),
 }
 
 /// Errors related to PDF object handling.
@@ -218,6 +224,64 @@ pub enum ParserError {
     #[cfg(feature = "compression")]
     #[error("Decompression failed: {0}")]
     Decompression(#[from] CompressionError),
+}
+
+/// Errors related to editing an already-loaded document
+/// ([`crate::editor::EditableDocument`]): content-stream rewriting, page
+/// tree surgery (insert/delete/move/rotate/split/merge) and incremental /
+/// full-rewrite saving.
+#[cfg(feature = "parser")]
+#[derive(Debug, Error)]
+pub enum EditorError {
+    /// The document's trailer `/Root` does not resolve to a dictionary,
+    /// or that dictionary has no usable `/Pages` entry (ISO 32000-1
+    /// 7.7.2, Table 28).
+    #[error("document catalog is missing or malformed (no usable /Pages)")]
+    MissingCatalog,
+
+    /// The page tree could not be walked: a node was neither a `/Pages`
+    /// node (has `/Kids`) nor a `/Page` leaf, or referenced an object
+    /// that does not resolve to a dictionary (ISO 32000-1 7.7.3).
+    #[error("malformed page tree: {0}")]
+    MalformedPageTree(String),
+
+    /// Page tree recursion/fan-out exceeded the safety bound while
+    /// walking a (possibly adversarial/corrupt) `/Kids` structure.
+    #[error("page tree exceeds the maximum supported depth/size ({0})")]
+    PageTreeTooLarge(&'static str),
+
+    /// `index` was out of range for the document's current page count.
+    #[error("page index {index} out of range (document has {count} pages)")]
+    InvalidPageIndex {
+        /// The requested zero-based page index.
+        index: usize,
+        /// The document's actual page count.
+        count: usize,
+    },
+
+    /// A content stream (or the reachable-object graph during a
+    /// full-rewrite save) exceeded a sanity size bound, most likely
+    /// because of a corrupt or adversarial `/Length`/`/Kids`/`/Count`
+    /// value in the source file.
+    #[error("{0}")]
+    ResourceLimitExceeded(String),
+
+    /// Incremental save requires the byte offset of the base file's
+    /// existing final cross-reference section (to populate `/Prev`), but
+    /// it could not be located.
+    #[error("could not locate base file's startxref offset for incremental save")]
+    MissingBaseXref,
+
+    /// A referenced indirect object could not be resolved (dangling
+    /// reference, or object not present in this document's object
+    /// space).
+    #[error("object {0} {1} R could not be resolved")]
+    UnresolvedObject(u32, u16),
+
+    /// A caller-supplied argument was rejected (e.g. a rotation not a
+    /// multiple of 90 degrees, ISO 32000-1 Table 30).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 /// Errors related to PDF encryption.

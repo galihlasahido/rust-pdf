@@ -22,6 +22,12 @@ pub use inline_image::{parse_inline_image, InlineImage};
 pub use trailer::Trailer;
 pub use xref::{XrefEntry, XrefTable};
 
+// Re-exported for `crate::editor`: incremental save (ISO 32000-1 7.5.6)
+// needs to chain a new update's `/Prev` to the byte offset of the base
+// file's own final `startxref`, and this is the already-tested routine
+// that locates it. Not part of the public API.
+pub(crate) use xref::find_startxref;
+
 use crate::document::PdfVersion;
 use crate::error::{ParserError, PdfResult};
 use crate::object::{Object, PdfDictionary};
@@ -31,7 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use trailer::parse_trailer;
-use xref::{find_startxref, parse_xref_table};
+use xref::parse_xref_table;
 
 /// Hard cap on the number of `/Prev`/`/XRefStm`-linked cross-reference
 /// sections that will be followed. Real files rarely have more than a
