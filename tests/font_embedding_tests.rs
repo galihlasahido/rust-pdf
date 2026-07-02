@@ -9,12 +9,20 @@
 //!   (composite, CJK) font and a non-embedded (Standard 14) font.
 //! - Subsetting produces a smaller file than a full embed of the same font.
 //!
-//! These tests use a small, hand-built synthetic sfnt/TrueType font (see
-//! [`build_test_font`] below) rather than a vendored real-world font, to
-//! avoid adding third-party font binaries (and their licensing overhead) to
-//! the repository purely for test fixtures — see the task report for the
-//! recommendation to add a real OFL-licensed CJK font under
-//! `tests/fixtures/` for stronger regression coverage.
+//! Most of these tests use a small, hand-built synthetic sfnt/TrueType font
+//! (see [`build_test_font`] below) rather than a vendored real-world font,
+//! specifically to test the embedding/subsetting/CID-encoding/ToUnicode
+//! *structure* in isolation without a large binary fixture.
+//!
+//! That is not sufficient on its own, though: a synthetic font's glyphs are
+//! empty (zero-contour) outlines, so it can never prove that Pdfium (or any
+//! real viewer) actually paints recognizable CJK glyph *shapes* on the
+//! page — only that the surrounding PDF structure is well-formed. The
+//! [`cjk_visual_render`] module below closes that gap with a small, real,
+//! OFL-licensed CJK font (a glyph-subsetted derivative of Noto Sans SC; see
+//! `tests/fixtures/fonts/NOTICE.md` for provenance and licensing) rendered
+//! through the actual Pdfium engine, asserting non-background ink pixels
+//! appear exactly where the CJK glyphs were placed.
 
 #![cfg(all(feature = "fonts", feature = "parser"))]
 
@@ -369,4 +377,188 @@ fn non_embedded_composite_font_omits_font_file_but_still_declares_type0() {
 
     let lopdf_doc = lopdf::Document::load_mem(&bytes).expect("lopdf must still open a non-embedded composite font PDF");
     assert_eq!(lopdf_doc.get_pages().len(), 1);
+}
+
+// ---------------------------------------------------------------------
+// Visual verification: a *real* CJK font, rendered through actual Pdfium.
+//
+// Every test above proves the PDF *structure* around CJK text is correct
+// (Type0/CIDFontType2, ToUnicode, subsetting) using a synthetic font whose
+// glyphs are empty outlines. That is necessary but not sufficient: it
+// cannot catch a bug in glyph-ID mapping, CIDToGIDMap, or advance-width
+// computation that would still produce a structurally-valid PDF but render
+// the *wrong* (or no) glyph shape. This module renders real CJK glyph
+// outlines (a small OFL-licensed subset of Noto Sans SC — see
+// `tests/fixtures/fonts/NOTICE.md`) through the actual Pdfium engine and
+// asserts non-background ink pixels land exactly where the glyphs were
+// placed.
+// ---------------------------------------------------------------------
+#[cfg(feature = "render")]
+mod cjk_visual_render {
+    use super::*;
+    use rust_pdf::render::{PdfRenderer, PdfiumLibrary};
+    use std::sync::OnceLock;
+
+    /// A real, OFL-licensed CJK font (glyph-subsetted Noto Sans SC; see
+    /// `tests/fixtures/fonts/NOTICE.md`), with genuine multi-contour glyph
+    /// outlines for every character this module renders — unlike
+    /// [`super::build_test_font`]'s empty/zero-contour synthetic glyphs.
+    fn real_cjk_font_bytes() -> Vec<u8> {
+        include_bytes!("fixtures/fonts/NotoSansSC-Subset.ttf").to_vec()
+    }
+
+    /// Loads (once per test process) the native Pdfium library, matching
+    /// the pattern in `render_tests.rs`: Pdfium's C API is a process-wide
+    /// singleton, so every test in this binary must share one instance.
+    fn library() -> Option<&'static PdfiumLibrary> {
+        static LIBRARY: OnceLock<Option<PdfiumLibrary>> = OnceLock::new();
+        LIBRARY
+            .get_or_init(|| match PdfiumLibrary::bind() {
+                Ok(library) => Some(library),
+                Err(err) => {
+                    eprintln!(
+                        "skipping cjk_visual_render tests: could not load the Pdfium shared \
+                         library ({err}). Run `scripts/fetch_pdfium.sh` and set \
+                         RUST_PDF_PDFIUM_LIB_DIR, or install Pdfium system-wide."
+                    );
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    /// The CJK text rendered by this test, all width-1000/1000-em (full
+    /// square) glyphs in the fixture font, each occupying a whole
+    /// `FONT_SIZE_PT`-wide advance so the on-page bounding box below is a
+    /// simple, exact multiple of the font size.
+    const CJK_TEXT: &str = "中文测试";
+    const FONT_SIZE_PT: f64 = 60.0;
+    const TEXT_ORIGIN_X_PT: f64 = 72.0;
+    const TEXT_ORIGIN_Y_PT: f64 = 650.0;
+    const RENDER_DPI: f32 = 150.0;
+
+    /// Builds a one-page A4 document containing (if `with_text`) the CJK
+    /// text drawn via a real, embedded [`CompositeFont`], at exactly
+    /// [`TEXT_ORIGIN_X_PT`]/[`TEXT_ORIGIN_Y_PT`]/[`FONT_SIZE_PT`] — or an
+    /// otherwise-identical but textless page when `with_text` is `false`,
+    /// used as a same-layout "no ink here" control.
+    fn build_page(with_text: bool) -> Vec<u8> {
+        let mut page_builder = PageBuilder::a4();
+        if with_text {
+            let font = CompositeFont::new(real_cjk_font_bytes(), "NotoSansSC-Test").unwrap();
+            let cid_bytes = font.encode(CJK_TEXT);
+            page_builder = page_builder.font("F1", font).content(
+                ContentBuilder::new().text_block(
+                    TextBuilder::new()
+                        .font("F1", FONT_SIZE_PT)
+                        .position(TEXT_ORIGIN_X_PT, TEXT_ORIGIN_Y_PT)
+                        .show_bytes(cid_bytes),
+                ),
+            );
+        }
+        let page = page_builder.build();
+        DocumentBuilder::new()
+            .title("CJK visual render test")
+            .page(page)
+            .build()
+            .unwrap()
+            .save_to_bytes()
+            .unwrap()
+    }
+
+    /// Converts a PDF-space rectangle (origin bottom-left, y-up, in points)
+    /// on an A4 page to a pixel-space rectangle (origin top-left, y-down)
+    /// at `dpi`, returning `(x0, y0, x1, y1)` pixel bounds clamped to
+    /// `(width, height)`.
+    fn pdf_rect_to_pixel_rect(
+        (x0_pt, y0_pt, x1_pt, y1_pt): (f64, f64, f64, f64),
+        dpi: f32,
+        (width, height): (u32, u32),
+    ) -> (u32, u32, u32, u32) {
+        let scale = (dpi / 72.0) as f64;
+        let page_height_pt = 842.0; // A4 height in points (see Rectangle::a4()).
+        let px0 = (x0_pt * scale).max(0.0) as u32;
+        let px1 = ((x1_pt * scale).max(0.0) as u32).min(width);
+        // Larger PDF y (higher up the page) maps to a smaller pixel row.
+        let py0 = ((page_height_pt - y1_pt) * scale).max(0.0) as u32;
+        let py1 = (((page_height_pt - y0_pt) * scale).max(0.0) as u32).min(height);
+        (px0, py0, px1, py1)
+    }
+
+    /// Counts pixels within `(x0, y0, x1, y1)` (pixel space, `x1`/`y1`
+    /// exclusive) that are meaningfully darker than a white page
+    /// background -- i.e. glyph ink (including anti-aliased gray edges),
+    /// not the paper.
+    fn count_ink_pixels(image: &rust_pdf::render::RgbaImage, (x0, y0, x1, y1): (u32, u32, u32, u32)) -> usize {
+        let mut count = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = image.get_pixel(x, y);
+                let intensity = (u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])) / 3;
+                // White background ~= 255; require a comfortable margin
+                // below that so JPEG-free PNG-exact white plus mild
+                // anti-aliasing noise never false-positives as "ink".
+                if intensity < 200 {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn cjk_real_glyphs_render_visible_ink_via_pdfium() {
+        let Some(lib) = library() else { return };
+
+        // Bounding box around the expected glyph area, generously padded
+        // (the fixture font's glyphs are ~1000/1000-em full-width CJK
+        // ideographs with a small negative descender, per
+        // `tests/fixtures/fonts/NOTICE.md`'s derivation notes), but tight
+        // enough that it does not extend into any other page content.
+        let bbox_pt = (
+            TEXT_ORIGIN_X_PT - 8.0,
+            TEXT_ORIGIN_Y_PT - 15.0,
+            TEXT_ORIGIN_X_PT + FONT_SIZE_PT * CJK_TEXT.chars().count() as f64 + 8.0,
+            TEXT_ORIGIN_Y_PT + FONT_SIZE_PT + 15.0,
+        );
+
+        let with_text = build_page(true);
+        let renderer = PdfRenderer::open_bytes(lib, with_text, None).expect("failed to open CJK render-test document");
+        let image = renderer.render_page(0, RENDER_DPI, None).expect("failed to render CJK page via Pdfium");
+        let (width, height) = image.dimensions();
+        let pixel_bbox = pdf_rect_to_pixel_rect(bbox_pt, RENDER_DPI, (width, height));
+
+        let ink_pixels = count_ink_pixels(&image, pixel_bbox);
+        assert!(
+            ink_pixels > 500,
+            "expected substantial glyph ink in the CJK text's bounding box {pixel_bbox:?} \
+             (image {width}x{height}), only found {ink_pixels} dark pixels -- real CJK glyph \
+             shapes are not being rendered"
+        );
+
+        // Control: the *same* bounding box on an otherwise-identical page
+        // with no text at all must be (near-)blank paper, proving the ink
+        // above is specifically due to the CJK glyphs, not some unrelated
+        // page decoration or rendering artifact.
+        let without_text = build_page(false);
+        let blank_renderer = PdfRenderer::open_bytes(lib, without_text, None).expect("failed to open blank control document");
+        let blank_image = blank_renderer.render_page(0, RENDER_DPI, None).expect("failed to render blank control page via Pdfium");
+        let blank_ink_pixels = count_ink_pixels(&blank_image, pixel_bbox);
+        assert!(
+            blank_ink_pixels < 5,
+            "expected the textless control page's identical bounding box to be blank paper, \
+             found {blank_ink_pixels} dark pixels -- test bounding box must be wrong"
+        );
+
+        // Sanity: save a PNG for manual inspection (gitignored), same
+        // convention as render_tests.rs.
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("output").join("render");
+        std::fs::create_dir_all(&dir).ok();
+        let _ = image.save(dir.join("cjk-visual-render.png"));
+
+        println!(
+            "CJK visual render: {ink_pixels} ink pixels in-bbox (text page) vs \
+             {blank_ink_pixels} (blank control) at {RENDER_DPI} DPI"
+        );
+    }
 }

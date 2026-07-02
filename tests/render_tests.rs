@@ -507,6 +507,149 @@ fn oversized_dpi_is_rejected_before_allocating() {
     assert!(matches!(err, rust_pdf::RenderError::OutputTooLarge { .. }), "{err:?}");
 }
 
+// ---------------------------------------------------------------------
+// Visual verification: annotation appearance streams, rendered through
+// actual Pdfium.
+//
+// `tests/interactive_features_tests.rs` proves (via `lopdf`) that every
+// annotation kind's appearance stream is structurally well-formed and
+// present (`/AP /N`). That is necessary but not sufficient: a bug that
+// produces a structurally valid but visually-empty (or mis-positioned)
+// appearance stream would still pass that test. This module renders a
+// page with one of every annotation kind through the real Pdfium engine
+// and asserts each annotation's on-page bounding box renders differently
+// from the *same* box on the *same* page with no annotations at all --
+// proving the appearance is genuinely painted, not just declared.
+// ---------------------------------------------------------------------
+#[cfg(feature = "parser")]
+mod annotation_visual_render {
+    use super::*;
+
+    /// An axis-aligned rectangle `(x0, y0, x1, y1)` in PDF user space
+    /// (points, origin bottom-left, y-up).
+    type PdfRect = (f64, f64, f64, f64);
+
+    // On-page bounding boxes (PDF user space, points; A4, origin bottom-left)
+    // for each annotation kind below. Chosen to be non-overlapping and to
+    // tightly bound that annotation's appearance.
+    const HIGHLIGHT_RECT: PdfRect = (72.0, 745.0, 150.0, 762.0);
+    const UNDERLINE_RECT: PdfRect = (160.0, 745.0, 230.0, 762.0);
+    const STRIKEOUT_RECT: PdfRect = (240.0, 745.0, 300.0, 762.0);
+    const FREETEXT_RECT: PdfRect = (72.0, 600.0, 300.0, 650.0);
+    const STAMP_RECT: PdfRect = (400.0, 700.0, 550.0, 750.0);
+    const INK_RECT: PdfRect = (95.0, 395.0, 145.0, 435.0);
+
+    /// A one-page A4 document with plain baseline text and *no*
+    /// annotations -- the "before" control every annotated region below is
+    /// compared against.
+    fn plain_page_bytes() -> Vec<u8> {
+        let page = PageBuilder::a4()
+            .font("F1", Standard14Font::Helvetica)
+            .content(ContentBuilder::new().text("F1", 12.0, 72.0, 750.0, "The quick brown fox jumps."))
+            .build();
+        DocumentBuilder::new()
+            .title("Annotation visual render test")
+            .page(page)
+            .build()
+            .unwrap()
+            .save_to_bytes()
+            .unwrap()
+    }
+
+    /// The same document as [`plain_page_bytes`], with one of every
+    /// annotation kind named in the task's Definition of Done added via an
+    /// incremental update (ISO 32000-1:2008 §12.5, Annotations).
+    fn annotated_page_bytes() -> Vec<u8> {
+        let mut doc = EditableDocument::from_bytes(plain_page_bytes()).unwrap();
+
+        let (hx0, hy0, hx1, hy1) = HIGHLIGHT_RECT;
+        doc.add_highlight_annotation(0, &[(hx0, hy0, hx1, hy1)], Color::rgb(1.0, 1.0, 0.0)).unwrap();
+        let (ux0, uy0, ux1, uy1) = UNDERLINE_RECT;
+        doc.add_underline_annotation(0, &[(ux0, uy0, ux1, uy1)], Color::BLACK).unwrap();
+        let (sx0, sy0, sx1, sy1) = STRIKEOUT_RECT;
+        doc.add_strikeout_annotation(0, &[(sx0, sy0, sx1, sy1)], Color::RED).unwrap();
+        let (fx0, fy0, fx1, fy1) = FREETEXT_RECT;
+        doc.add_freetext_annotation(0, Rectangle::new(fx0, fy0, fx1, fy1), "Reviewer note here", 14.0, Color::BLUE).unwrap();
+        let (tx0, ty0, tx1, ty1) = STAMP_RECT;
+        doc.add_stamp_annotation(0, Rectangle::new(tx0, ty0, tx1, ty1), "APPROVED", Color::rgb(0.0, 0.5, 0.0)).unwrap();
+        doc.add_ink_annotation(0, &[vec![(100.0, 400.0), (120.0, 430.0), (140.0, 405.0)]], Color::rgb(0.2, 0.2, 0.8), 3.0).unwrap();
+
+        doc.save_incremental_to_bytes().unwrap()
+    }
+
+    /// Converts a PDF-space rectangle (origin bottom-left, y-up, points) to
+    /// a pixel-space rectangle (origin top-left, y-down) at `dpi` on a page
+    /// of height `page_height_pt`, clamped to `(width, height)`.
+    fn pixel_rect(
+        (x0_pt, y0_pt, x1_pt, y1_pt): PdfRect,
+        dpi: f32,
+        page_height_pt: f64,
+        (width, height): (u32, u32),
+    ) -> (u32, u32, u32, u32) {
+        let scale = (dpi / 72.0) as f64;
+        let px0 = ((x0_pt * scale) as u32).min(width);
+        let px1 = ((x1_pt * scale) as u32).min(width);
+        let py0 = (((page_height_pt - y1_pt) * scale).max(0.0) as u32).min(height);
+        let py1 = (((page_height_pt - y0_pt) * scale).max(0.0) as u32).min(height);
+        (px0, py0, px1, py1)
+    }
+
+    /// Whether any pixel differs between `a` and `b` within
+    /// `(x0, y0, x1, y1)` (pixel space, `x1`/`y1` exclusive).
+    fn region_differs(a: &RgbaImage, b: &RgbaImage, (x0, y0, x1, y1): (u32, u32, u32, u32)) -> bool {
+        (y0..y1).any(|y| (x0..x1).any(|x| a.get_pixel(x, y) != b.get_pixel(x, y)))
+    }
+
+    #[test]
+    fn every_annotation_kind_visibly_changes_the_rendered_page_via_pdfium() {
+        let lib = require_pdfium!();
+
+        let plain_renderer = PdfRenderer::open_bytes(lib, plain_page_bytes(), None).expect("failed to open plain (no-annotation) control document");
+        let plain_image = plain_renderer.render_page(0, TEST_DPI, None).expect("failed to render plain control page via Pdfium");
+
+        let annotated_renderer = PdfRenderer::open_bytes(lib, annotated_page_bytes(), None).expect("failed to open annotated document");
+        let annotated_image = annotated_renderer.render_page(0, TEST_DPI, None).expect("failed to render annotated page via Pdfium");
+
+        assert_eq!(
+            plain_image.dimensions(),
+            annotated_image.dimensions(),
+            "adding annotations must not change the page's rendered raster dimensions"
+        );
+        let dims = plain_image.dimensions();
+
+        assert_ne!(
+            plain_image.as_raw(),
+            annotated_image.as_raw(),
+            "a page with every annotation kind added must not render pixel-identical to the same page with no annotations"
+        );
+
+        const PAGE_HEIGHT_PT: f64 = 842.0; // A4 (see Rectangle::a4()).
+        let regions: [(&str, PdfRect); 6] = [
+            ("highlight", HIGHLIGHT_RECT),
+            ("underline", UNDERLINE_RECT),
+            ("strikeout", STRIKEOUT_RECT),
+            ("freetext", FREETEXT_RECT),
+            ("stamp", STAMP_RECT),
+            ("ink", INK_RECT),
+        ];
+
+        for (name, bbox_pt) in regions {
+            let region = pixel_rect(bbox_pt, TEST_DPI, PAGE_HEIGHT_PT, dims);
+            assert!(
+                region_differs(&plain_image, &annotated_image, region),
+                "{name} annotation's on-page region {region:?} rendered identically to the \
+                 un-annotated control page -- its appearance stream is not actually visible"
+            );
+        }
+
+        // Save both rasters for manual visual inspection (gitignored), same
+        // convention as the rest of this file.
+        let dir = output_dir();
+        let _ = plain_image.save(dir.join("annotations-before.png"));
+        let _ = annotated_image.save(dir.join("annotations-after.png"));
+    }
+}
+
 #[cfg(feature = "encryption")]
 #[test]
 fn password_protected_document_requires_password() {
