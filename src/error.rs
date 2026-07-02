@@ -64,6 +64,12 @@ pub enum PdfError {
     #[cfg(feature = "parser")]
     #[error("Editor error: {0}")]
     Editor(#[from] EditorError),
+
+    /// Error during embedded TrueType/OpenType font loading, subsetting, or
+    /// CID/Type0 composite font construction.
+    #[cfg(feature = "fonts")]
+    #[error("Font error: {0}")]
+    Font(#[from] FontError),
 }
 
 /// Errors related to PDF object handling.
@@ -475,6 +481,22 @@ pub enum RenderError {
     /// `dpi` was not a finite, positive number.
     #[error("invalid DPI value: {0} (must be finite and > 0)")]
     InvalidDpi(f32),
+}
+
+/// Errors related to embedded TrueType/OpenType font loading, subsetting,
+/// and CID/Type0 composite font construction (`fonts` feature). See
+/// [`crate::font::truetype`], [`crate::font::subset`], and
+/// [`crate::font::cid`].
+#[cfg(feature = "fonts")]
+#[derive(Debug, Error)]
+pub enum FontError {
+    /// Failed to load/validate a TrueType/OpenType font program.
+    #[error("failed to load font: {0}")]
+    Load(#[from] crate::font::truetype::FontLoadError),
+
+    /// Failed to subset a font program to its used glyphs.
+    #[error("failed to subset font: {0}")]
+    Subset(#[from] crate::font::subset::SubsetError),
 }
 
 /// A specialized Result type for PDF operations.

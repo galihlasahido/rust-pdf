@@ -54,5 +54,6 @@ mod content_stream;
 mod graph;
 mod pages;
 mod save;
+mod text_extract;
 
 pub use graph::EditableDocument;

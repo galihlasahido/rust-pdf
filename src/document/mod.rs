@@ -109,7 +109,7 @@ impl Document {
         // Allocate IDs for each page and its content
         let mut page_ids: Vec<ObjectId> = Vec::new();
         let mut content_ids: Vec<ObjectId> = Vec::new();
-        let mut font_ids: Vec<Vec<(String, ObjectId)>> = Vec::new();
+        let mut font_ids: Vec<Vec<(String, FontIds)>> = Vec::new();
 
         // Image IDs: Vec of (name, image_id, optional soft_mask_id)
         #[cfg(feature = "images")]
@@ -119,10 +119,41 @@ impl Document {
             page_ids.push(pdf_writer.allocate_id());
             content_ids.push(pdf_writer.allocate_id());
 
-            // Allocate font IDs for this page
+            // Allocate font IDs for this page. A composite (Type 0) font is
+            // a graph of several indirect objects (ISO 32000-1 9.7), not a
+            // single dictionary, so it needs several IDs; a standard-14
+            // font is a single dictionary.
             let mut page_font_ids = Vec::new();
-            for (font_name, _) in &page.fonts {
-                page_font_ids.push((font_name.clone(), pdf_writer.allocate_id()));
+            for (font_name, font) in &page.fonts {
+                let ids = match font {
+                    #[cfg(feature = "fonts")]
+                    crate::font::Font::Composite(cf) => {
+                        let type0_id = pdf_writer.allocate_id();
+                        let descendant_id = pdf_writer.allocate_id();
+                        let descriptor_id = pdf_writer.allocate_id();
+                        let font_file_id = if cf.is_embedded() {
+                            Some(pdf_writer.allocate_id())
+                        } else {
+                            None
+                        };
+                        let cid_to_gid_map_id = if cf.will_subset() {
+                            Some(pdf_writer.allocate_id())
+                        } else {
+                            None
+                        };
+                        let tounicode_id = pdf_writer.allocate_id();
+                        FontIds::Composite(crate::font::cid::CompositeFontIds {
+                            type0_id,
+                            descendant_id,
+                            descriptor_id,
+                            font_file_id,
+                            cid_to_gid_map_id,
+                            tounicode_id,
+                        })
+                    }
+                    _ => FontIds::Simple(pdf_writer.allocate_id()),
+                };
+                page_font_ids.push((font_name.clone(), ids));
             }
             font_ids.push(page_font_ids);
 
@@ -239,8 +270,8 @@ impl Document {
 
             // Build font resources dictionary
             let mut font_dict = PdfDictionary::new();
-            for (font_name, font_id) in page_fonts {
-                font_dict.set(font_name, Object::Reference(*font_id));
+            for (font_name, ids) in page_fonts {
+                font_dict.set(font_name, Object::Reference(ids.resource_id()));
             }
 
             // Build XObject resources dictionary for images
@@ -316,10 +347,48 @@ impl Document {
             pdf_writer.write_object_with_id(content_id, &Object::Stream(content_stream))?;
 
             // Write font objects
-            for (j, (_, font_id)) in page_fonts.iter().enumerate() {
+            for (j, (_, ids)) in page_fonts.iter().enumerate() {
                 let (_, font) = &page.fonts[j];
-                let font_dict = font.to_dictionary();
-                pdf_writer.write_object_with_id(*font_id, &Object::Dictionary(font_dict))?;
+                match ids {
+                    FontIds::Simple(font_id) => {
+                        let font_dict = font.to_dictionary();
+                        pdf_writer.write_object_with_id(*font_id, &Object::Dictionary(font_dict))?;
+                    }
+                    #[cfg(feature = "fonts")]
+                    FontIds::Composite(cids) => {
+                        let crate::font::Font::Composite(cf) = font else {
+                            unreachable!("FontIds::Composite is only allocated for Font::Composite")
+                        };
+                        let built = cf.build(cids)?;
+                        pdf_writer.write_object_with_id(
+                            cids.type0_id,
+                            &Object::Dictionary(built.type0),
+                        )?;
+                        pdf_writer.write_object_with_id(
+                            cids.descendant_id,
+                            &Object::Dictionary(built.descendant),
+                        )?;
+                        pdf_writer.write_object_with_id(
+                            cids.descriptor_id,
+                            &Object::Dictionary(built.descriptor),
+                        )?;
+                        pdf_writer.write_object_with_id(
+                            cids.tounicode_id,
+                            &Object::Stream(built.tounicode),
+                        )?;
+                        if let (Some(font_file_id), Some(font_file)) =
+                            (cids.font_file_id, built.font_file)
+                        {
+                            pdf_writer
+                                .write_object_with_id(font_file_id, &Object::Stream(font_file))?;
+                        }
+                        if let (Some(map_id), Some(map_stream)) =
+                            (cids.cid_to_gid_map_id, built.cid_to_gid_map)
+                        {
+                            pdf_writer.write_object_with_id(map_id, &Object::Stream(map_stream))?;
+                        }
+                    }
+                }
             }
 
             // Write image XObject streams
@@ -564,6 +633,31 @@ impl DocumentBuilder {
             #[cfg(feature = "encryption")]
             encryption: self.encryption,
         })
+    }
+}
+
+/// The object ID(s) needed to write one page-resource font entry: either a
+/// single dictionary (Standard 14 / simple fonts) or the several indirect
+/// objects a Type 0 composite font requires (`fonts` feature, ISO 32000-1
+/// 9.7).
+enum FontIds {
+    /// A single font dictionary object.
+    Simple(ObjectId),
+    /// A composite (Type 0/CIDFontType2) font's object graph.
+    #[cfg(feature = "fonts")]
+    Composite(crate::font::cid::CompositeFontIds),
+}
+
+impl FontIds {
+    /// The object ID a page's `/Resources /Font` entry should reference
+    /// (the top-level dictionary for a simple font, or the `/Type0`
+    /// dictionary for a composite font).
+    fn resource_id(&self) -> ObjectId {
+        match self {
+            FontIds::Simple(id) => *id,
+            #[cfg(feature = "fonts")]
+            FontIds::Composite(ids) => ids.type0_id,
+        }
     }
 }
 

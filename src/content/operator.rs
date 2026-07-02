@@ -112,6 +112,15 @@ pub enum Operator {
     // Text showing operators
     /// Tj - Show text string
     ShowText(String),
+    /// Tj - Show text given as raw pre-encoded bytes, written as a PDF hex
+    /// string rather than a literal string.
+    ///
+    /// Used for composite (Type 0 / CID) fonts, whose content-stream codes
+    /// are fixed-width binary (2 bytes each for the `Identity-H` encoding
+    /// this crate emits, ISO 32000-1:2008 9.7.4.2) rather than something
+    /// meaningfully representable as a Rust `String`. See
+    /// [`crate::font::cid::CompositeFont::encode`].
+    ShowTextBytes(Vec<u8>),
     /// TJ - Show text with positioning
     ShowTextPositioned(Vec<TextElement>),
     /// ' - Move to next line and show text
@@ -132,6 +141,9 @@ pub enum Operator {
 pub enum TextElement {
     /// A text string.
     Text(String),
+    /// Raw pre-encoded text bytes (see [`Operator::ShowTextBytes`]),
+    /// written as a PDF hex string.
+    Bytes(Vec<u8>),
     /// A positioning adjustment (negative = move right).
     Position(f64),
 }
@@ -246,11 +258,13 @@ impl Operator {
 
             // Text showing
             Operator::ShowText(s) => format!("({}) Tj", escape_string(s)),
+            Operator::ShowTextBytes(bytes) => format!("{} Tj", hex_string(bytes)),
             Operator::ShowTextPositioned(elements) => {
                 let mut parts = Vec::new();
                 for elem in elements {
                     match elem {
                         TextElement::Text(s) => parts.push(format!("({})", escape_string(s))),
+                        TextElement::Bytes(bytes) => parts.push(hex_string(bytes)),
                         TextElement::Position(p) => parts.push(fmt(p)),
                     }
                 }
@@ -280,6 +294,18 @@ fn fmt(v: &f64) -> String {
         let s = format!("{:.4}", v);
         s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
+}
+
+/// Encodes bytes as a PDF hex string (`<48656C6C6F>`), used for
+/// pre-encoded composite-font text (ISO 32000-1:2008 7.3.4.3).
+fn hex_string(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2 + 2);
+    s.push('<');
+    for b in bytes {
+        s.push_str(&format!("{:02X}", b));
+    }
+    s.push('>');
+    s
 }
 
 /// Escapes special characters in a PDF string.
@@ -344,5 +370,24 @@ mod tests {
         assert_eq!(escape_string("Hello"), "Hello");
         assert_eq!(escape_string("Hello (World)"), "Hello \\(World\\)");
         assert_eq!(escape_string("Line1\nLine2"), "Line1\\nLine2");
+    }
+
+    #[test]
+    fn test_show_text_bytes_hex_encoding() {
+        // 2-byte-per-glyph CID codes (Identity-H), e.g. GID 1 then GID 2.
+        assert_eq!(
+            Operator::ShowTextBytes(vec![0x00, 0x01, 0x00, 0x02]).to_pdf_string(),
+            "<00010002> Tj"
+        );
+    }
+
+    #[test]
+    fn test_show_text_positioned_with_bytes_and_kerning() {
+        let ops = Operator::ShowTextPositioned(vec![
+            TextElement::Bytes(vec![0x00, 0x03]),
+            TextElement::Position(-120.0),
+            TextElement::Bytes(vec![0x00, 0x04]),
+        ]);
+        assert_eq!(ops.to_pdf_string(), "[<0003> -120 <0004>] TJ");
     }
 }

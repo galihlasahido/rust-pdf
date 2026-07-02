@@ -15,7 +15,11 @@ encryption = ["aes", "cbc", "sha2", "md-5", "rand", "zeroize"]
 signatures = ["encryption", "cms", "x509-cert", "rsa", "p256", "ecdsa", "const-oid", "der", "spki", "pkcs8", "signature"]
 html = []
 office = []
-full = ["compression", "images", "parser", "encryption", "signatures", "html", "office"]
+# Embedded TrueType/OpenType font loading (ttf-parser), Type0/CID composite
+# fonts, and font subsetting (subsetter) for PDF generation. See
+# src/font/truetype.rs and src/font/subset.rs.
+fonts = ["dep:ttf-parser", "dep:subsetter"]
+full = ["compression", "images", "parser", "encryption", "signatures", "html", "office", "fonts"]
 # Content-stream rasterization (path fill/stroke, text, clipping, transparency,
 # color-space conversion) via an FFI binding to Google's Pdfium engine. See
 # src/render/mod.rs and ARCHITECTURE.md ("Native vs FFI rendering decision")
@@ -54,6 +58,17 @@ spki = { version = "0.7", optional = true, features = ["std"] }
 pkcs8 = { version = "0.10", optional = true, features = ["std", "pem"] }
 signature = { version = "2.2", optional = true }
 pdfium-render = { version = "0.9.2", optional = true }
+# Embedded TrueType/OpenType font parsing (glyph metrics, cmap, name table).
+# We deliberately parse fonts only through this crate rather than hand-rolling
+# our own sfnt/OpenType parser over untrusted font bytes (see CLAUDE workflow
+# rule: don't reimplement mature C/C++-grade parsers).
+ttf-parser = { version = "0.25", optional = true }
+# TrueType/OpenType font subsetting (glyf/CFF table rebuilding, glyph
+# remapping) for PDF font embedding. `variable-fonts` is disabled: it pulls
+# in `skrifa`/`write-fonts`/`kurbo` to support font-variation instancing,
+# which this crate does not need (embedded fonts are always instanced to a
+# single set of outlines).
+subsetter = { version = "0.2", optional = true, default-features = false }
 
 [dev-dependencies]
 lopdf = "0.43.0"

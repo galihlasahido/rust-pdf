@@ -161,6 +161,10 @@ pub mod prelude {
         SignatureConfig, SignatureInfo, SignatureVerifier, VerifiedSignature,
     };
     pub use crate::font::{Font, FontMetrics, Standard14Font};
+    #[cfg(feature = "fonts")]
+    pub use crate::font::CompositeFont;
+    #[cfg(feature = "fonts")]
+    pub use crate::error::FontError;
     pub use crate::forms::{
         AppearanceBuilder, BorderStyle, CheckBox, ComboBox, FieldFlags, FormField,
         FormFieldTrait, FormFieldType, ListBox, PushButton, RadioButton, RadioGroup, TextField,

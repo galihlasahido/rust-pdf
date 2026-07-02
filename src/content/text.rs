@@ -52,6 +52,15 @@ impl TextBuilder {
         self
     }
 
+    /// Shows text given as raw pre-encoded bytes (e.g. the 2-byte-per-glyph
+    /// `Identity-H` codes produced by a Type 0/CID composite font's
+    /// `encode` method, ISO 32000-1:2008 9.7.4.2), written as a PDF hex
+    /// string rather than a literal string.
+    pub fn show_bytes(mut self, bytes: Vec<u8>) -> Self {
+        self.operators.push(Operator::ShowTextBytes(bytes));
+        self
+    }
+
     /// Shows text with kerning/positioning adjustments.
     pub fn show_positioned(mut self, elements: Vec<TextElement>) -> Self {
         self.operators.push(Operator::ShowTextPositioned(elements));
