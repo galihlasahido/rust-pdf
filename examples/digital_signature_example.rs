@@ -23,7 +23,10 @@ use rust_pdf::prelude::*;
 use std::path::Path;
 
 #[cfg(feature = "signatures")]
-use rust_pdf::signatures::{Certificate, DocumentSigner, IncrementalSigner, PrivateKey, SignatureAlgorithm};
+use rust_pdf::signatures::{
+    Certificate, DocumentSigner, IncrementalSigner, PrivateKey, SignatureAlgorithm,
+    SignatureVerifier,
+};
 
 const OUTPUT_DIR: &str = "tests/output";
 
@@ -181,6 +184,9 @@ fn create_single_signed_pdf() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&output_path, &signed_pdf)?;
     println!("Saved: {} ({} bytes)", output_path, signed_pdf.len());
 
+    // Verify the signature we just created
+    print_verification(&signed_pdf);
+
     Ok(())
 }
 
@@ -277,7 +283,42 @@ fn create_multi_signed_pdf() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&output_path, &signed_multi)?;
     println!("Saved: {} ({} bytes)", output_path, signed_multi.len());
 
+    // Verify both signatures on the final, twice-signed document
+    print_verification(&signed_multi);
+
     Ok(())
+}
+
+/// Verifies every signature found in `pdf_bytes` and prints a short report.
+#[cfg(feature = "signatures")]
+fn print_verification(pdf_bytes: &[u8]) {
+    println!("\nVerifying signatures...");
+
+    let results = match SignatureVerifier::new(pdf_bytes.to_vec()).verify() {
+        Ok(results) => results,
+        Err(e) => {
+            println!("  Verification failed to run: {}", e);
+            return;
+        }
+    };
+
+    if results.is_empty() {
+        println!("  No signatures found.");
+        return;
+    }
+
+    for (i, sig) in results.iter().enumerate() {
+        println!(
+            "  Signature {}: signer={:?}, reason={:?}, valid={}",
+            i + 1,
+            sig.signer_name,
+            sig.reason,
+            sig.is_valid
+        );
+        if let Some(ref err) = sig.error {
+            println!("    error: {}", err);
+        }
+    }
 }
 
 #[cfg(not(feature = "signatures"))]

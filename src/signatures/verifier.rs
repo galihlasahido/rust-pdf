@@ -1,0 +1,557 @@
+//! Verification of PDF digital signatures.
+//!
+//! This module checks signatures produced by [`super::DocumentSigner`] and
+//! [`super::IncrementalSigner`] (and, best-effort, other PKCS#7/CMS detached
+//! signatures using the same `Adobe.PPKLite`/`adbe.pkcs7.detached` shape).
+//!
+//! Verification only establishes that a signature is *cryptographically
+//! self-consistent* — the signed bytes match the embedded digest and the
+//! embedded certificate's public key validates the signature. It does
+//! **not** perform certificate chain / root-of-trust validation, revocation
+//! checking, or timestamp (RFC 3161) validation.
+
+use std::fs;
+use std::path::Path;
+
+use cms::cert::CertificateChoices;
+use cms::content_info::ContentInfo;
+use cms::signed_data::{SignedData, SignerIdentifier};
+use der::asn1::OctetString;
+use der::{Decode, Encode};
+
+use crate::error::SignatureError;
+use super::{digest_for_algorithm, ByteRange, Certificate, SignatureAlgorithm, SignatureResult};
+
+/// Verifies digital signatures embedded in a PDF document.
+#[derive(Debug)]
+pub struct SignatureVerifier {
+    pdf_bytes: Vec<u8>,
+}
+
+impl SignatureVerifier {
+    /// Creates a verifier for the given PDF bytes.
+    pub fn new(pdf_bytes: Vec<u8>) -> Self {
+        Self { pdf_bytes }
+    }
+
+    /// Creates a verifier by reading a PDF file from disk.
+    pub fn from_file(path: impl AsRef<Path>) -> SignatureResult<Self> {
+        let pdf_bytes = fs::read(path.as_ref()).map_err(|e| {
+            SignatureError::VerificationFailed(format!("Failed to read file: {}", e))
+        })?;
+        Ok(Self::new(pdf_bytes))
+    }
+
+    /// Finds and verifies every signature present in the PDF.
+    ///
+    /// Returns one [`VerifiedSignature`] per signature found, in the order
+    /// they appear in the file. A problem with an individual signature is
+    /// reported via that signature's `error`/`is_valid` fields rather than
+    /// aborting the whole scan — a PDF can contain several signatures where
+    /// only one is broken. An empty PDF (no signatures) returns `Ok(vec![])`.
+    pub fn verify(&self) -> SignatureResult<Vec<VerifiedSignature>> {
+        Ok(find_signature_objects(&self.pdf_bytes)
+            .into_iter()
+            .map(|raw| verify_one(&self.pdf_bytes, raw))
+            .collect())
+    }
+}
+
+/// The result of verifying a single signature found in a PDF.
+#[derive(Debug, Clone)]
+pub struct VerifiedSignature {
+    /// The signer's name, if present.
+    pub signer_name: Option<String>,
+    /// The stated reason for signing, if present.
+    pub reason: Option<String>,
+    /// The stated location of signing, if present.
+    pub location: Option<String>,
+    /// The signing time as embedded in the PDF, if present.
+    pub signing_time: Option<String>,
+    /// The byte range covered by this signature.
+    pub byte_range: ByteRange,
+    /// The signer's certificate, if it could be extracted from the signature.
+    pub certificate: Option<Certificate>,
+    /// Whether the signature is cryptographically valid: the covered bytes
+    /// match the embedded digest, and the embedded certificate's public key
+    /// validates the signature. Does not imply the certificate is trusted.
+    pub is_valid: bool,
+    /// Whether the certificate's validity period covers the current time.
+    /// `None` if this could not be determined. Informational only — not
+    /// folded into `is_valid`.
+    pub certificate_valid_now: Option<bool>,
+    /// Explains why `is_valid` is `false`, if applicable.
+    pub error: Option<String>,
+}
+
+/// A signature dictionary located in the raw PDF bytes, with its fields
+/// extracted but not yet cryptographically checked.
+struct RawSignature {
+    byte_range: ByteRange,
+    contents_hex: Vec<u8>,
+    name: Option<String>,
+    reason: Option<String>,
+    location: Option<String>,
+    signing_time: Option<String>,
+}
+
+/// Scans raw PDF bytes for `/Type /Sig` dictionaries and extracts their
+/// relevant fields.
+fn find_signature_objects(pdf_bytes: &[u8]) -> Vec<RawSignature> {
+    const TYPE_SIG: &[u8] = b"/Type /Sig";
+    const OBJ_START: &[u8] = b" 0 obj";
+    const ENDOBJ: &[u8] = b"endobj";
+
+    let mut results = Vec::new();
+    let mut search_from = 0usize;
+
+    while let Some(rel_pos) = find_bytes(&pdf_bytes[search_from..], TYPE_SIG) {
+        let match_pos = search_from + rel_pos;
+
+        let dict_start = pdf_bytes[..match_pos]
+            .windows(OBJ_START.len())
+            .rposition(|w| w == OBJ_START)
+            .map(|p| p + OBJ_START.len())
+            .unwrap_or(0);
+
+        let dict_end = find_bytes(&pdf_bytes[match_pos..], ENDOBJ)
+            .map(|p| match_pos + p)
+            .unwrap_or(pdf_bytes.len());
+
+        let slice = &pdf_bytes[dict_start..dict_end];
+
+        if let (Some(byte_range), Some(contents_hex)) =
+            (parse_byte_range(slice), parse_hex_contents(slice))
+        {
+            results.push(RawSignature {
+                byte_range,
+                contents_hex,
+                name: parse_string_field(slice, b"/Name ("),
+                reason: parse_string_field(slice, b"/Reason ("),
+                location: parse_string_field(slice, b"/Location ("),
+                signing_time: parse_string_field(slice, b"/M ("),
+            });
+        }
+
+        search_from = match_pos + TYPE_SIG.len();
+    }
+
+    results
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn parse_byte_range(slice: &[u8]) -> Option<ByteRange> {
+    const PATTERN: &[u8] = b"/ByteRange [";
+    let pos = find_bytes(slice, PATTERN)?;
+    let start = pos + PATTERN.len();
+    let end = start + slice[start..].iter().position(|&b| b == b']')?;
+    let text = std::str::from_utf8(&slice[start..end]).ok()?;
+    let nums: Vec<i64> = text
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if nums.len() != 4 {
+        return None;
+    }
+    Some(ByteRange::new(nums[0], nums[1], nums[2], nums[3]))
+}
+
+fn parse_hex_contents(slice: &[u8]) -> Option<Vec<u8>> {
+    const PATTERN: &[u8] = b"/Contents <";
+    let pos = find_bytes(slice, PATTERN)?;
+    let start = pos + PATTERN.len();
+    let end = start + slice[start..].iter().position(|&b| b == b'>')?;
+    let hex_bytes: Vec<u8> = slice[start..end]
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    hex_decode(&hex_bytes)
+}
+
+fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.chunks(2) {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+/// Parses a `/Key (value)` field, handling the `\(`, `\)`, `\\` escapes
+/// that `signer.rs::escape_pdf_string` produces.
+fn parse_string_field(slice: &[u8], key_with_paren: &[u8]) -> Option<String> {
+    let pos = find_bytes(slice, key_with_paren)?;
+    let start = pos + key_with_paren.len();
+    let mut i = start;
+    while i < slice.len() {
+        match slice[i] {
+            b'\\' => i += 2,
+            b')' => break,
+            _ => i += 1,
+        }
+    }
+    if i >= slice.len() {
+        return None;
+    }
+    Some(unescape_pdf_string(&slice[start..i]))
+}
+
+fn unescape_pdf_string(raw: &[u8]) -> String {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'\\' && i + 1 < raw.len() && matches!(raw[i + 1], b'(' | b')' | b'\\') {
+            out.push(raw[i + 1]);
+            i += 2;
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extracts the signed bytes covered by `byte_range`, mirroring
+/// `DocumentSigner::extract_signed_data`.
+fn extract_signed_bytes(pdf_bytes: &[u8], byte_range: &ByteRange) -> Vec<u8> {
+    let mut data = Vec::new();
+
+    let start1 = byte_range.offset1.max(0) as usize;
+    let end1 = start1.saturating_add(byte_range.length1.max(0) as usize);
+    if end1 <= pdf_bytes.len() {
+        data.extend_from_slice(&pdf_bytes[start1..end1]);
+    }
+
+    let start2 = byte_range.offset2.max(0) as usize;
+    let end2 = start2.saturating_add(byte_range.length2.max(0) as usize);
+    if end2 <= pdf_bytes.len() {
+        data.extend_from_slice(&pdf_bytes[start2..end2]);
+    }
+
+    data
+}
+
+/// The `/Contents` hex field is a fixed-size placeholder padded with
+/// trailing zero bytes past the actual PKCS#7 DER content (see
+/// `signer.rs::embed_signature`/`SIGNATURE_SIZE`). This reads the outer
+/// `SEQUENCE` tag+length header to find where the real content ends.
+fn trim_to_der_length(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < 2 || bytes[0] != 0x30 {
+        return None;
+    }
+    let first_len_byte = bytes[1];
+    let (header_len, content_len) = if first_len_byte & 0x80 == 0 {
+        (2usize, first_len_byte as usize)
+    } else {
+        let num_octets = (first_len_byte & 0x7F) as usize;
+        if num_octets == 0 || num_octets > 8 {
+            return None;
+        }
+        let len_bytes = bytes.get(2..2 + num_octets)?;
+        let mut len: usize = 0;
+        for &b in len_bytes {
+            len = (len << 8) | b as usize;
+        }
+        (2 + num_octets, len)
+    };
+
+    let total = header_len.checked_add(content_len)?;
+    bytes.get(..total)
+}
+
+fn verify_one(pdf_bytes: &[u8], raw: RawSignature) -> VerifiedSignature {
+    let mut result = VerifiedSignature {
+        signer_name: raw.name.clone(),
+        reason: raw.reason.clone(),
+        location: raw.location.clone(),
+        signing_time: raw.signing_time.clone(),
+        byte_range: raw.byte_range,
+        certificate: None,
+        is_valid: false,
+        certificate_valid_now: None,
+        error: None,
+    };
+
+    match verify_cryptographically(pdf_bytes, &raw) {
+        Ok(outcome) => {
+            result.certificate = outcome.certificate;
+            result.certificate_valid_now = outcome.certificate_valid_now;
+            result.is_valid = outcome.is_valid;
+            result.error = outcome.error;
+        }
+        Err(e) => {
+            result.error = Some(e);
+        }
+    }
+
+    result
+}
+
+struct CryptoOutcome {
+    certificate: Option<Certificate>,
+    certificate_valid_now: Option<bool>,
+    is_valid: bool,
+    error: Option<String>,
+}
+
+fn verify_cryptographically(pdf_bytes: &[u8], raw: &RawSignature) -> Result<CryptoOutcome, String> {
+    let der_bytes = trim_to_der_length(&raw.contents_hex)
+        .ok_or_else(|| "Could not determine PKCS#7 signature length".to_string())?;
+
+    let content_info = ContentInfo::from_der(der_bytes)
+        .map_err(|e| format!("Failed to parse PKCS#7 ContentInfo: {e}"))?;
+    let signed_data: SignedData = content_info
+        .content
+        .decode_as()
+        .map_err(|e| format!("Failed to parse CMS SignedData: {e}"))?;
+
+    let signer_info = signed_data
+        .signer_infos
+        .0
+        .iter()
+        .next()
+        .ok_or_else(|| "CMS SignedData has no SignerInfo".to_string())?;
+
+    let algo = SignatureAlgorithm::from_oid(&signer_info.signature_algorithm.oid.to_string())
+        .ok_or_else(|| {
+            format!(
+                "Unsupported signature algorithm: {}",
+                signer_info.signature_algorithm.oid
+            )
+        })?;
+
+    let signed_attrs = signer_info
+        .signed_attrs
+        .as_ref()
+        .ok_or_else(|| "Signature has no signed attributes (unsupported)".to_string())?;
+
+    let message_digest_oid = const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
+    let message_digest_attr = signed_attrs
+        .iter()
+        .find(|attr| attr.oid == message_digest_oid)
+        .ok_or_else(|| "Missing messageDigest signed attribute".to_string())?;
+
+    let digest_value: OctetString = message_digest_attr
+        .values
+        .get(0)
+        .ok_or_else(|| "messageDigest attribute has no value".to_string())?
+        .clone()
+        .decode_as()
+        .map_err(|e| format!("Invalid messageDigest attribute: {e}"))?;
+
+    let signed_bytes = extract_signed_bytes(pdf_bytes, &raw.byte_range);
+    let computed_digest = digest_for_algorithm(algo, &signed_bytes);
+    let digest_matches = computed_digest == digest_value.as_bytes();
+
+    let signed_attrs_der = signed_attrs
+        .to_der()
+        .map_err(|e| format!("Failed to re-encode signed attributes: {e}"))?;
+
+    let mut certificate = None;
+    let mut certificate_valid_now = None;
+    let mut signature_valid = false;
+    let mut crypto_error = None;
+
+    match find_matching_certificate(&signed_data, &signer_info.sid) {
+        Some(x509_cert) => match x509_cert
+            .to_der()
+            .map_err(|e| format!("Failed to encode embedded certificate: {e}"))
+            .and_then(|bytes| {
+                Certificate::from_der(&bytes)
+                    .map_err(|e| format!("Failed to load embedded certificate: {e}"))
+            }) {
+            Ok(wrapped) => {
+                certificate_valid_now = wrapped.is_currently_valid().ok();
+                match verify_signature_bytes(
+                    algo,
+                    &x509_cert,
+                    &signed_attrs_der,
+                    signer_info.signature.as_bytes(),
+                ) {
+                    Ok(valid) => signature_valid = valid,
+                    Err(e) => crypto_error = Some(e),
+                }
+                certificate = Some(wrapped);
+            }
+            Err(e) => crypto_error = Some(e),
+        },
+        None => crypto_error = Some("No certificate found in CMS SignedData".to_string()),
+    }
+
+    let is_valid = digest_matches && signature_valid;
+    let error = if is_valid {
+        None
+    } else if !digest_matches {
+        Some(
+            "Document content does not match the signed digest (document was modified after signing)"
+                .to_string(),
+        )
+    } else {
+        crypto_error.or_else(|| Some("Cryptographic signature verification failed".to_string()))
+    };
+
+    Ok(CryptoOutcome {
+        certificate,
+        certificate_valid_now,
+        is_valid,
+        error,
+    })
+}
+
+fn find_matching_certificate(
+    signed_data: &SignedData,
+    sid: &SignerIdentifier,
+) -> Option<x509_cert::Certificate> {
+    let certs = signed_data.certificates.as_ref()?;
+    let candidates: Vec<x509_cert::Certificate> = certs
+        .0
+        .iter()
+        .filter_map(|c| match c {
+            CertificateChoices::Certificate(cert) => Some(cert.clone()),
+            _ => None,
+        })
+        .collect();
+
+    if let SignerIdentifier::IssuerAndSerialNumber(ias) = sid {
+        if let Some(found) = candidates.iter().find(|cert| {
+            cert.tbs_certificate.issuer.to_der().ok() == ias.issuer.to_der().ok()
+                && cert.tbs_certificate.serial_number.to_der().ok()
+                    == ias.serial_number.to_der().ok()
+        }) {
+            return Some(found.clone());
+        }
+    }
+
+    candidates.into_iter().next()
+}
+
+fn verify_signature_bytes(
+    algo: SignatureAlgorithm,
+    cert: &x509_cert::Certificate,
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> Result<bool, String> {
+    let spki_der = cert
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|e| format!("Failed to encode public key: {e}"))?;
+    let spki = spki::SubjectPublicKeyInfoRef::from_der(&spki_der)
+        .map_err(|e| format!("Failed to decode public key: {e}"))?;
+
+    match algo {
+        SignatureAlgorithm::RsaSha256 => verify_rsa::<sha2::Sha256>(spki, message, signature_bytes),
+        SignatureAlgorithm::RsaSha384 => verify_rsa::<sha2::Sha384>(spki, message, signature_bytes),
+        SignatureAlgorithm::RsaSha512 => verify_rsa::<sha2::Sha512>(spki, message, signature_bytes),
+        SignatureAlgorithm::EcdsaP256Sha256 => verify_ecdsa_p256(spki, message, signature_bytes),
+    }
+}
+
+fn verify_rsa<D>(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> Result<bool, String>
+where
+    D: sha2::Digest + der::oid::AssociatedOid,
+{
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use signature::Verifier;
+
+    let verifying_key =
+        VerifyingKey::<D>::try_from(spki).map_err(|e| format!("Invalid RSA public key: {e}"))?;
+    let sig = Signature::try_from(signature_bytes)
+        .map_err(|e| format!("Invalid RSA signature encoding: {e}"))?;
+
+    Ok(verifying_key.verify(message, &sig).is_ok())
+}
+
+fn verify_ecdsa_p256(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> Result<bool, String> {
+    use p256::ecdsa::{Signature, VerifyingKey};
+    use signature::Verifier;
+
+    let verifying_key =
+        VerifyingKey::try_from(spki).map_err(|e| format!("Invalid ECDSA public key: {e}"))?;
+    let sig = Signature::from_der(signature_bytes)
+        .map_err(|e| format!("Invalid ECDSA signature encoding: {e}"))?;
+
+    Ok(verifying_key.verify(message, &sig).is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hex_decode() {
+        assert_eq!(hex_decode(b"48656C6C6F"), Some(b"Hello".to_vec()));
+        assert_eq!(hex_decode(b"abc"), None);
+    }
+
+    #[test]
+    fn test_parse_byte_range() {
+        let slice = b"/ByteRange [0 100 200 300]/Contents <ABCD>";
+        let range = parse_byte_range(slice).unwrap();
+        assert_eq!(range.offset1, 0);
+        assert_eq!(range.length1, 100);
+        assert_eq!(range.offset2, 200);
+        assert_eq!(range.length2, 300);
+    }
+
+    #[test]
+    fn test_parse_hex_contents() {
+        let slice = b"/Contents <48656C6C6F>\n";
+        assert_eq!(parse_hex_contents(slice), Some(b"Hello".to_vec()));
+    }
+
+    #[test]
+    fn test_parse_string_field_with_escapes() {
+        let slice = b"/Name (John \\(Doe\\))\n/Reason (Approval)\n";
+        assert_eq!(
+            parse_string_field(slice, b"/Name ("),
+            Some("John (Doe)".to_string())
+        );
+        assert_eq!(
+            parse_string_field(slice, b"/Reason ("),
+            Some("Approval".to_string())
+        );
+        assert_eq!(parse_string_field(slice, b"/Location ("), None);
+    }
+
+    #[test]
+    fn test_find_signature_objects_none() {
+        assert!(find_signature_objects(b"%PDF-1.7\n%%EOF").is_empty());
+    }
+
+    #[test]
+    fn test_trim_to_der_length_short_form() {
+        let mut bytes = vec![0x30, 0x03, 0x01, 0x02, 0x03];
+        bytes.extend_from_slice(&[0u8; 10]); // trailing padding
+        assert_eq!(trim_to_der_length(&bytes), Some(&[0x30, 0x03, 0x01, 0x02, 0x03][..]));
+    }
+
+    #[test]
+    fn test_trim_to_der_length_long_form() {
+        let content = vec![0xAAu8; 200];
+        let mut bytes = vec![0x30, 0x81, 0xC8]; // long form: 1 length octet, 0xC8 = 200
+        bytes.extend_from_slice(&content);
+        bytes.extend_from_slice(&[0u8; 5]); // trailing padding
+        let trimmed = trim_to_der_length(&bytes).unwrap();
+        assert_eq!(trimmed.len(), 3 + 200);
+    }
+}

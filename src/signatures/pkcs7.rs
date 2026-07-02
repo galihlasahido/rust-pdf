@@ -2,7 +2,6 @@
 
 use crate::error::SignatureError;
 use super::{Certificate, PrivateKey, SignatureAlgorithm, SignatureResult};
-use sha2::{Sha256, Sha384, Sha512, Digest};
 
 /// Builder for creating PKCS#7 (CMS) SignedData structures.
 #[derive(Debug)]
@@ -75,23 +74,7 @@ impl Pkcs7Builder {
 
     /// Computes the message digest.
     fn compute_digest(&self, data: &[u8]) -> Vec<u8> {
-        match self.algorithm {
-            SignatureAlgorithm::RsaSha256 | SignatureAlgorithm::EcdsaP256Sha256 => {
-                let mut hasher = Sha256::new();
-                hasher.update(data);
-                hasher.finalize().to_vec()
-            }
-            SignatureAlgorithm::RsaSha384 => {
-                let mut hasher = Sha384::new();
-                hasher.update(data);
-                hasher.finalize().to_vec()
-            }
-            SignatureAlgorithm::RsaSha512 => {
-                let mut hasher = Sha512::new();
-                hasher.update(data);
-                hasher.finalize().to_vec()
-            }
-        }
+        super::digest_for_algorithm(self.algorithm, data)
     }
 
     /// Builds the signed attributes to be signed (as SET for signing).

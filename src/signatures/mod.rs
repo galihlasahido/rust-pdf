@@ -37,11 +37,13 @@ mod certificate;
 mod config;
 mod pkcs7;
 mod signer;
+mod verifier;
 
 pub use certificate::{Certificate, PrivateKey};
 pub use config::SignatureConfig;
 pub use pkcs7::Pkcs7Builder;
 pub use signer::{ByteRange, DocumentSigner, IncrementalSigner, SignatureInfo};
+pub use verifier::{SignatureVerifier, VerifiedSignature};
 
 use crate::error::SignatureError;
 
@@ -80,6 +82,47 @@ impl SignatureAlgorithm {
             }
             SignatureAlgorithm::RsaSha384 => "2.16.840.1.101.3.4.2.2", // SHA-384
             SignatureAlgorithm::RsaSha512 => "2.16.840.1.101.3.4.2.3", // SHA-512
+        }
+    }
+
+    /// Looks up a signature algorithm from its signature algorithm OID.
+    ///
+    /// This is the reverse of [`SignatureAlgorithm::oid`], used when parsing
+    /// a CMS `SignerInfo` to determine which algorithm was used to sign.
+    pub fn from_oid(oid: &str) -> Option<Self> {
+        match oid {
+            "1.2.840.113549.1.1.11" => Some(SignatureAlgorithm::RsaSha256),
+            "1.2.840.113549.1.1.12" => Some(SignatureAlgorithm::RsaSha384),
+            "1.2.840.113549.1.1.13" => Some(SignatureAlgorithm::RsaSha512),
+            "1.2.840.10045.4.3.2" => Some(SignatureAlgorithm::EcdsaP256Sha256),
+            _ => None,
+        }
+    }
+}
+
+/// Computes the message digest for `data` using the hash algorithm
+/// associated with `algo`.
+///
+/// Shared by [`Pkcs7Builder`] (when signing) and [`SignatureVerifier`]
+/// (when verifying) so both sides hash the same way.
+pub(crate) fn digest_for_algorithm(algo: SignatureAlgorithm, data: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256, Sha384, Sha512};
+
+    match algo {
+        SignatureAlgorithm::RsaSha256 | SignatureAlgorithm::EcdsaP256Sha256 => {
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            hasher.finalize().to_vec()
+        }
+        SignatureAlgorithm::RsaSha384 => {
+            let mut hasher = Sha384::new();
+            hasher.update(data);
+            hasher.finalize().to_vec()
+        }
+        SignatureAlgorithm::RsaSha512 => {
+            let mut hasher = Sha512::new();
+            hasher.update(data);
+            hasher.finalize().to_vec()
         }
     }
 }
@@ -121,5 +164,31 @@ mod tests {
     #[test]
     fn test_signature_algorithm_default() {
         assert_eq!(SignatureAlgorithm::default(), SignatureAlgorithm::RsaSha256);
+    }
+
+    #[test]
+    fn test_signature_algorithm_from_oid_roundtrip() {
+        for algo in [
+            SignatureAlgorithm::RsaSha256,
+            SignatureAlgorithm::RsaSha384,
+            SignatureAlgorithm::RsaSha512,
+            SignatureAlgorithm::EcdsaP256Sha256,
+        ] {
+            assert_eq!(SignatureAlgorithm::from_oid(algo.oid()), Some(algo));
+        }
+        assert_eq!(SignatureAlgorithm::from_oid("0.0.0"), None);
+    }
+
+    #[test]
+    fn test_digest_for_algorithm_matches_sha256() {
+        use sha2::{Digest, Sha256};
+
+        let data = b"hello world";
+        let expected = {
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            hasher.finalize().to_vec()
+        };
+        assert_eq!(digest_for_algorithm(SignatureAlgorithm::RsaSha256, data), expected);
     }
 }

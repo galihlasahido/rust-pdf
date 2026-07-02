@@ -110,6 +110,32 @@ impl Certificate {
     pub fn der_bytes(&self) -> &[u8] {
         &self.der_bytes
     }
+
+    /// Checks whether the certificate's validity period covers the current
+    /// system time.
+    ///
+    /// This only checks the `notBefore`/`notAfter` fields — it does not
+    /// verify the certificate against a trust store or check revocation.
+    pub fn is_currently_valid(&self) -> SignatureResult<bool> {
+        use x509_cert::Certificate as X509Cert;
+        use der::Decode;
+        use std::time::SystemTime;
+
+        let cert = X509Cert::from_der(&self.der_bytes).map_err(|e| {
+            SignatureError::CertificateLoadFailed(format!("Failed to parse certificate: {}", e))
+        })?;
+
+        let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
+        let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| {
+                SignatureError::CertificateLoadFailed(format!("System clock error: {}", e))
+            })?;
+
+        Ok(now >= not_before && now <= not_after)
+    }
 }
 
 /// A private key for PDF signing.
@@ -141,6 +167,10 @@ impl PrivateKey {
     }
 
     /// Loads a private key from PEM data.
+    ///
+    /// Keys in the legacy PKCS#1 (`BEGIN RSA PRIVATE KEY`) and SEC1
+    /// (`BEGIN EC PRIVATE KEY`) formats are normalized to PKCS#8 DER on
+    /// load, since [`PrivateKey::sign`] only knows how to parse PKCS#8.
     pub fn from_pem(pem_data: &str) -> SignatureResult<Self> {
         // Try PKCS#8 format first
         if pem_data.contains("BEGIN PRIVATE KEY") {
@@ -148,21 +178,21 @@ impl PrivateKey {
             return Self::from_pkcs8_der(&der_bytes);
         }
 
-        // Try RSA private key format
+        // Try RSA private key format (PKCS#1)
         if pem_data.contains("BEGIN RSA PRIVATE KEY") {
             let der_bytes = pem_to_der(pem_data, "RSA PRIVATE KEY")?;
             return Ok(Self {
                 key_type: KeyType::Rsa,
-                der_bytes,
+                der_bytes: rsa_pkcs1_der_to_pkcs8(&der_bytes)?,
             });
         }
 
-        // Try EC private key format
+        // Try EC private key format (SEC1)
         if pem_data.contains("BEGIN EC PRIVATE KEY") {
             let der_bytes = pem_to_der(pem_data, "EC PRIVATE KEY")?;
             return Ok(Self {
                 key_type: KeyType::EcdsaP256,
-                der_bytes,
+                der_bytes: ec_sec1_der_to_pkcs8(&der_bytes)?,
             });
         }
 
@@ -279,6 +309,45 @@ fn extract_common_name(name: &x509_cert::name::Name) -> Option<String> {
         }
     }
     None
+}
+
+/// Converts a PKCS#1-encoded RSA private key (`RSAPrivateKey` DER, as
+/// produced by e.g. `openssl genrsa`) to PKCS#8 DER.
+fn rsa_pkcs1_der_to_pkcs8(der_bytes: &[u8]) -> SignatureResult<Vec<u8>> {
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::RsaPrivateKey;
+
+    let key = RsaPrivateKey::from_pkcs1_der(der_bytes).map_err(|e| {
+        SignatureError::PrivateKeyLoadFailed(format!("Failed to parse PKCS#1 RSA key: {}", e))
+    })?;
+    let pkcs8_doc = key.to_pkcs8_der().map_err(|e| {
+        SignatureError::PrivateKeyLoadFailed(format!(
+            "Failed to convert RSA key to PKCS#8: {}",
+            e
+        ))
+    })?;
+
+    Ok(pkcs8_doc.as_bytes().to_vec())
+}
+
+/// Converts a SEC1-encoded EC private key (`ECPrivateKey` DER, as produced
+/// by e.g. `openssl ecparam -genkey`) to PKCS#8 DER.
+fn ec_sec1_der_to_pkcs8(der_bytes: &[u8]) -> SignatureResult<Vec<u8>> {
+    use p256::pkcs8::EncodePrivateKey;
+    use p256::SecretKey;
+
+    let key = SecretKey::from_sec1_der(der_bytes).map_err(|e| {
+        SignatureError::PrivateKeyLoadFailed(format!("Failed to parse SEC1 EC key: {}", e))
+    })?;
+    let pkcs8_doc = key.to_pkcs8_der().map_err(|e| {
+        SignatureError::PrivateKeyLoadFailed(format!(
+            "Failed to convert EC key to PKCS#8: {}",
+            e
+        ))
+    })?;
+
+    Ok(pkcs8_doc.as_bytes().to_vec())
 }
 
 /// Converts PEM data to DER bytes.

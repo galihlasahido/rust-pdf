@@ -98,7 +98,10 @@ pub use error::SignatureError;
 #[cfg(feature = "encryption")]
 pub use encryption::{EncryptionConfig, EncryptionHandler, Permissions};
 #[cfg(feature = "signatures")]
-pub use signatures::{ByteRange, Certificate, DocumentSigner, PrivateKey, SignatureAlgorithm, SignatureConfig, SignatureInfo};
+pub use signatures::{
+    ByteRange, Certificate, DocumentSigner, IncrementalSigner, PrivateKey, SignatureAlgorithm,
+    SignatureConfig, SignatureInfo, SignatureVerifier, VerifiedSignature,
+};
 pub use font::{Font, FontMetrics, Standard14Font};
 pub use forms::{
     AppearanceBuilder, BorderStyle, CheckBox, ComboBox, FieldFlags, FormField, FormFieldTrait,
@@ -139,7 +142,10 @@ pub mod prelude {
     #[cfg(feature = "encryption")]
     pub use crate::encryption::{EncryptionConfig, EncryptionHandler, Permissions};
     #[cfg(feature = "signatures")]
-    pub use crate::signatures::{ByteRange, Certificate, DocumentSigner, PrivateKey, SignatureAlgorithm, SignatureConfig, SignatureInfo};
+    pub use crate::signatures::{
+        ByteRange, Certificate, DocumentSigner, IncrementalSigner, PrivateKey, SignatureAlgorithm,
+        SignatureConfig, SignatureInfo, SignatureVerifier, VerifiedSignature,
+    };
     pub use crate::font::{Font, FontMetrics, Standard14Font};
     pub use crate::forms::{
         AppearanceBuilder, BorderStyle, CheckBox, ComboBox, FieldFlags, FormField,
