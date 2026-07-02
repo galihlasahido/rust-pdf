@@ -13,12 +13,6 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-/// Maximum number of objects visited while walking the reachable-object
-/// graph for a full rewrite. Bounds work against a corrupt/adversarial
-/// document (e.g. a cyclic `/Kids` or resource graph); real documents
-/// this crate targets (tens of thousands of pages) are nowhere near this.
-const MAX_REACHABLE_OBJECTS: usize = 5_000_000;
-
 /// Objects packed per `/ObjStm` container (ISO 32000-1 7.5.7) in a full
 /// rewrite. Bounded (rather than one giant object stream) so a single
 /// container's decompressed size, and the cost of re-decoding it to
@@ -123,7 +117,7 @@ impl EditableDocument {
         if let Some(info) = info_id {
             roots.push(info);
         }
-        let (order, objects) = self.collect_reachable(&roots)?;
+        let (order, objects) = self.reachable_objects(&roots)?;
 
         // 2. Compact renumbering: id_map[old] = new, assigned in visita-
         //    tion (BFS) order starting at 1.
@@ -239,50 +233,139 @@ impl EditableDocument {
         Ok(out)
     }
 
-    /// BFS over every [`Object::Reference`] reachable from `roots`,
-    /// returning visitation order (used to assign compact new numbers)
-    /// and the resolved objects.
-    fn collect_reachable(
-        &self,
-        roots: &[ObjectId],
-    ) -> PdfResult<(Vec<ObjectId>, HashMap<ObjectId, Object>)> {
-        use std::collections::{HashSet, VecDeque};
+    /// Like [`EditableDocument::save_full_rewrite_to_bytes`] (same
+    /// reachability walk, same compact renumbering, same "drop anything
+    /// orphaned by an edit" behaviour), but deliberately avoids every
+    /// PDF-1.5+-only construct: no compressed object streams (`/ObjStm`,
+    /// ISO 32000-1 7.5.7) and no cross-reference *stream* (`/Type /XRef`,
+    /// 7.5.8) - every object is written as an ordinary indirect object and
+    /// the file ends in a traditional `xref`/`trailer` section (7.5.4),
+    /// exactly like a hand-authored PDF 1.4 file would.
+    ///
+    /// This is what [`crate::editor::pdfa::PdfAFlavor::Part1B`] conversion
+    /// uses to write its output: ISO 19005-1:2005 (PDF/A-1) is defined in
+    /// terms of the PDF 1.4 Reference, which predates both object streams
+    /// and cross-reference streams, so a PDF/A-1 file must not contain
+    /// them even though [`crate::editor::EditableDocument::save_full_rewrite_to_bytes`]
+    /// would otherwise always prefer them for size. PDF/A-2 and PDF/A-3
+    /// are defined against ISO 32000-1 (PDF 1.7) and do permit both, but
+    /// this writer is also used for those flavors for simplicity (a
+    /// classic xref table is always valid PDF 1.7 too, just less compact).
+    /// See the effort-estimate note in `crate::editor::pdfa` for why a
+    /// second, ObjStm-using PDF/A-2/3-specific writer was not built in
+    /// this pass.
+    ///
+    /// `version` is written verbatim into the `%PDF-x.y` header (the
+    /// caller - [`crate::editor::pdfa::PdfAFlavor::min_pdf_version`] -
+    /// decides which version each flavor requires); unlike
+    /// `save_full_rewrite_to_bytes`, this method does **not** silently
+    /// bump it to 1.5, since doing so would itself be a PDF/A-1
+    /// nonconformance.
+    pub fn save_pdfa_compatible_to_bytes(&self, version: PdfVersion) -> PdfResult<Vec<u8>> {
+        let info_id = self.reader.trailer().info;
 
-        let mut order = Vec::new();
-        let mut objects = HashMap::new();
-        let mut queued: HashSet<ObjectId> = HashSet::new();
-        let mut queue: VecDeque<ObjectId> = VecDeque::new();
-
-        for &r in roots {
-            if queued.insert(r) {
-                queue.push_back(r);
-            }
+        let mut roots = vec![self.root];
+        if let Some(info) = info_id {
+            roots.push(info);
         }
+        let (order, objects) = self.reachable_objects(&roots)?;
 
-        while let Some(id) = queue.pop_front() {
-            if order.len() >= MAX_REACHABLE_OBJECTS {
-                return Err(EditorError::ResourceLimitExceeded(
-                    "full-rewrite reachable-object graph exceeded the maximum supported size"
-                        .to_string(),
-                )
-                .into());
-            }
-            let Some(obj) = self.get_object(id) else {
-                continue;
-            };
-            let mut refs = Vec::new();
-            collect_all_refs(&obj, &mut refs);
-            for r in refs {
-                if queued.insert(r) {
-                    queue.push_back(r);
+        let mut id_map: HashMap<ObjectId, ObjectId> = HashMap::with_capacity(order.len());
+        for (i, &old_id) in order.iter().enumerate() {
+            id_map.insert(old_id, ObjectId::new(i as u32 + 1));
+        }
+        let new_root = id_map[&self.root];
+        let new_info = info_id.map(|id| id_map[&id]);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(format!("%PDF-{}\n", version.as_str()).as_bytes());
+        out.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n");
+
+        let mut offsets: Vec<(u32, u64)> = Vec::with_capacity(order.len());
+        for old_id in &order {
+            let new_id = id_map[old_id];
+            let remapped = remap_all(&objects[old_id], &id_map);
+            // Content streams still benefit from FlateDecode (a plain
+            // filter, not an ObjStm) - only the *container* format
+            // (classic table vs. compressed stream) is what PDF/A-1
+            // restricts. The XML metadata stream (ISO 32000-1 14.3.2) is
+            // the one stream PDF/A explicitly forbids compressing (ISO
+            // 19005-1:2005 6.7.2 - a validator/indexer must be able to
+            // find the PDF/A identification schema without running a
+            // Flate decoder first), so it's left exactly as
+            // [`crate::editor::xmp::EditableDocument::set_xmp_metadata`]
+            // built it (uncompressed) regardless of this method's usual
+            // "compress every plain stream" behaviour.
+            let remapped = match remapped {
+                Object::Stream(s) if !s.is_compressed() && !is_metadata_stream(&s.dictionary) => {
+                    Object::Stream(s.with_compression().unwrap_or_else(|_| PdfStream::new(Vec::new())))
                 }
-            }
-            order.push(id);
-            objects.insert(id, obj);
+                other => other,
+            };
+            let offset = out.len() as u64;
+            write_indirect_object(&mut out, new_id, &remapped);
+            offsets.push((new_id.number, offset));
         }
 
-        Ok((order, objects))
+        if out.len() > u32::MAX as usize {
+            return Err(EditorError::ResourceLimitExceeded(
+                "PDF/A-compatible rewrite output exceeds the 4 GiB offset width supported by this writer"
+                    .to_string(),
+            )
+            .into());
+        }
+
+        let xref_offset = out.len() as u64;
+        let size = order.len() as u32 + 1;
+        // ISO 19005-1:2005 6.1.3 (via the base PDF Reference's 3.4.4/
+        // 3.4.5) requires the trailer to carry an `/ID`; generate one if
+        // the source document never had one (e.g. it was itself built by
+        // `DocumentBuilder`, which doesn't set one) rather than silently
+        // omitting a required key.
+        let file_id = self.reader.trailer().id.clone().unwrap_or_else(|| {
+            let id = generate_file_id_bytes(out.len());
+            (id.clone(), id)
+        });
+        write_classic_xref_and_trailer(&mut out, &offsets, size, new_root, new_info, Some(file_id));
+        out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        Ok(out)
     }
+}
+
+/// `true` if `dict` is a `/Type /Metadata` stream dictionary (ISO
+/// 32000-1 14.3.2, Table 315).
+fn is_metadata_stream(dict: &PdfDictionary) -> bool {
+    matches!(dict.get("Type"), Some(Object::Name(n)) if n.as_str() == "Metadata")
+}
+
+/// A dependency-free (no `encryption` feature, no extra crate), non-
+/// cryptographic 16-byte file identifier for
+/// [`EditableDocument::save_pdfa_compatible_to_bytes`]'s `/ID` fallback.
+/// Unlike the `encryption` feature's own file-id generator (which needs
+/// real randomness because it feeds key derivation), a plain `/ID` only
+/// needs to be "practically unique per save", not unpredictable, so
+/// hashing wall-clock time, the process id and the output size so far is
+/// sufficient here without pulling in the `rand`/`encryption` feature.
+fn generate_file_id_bytes(output_len_so_far: usize) -> Vec<u8> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut h1 = DefaultHasher::new();
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().hash(&mut h1);
+    output_len_so_far.hash(&mut h1);
+    let a = h1.finish();
+
+    let mut h2 = DefaultHasher::new();
+    a.hash(&mut h2);
+    std::process::id().hash(&mut h2);
+    output_len_so_far.wrapping_mul(2654435761).hash(&mut h2);
+    let b = h2.finish();
+
+    let mut id = Vec::with_capacity(16);
+    id.extend_from_slice(&a.to_be_bytes());
+    id.extend_from_slice(&b.to_be_bytes());
+    id
 }
 
 /// Where an object ended up after a full rewrite, for xref-stream
@@ -292,28 +375,6 @@ enum XrefTarget {
     Offset(u64),
     /// Type 2: packed inside object-stream number `stream` at `index`.
     Compressed { stream: u32, index: u32 },
-}
-
-fn collect_all_refs(obj: &Object, out: &mut Vec<ObjectId>) {
-    match obj {
-        Object::Reference(id) => out.push(*id),
-        Object::Array(arr) => {
-            for item in arr.iter() {
-                collect_all_refs(item, out);
-            }
-        }
-        Object::Dictionary(dict) => {
-            for (_, v) in dict.iter() {
-                collect_all_refs(v, out);
-            }
-        }
-        Object::Stream(s) => {
-            for (_, v) in s.dictionary.iter() {
-                collect_all_refs(v, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Rewrites every [`Object::Reference`] in `obj` through `map`. Any
@@ -409,6 +470,44 @@ fn write_incremental_xref_and_trailer(
         out.extend_from_slice(format!("/Info {} ", info.reference_string()).as_bytes());
     }
     out.extend_from_slice(format!("/Prev {prev} ").as_bytes());
+    out.extend_from_slice(b">>\n");
+}
+
+/// Writes a traditional, full (not incremental) xref section (ISO
+/// 32000-1 7.5.4) plus trailer dictionary for
+/// [`EditableDocument::save_pdfa_compatible_to_bytes`]. `offsets` must be
+/// exactly the contiguous object numbers `1..=offsets.len()` in ascending
+/// order (guaranteed by that method's compact renumbering) so this can
+/// emit them as one `0 size` subsection headed by the conventional free
+/// object 0.
+fn write_classic_xref_and_trailer(
+    out: &mut Vec<u8>,
+    offsets: &[(u32, u64)],
+    size: u32,
+    root: ObjectId,
+    info: Option<ObjectId>,
+    file_id: Option<(Vec<u8>, Vec<u8>)>,
+) {
+    out.extend_from_slice(b"xref\n");
+    out.extend_from_slice(format!("0 {size}\n").as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for (_, offset) in offsets {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
+    }
+
+    out.extend_from_slice(b"trailer\n<< ");
+    out.extend_from_slice(format!("/Size {size} ").as_bytes());
+    out.extend_from_slice(format!("/Root {} ", root.reference_string()).as_bytes());
+    if let Some(info) = info {
+        out.extend_from_slice(format!("/Info {} ", info.reference_string()).as_bytes());
+    }
+    if let Some((id1, id2)) = file_id {
+        out.extend_from_slice(b"/ID [");
+        out.extend_from_slice(crate::object::PdfString::Hex(id1).to_pdf_string().as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(crate::object::PdfString::Hex(id2).to_pdf_string().as_bytes());
+        out.extend_from_slice(b"] ");
+    }
     out.extend_from_slice(b">>\n");
 }
 
@@ -582,5 +681,46 @@ mod tests {
             let bytes = reopened.page_content_bytes(id).unwrap();
             assert!(String::from_utf8_lossy(&bytes).contains(&format!("Page {i}")));
         }
+    }
+
+    #[test]
+    fn test_pdfa_compatible_save_round_trips() {
+        let original = sample_pdf(3);
+        let doc = EditableDocument::from_bytes(original).unwrap();
+        let saved = doc.save_pdfa_compatible_to_bytes(PdfVersion::V1_4).unwrap();
+        assert!(saved.starts_with(b"%PDF-1.4\n"));
+
+        let reopened = EditableDocument::from_bytes(saved).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), 3);
+        for i in 0..3 {
+            let id = reopened.page_id_at(i).unwrap();
+            let bytes = reopened.page_content_bytes(id).unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains(&format!("Page {i}")));
+        }
+    }
+
+    #[test]
+    fn test_pdfa_compatible_save_never_emits_object_streams_or_xref_streams() {
+        // The whole point of this writer (vs. save_full_rewrite_to_bytes)
+        // is avoiding PDF-1.5+-only constructs, which PDF/A-1 forbids.
+        let original = sample_pdf(10);
+        let doc = EditableDocument::from_bytes(original).unwrap();
+        let saved = doc.save_pdfa_compatible_to_bytes(PdfVersion::V1_4).unwrap();
+        let text = String::from_utf8_lossy(&saved);
+        assert!(!text.contains("/ObjStm"), "must not use compressed object streams");
+        assert!(!text.contains("/Type/XRef") && !text.contains("/Type /XRef"), "must not use a cross-reference stream");
+        assert!(text.contains("\nxref\n"), "must use a classic xref table");
+        assert!(text.contains("trailer"), "must use a classic trailer dictionary");
+    }
+
+    #[test]
+    fn test_pdfa_compatible_save_drops_orphans_like_full_rewrite() {
+        let original = sample_pdf(4);
+        let mut doc = EditableDocument::from_bytes(original).unwrap();
+        doc.delete_page(1).unwrap();
+        let saved = doc.save_pdfa_compatible_to_bytes(PdfVersion::V1_7).unwrap();
+        assert!(saved.starts_with(b"%PDF-1.7\n"));
+        let reopened = EditableDocument::from_bytes(saved).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), 3);
     }
 }

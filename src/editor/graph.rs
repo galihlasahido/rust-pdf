@@ -6,6 +6,7 @@ use crate::object::{Object, PdfDictionary};
 use crate::parser::PdfReader;
 use crate::types::ObjectId;
 use indexmap::IndexMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 /// Maximum number of nodes visited while walking a page tree (ISO 32000-1
@@ -17,6 +18,14 @@ const MAX_PAGE_TREE_NODES: usize = 500_000;
 
 /// Maximum `/Kids`-nesting depth allowed while walking a page tree.
 const MAX_PAGE_TREE_DEPTH: u32 = 64;
+
+/// Maximum number of objects visited by [`EditableDocument::reachable_objects`].
+/// Shared bound for every full-graph walk (full rewrite, PDF/A-safe save,
+/// and the conformance validators/converters in
+/// [`crate::editor::pdfa`]/[`crate::editor::pdfx`]/[`crate::editor::pdfua`]),
+/// so a corrupt/adversarial resource graph (e.g. a cyclic `/Resources` or
+/// `/Group` reference) cannot force unbounded work in any of them.
+const MAX_REACHABLE_OBJECTS: usize = 5_000_000;
 
 /// An existing PDF document loaded for in-place editing.
 ///
@@ -276,6 +285,116 @@ impl EditableDocument {
         page.set("Annots", Object::Array(annots));
         self.set_object(page_id, Object::Dictionary(page));
         Ok(())
+    }
+
+    /// Returns the classic `/Info /Title` (ISO 32000-1 14.3.3, Table 317)
+    /// if the document has an `/Info` dictionary with one, decoded via
+    /// [`super::util::from_pdf_text_string`]. Shared by
+    /// [`crate::editor::pdfa`]'s `/Info`-vs-XMP title equivalence check
+    /// (ISO 19005-1 6.7.3) and [`crate::editor::pdfua`]'s XMP `dc:title`
+    /// fallback (ISO 14289-1 7.1's "the metadata stream must contain
+    /// dc:title" requirement) - both need "does this document already
+    /// have a title", just for different reasons.
+    pub(crate) fn classic_info_title(&self) -> Option<String> {
+        let info_dict = self.reader.trailer().info.and_then(|id| self.get_dictionary(id).ok())?;
+        match info_dict.get("Title") {
+            Some(Object::String(s)) => Some(super::util::from_pdf_text_string(s)),
+            _ => None,
+        }
+    }
+
+    /// Returns `page_id`'s own `/Resources` dictionary (ISO 32000-1
+    /// 7.7.3.4, Table 30), resolving one level of indirection if it's a
+    /// reference. Does **not** walk up the page tree for an inherited
+    /// `/Resources` on an ancestor `/Pages` node (a rare, legal-but-
+    /// unusual authoring style, ISO 32000-1 7.7.3.4's inheritable
+    /// attributes) - every producer this crate is aware of, including
+    /// this crate's own [`crate::page::PageBuilder`], always sets
+    /// `/Resources` directly on the page. Callers that need the fully
+    /// spec-correct inherited lookup should treat this as a documented
+    /// simplification, not a guarantee.
+    pub(crate) fn page_resources(&self, page_id: ObjectId) -> PdfResult<PdfDictionary> {
+        let page = self.get_dictionary(page_id)?;
+        match page.get("Resources") {
+            Some(Object::Dictionary(d)) => Ok(d.clone()),
+            Some(Object::Reference(id)) => self.get_dictionary(*id),
+            _ => Ok(PdfDictionary::new()),
+        }
+    }
+
+    /// BFS over every [`Object::Reference`] reachable from `roots` (direct
+    /// or indirect, through dictionaries/arrays/stream dictionaries),
+    /// returning visitation order (breadth-first, so e.g. a full rewrite
+    /// can assign compact ids in a stable order) and the resolved objects.
+    ///
+    /// This is the one bounded graph walk shared by
+    /// [`EditableDocument::save_full_rewrite_to_bytes`],
+    /// [`EditableDocument::save_pdfa_compatible_to_bytes`]
+    /// (`crate::editor::save`) and the conformance checkers in
+    /// `crate::editor::pdfa`/`pdfx`/`pdfua` - every one of them needs "every
+    /// object the document actually uses" over an untrusted object graph,
+    /// so the [`MAX_REACHABLE_OBJECTS`] bound protects all of them
+    /// identically rather than each reimplementing (and each having to be
+    /// independently proven to bound) its own walk.
+    pub(crate) fn reachable_objects(&self, roots: &[ObjectId]) -> PdfResult<(Vec<ObjectId>, HashMap<ObjectId, Object>)> {
+        let mut order = Vec::new();
+        let mut objects = HashMap::new();
+        let mut queued: HashSet<ObjectId> = HashSet::new();
+        let mut queue: VecDeque<ObjectId> = VecDeque::new();
+
+        for &r in roots {
+            if queued.insert(r) {
+                queue.push_back(r);
+            }
+        }
+
+        while let Some(id) = queue.pop_front() {
+            if order.len() >= MAX_REACHABLE_OBJECTS {
+                return Err(EditorError::ResourceLimitExceeded(
+                    "reachable-object graph exceeded the maximum supported size".to_string(),
+                )
+                .into());
+            }
+            let Some(obj) = self.get_object(id) else {
+                continue;
+            };
+            let mut refs = Vec::new();
+            collect_all_refs(&obj, &mut refs);
+            for r in refs {
+                if queued.insert(r) {
+                    queue.push_back(r);
+                }
+            }
+            order.push(id);
+            objects.insert(id, obj);
+        }
+
+        Ok((order, objects))
+    }
+}
+
+/// Collects every [`Object::Reference`] directly contained in `obj` (one
+/// level of dictionaries/arrays/stream dictionaries - the caller's BFS
+/// handles following them transitively).
+fn collect_all_refs(obj: &Object, out: &mut Vec<ObjectId>) {
+    match obj {
+        Object::Reference(id) => out.push(*id),
+        Object::Array(arr) => {
+            for item in arr.iter() {
+                collect_all_refs(item, out);
+            }
+        }
+        Object::Dictionary(dict) => {
+            for (_, v) in dict.iter() {
+                collect_all_refs(v, out);
+            }
+        }
+        Object::Stream(s) => {
+            for (_, v) in s.dictionary.iter() {
+                collect_all_refs(v, out);
+            }
+        }
+        _ => {}
     }
 }
 
