@@ -70,7 +70,8 @@ rust-pdf = { version = "0.1.0", features = ["full"] }
 | `parser` | Read existing PDFs | `nom` |
 | `encryption` | AES-256 password protection | `aes`, `sha2`, `rand` |
 | `signatures` | Digital signatures | `rsa`, `x509-cert`, `cms` |
-| `full` | All features enabled | All above |
+| `render` | Rasterize pages to `RgbaImage` via Pdfium FFI (see `src/render/mod.rs`) | `pdfium-render`, `image`; requires a native `libpdfium` at run time — see `scripts/fetch_pdfium.sh` |
+| `full` | All features enabled *except* `render` (native binary dependency, opted into separately) | All above except `render` |
 
 ## Quick Start
 

@@ -16,6 +16,14 @@ signatures = ["encryption", "cms", "x509-cert", "rsa", "p256", "ecdsa", "const-o
 html = []
 office = []
 full = ["compression", "images", "parser", "encryption", "signatures", "html", "office"]
+# Content-stream rasterization (path fill/stroke, text, clipping, transparency,
+# color-space conversion) via an FFI binding to Google's Pdfium engine. See
+# src/render/mod.rs and ARCHITECTURE.md ("Native vs FFI rendering decision")
+# for why this is FFI rather than a from-scratch Rust rasterizer. Kept out of
+# `full` deliberately: it requires bundling a native, per-platform Pdfium
+# shared library at application-packaging time (scripts/fetch_pdfium.sh),
+# which pure structural/generation consumers of this crate do not need.
+render = ["dep:pdfium-render", "images"]
 
 [dependencies]
 thiserror = "2.0"
@@ -45,6 +53,7 @@ der = { version = "0.7", optional = true, features = ["std", "pem", "alloc"] }
 spki = { version = "0.7", optional = true, features = ["std"] }
 pkcs8 = { version = "0.10", optional = true, features = ["std", "pem"] }
 signature = { version = "2.2", optional = true }
+pdfium-render = { version = "0.9.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3.0"

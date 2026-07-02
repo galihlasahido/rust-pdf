@@ -74,6 +74,8 @@ pub mod object;
 pub mod page;
 #[cfg(feature = "parser")]
 pub mod parser;
+#[cfg(feature = "render")]
+pub mod render;
 #[cfg(feature = "signatures")]
 pub mod signatures;
 pub mod types;
@@ -93,6 +95,8 @@ pub use error::CompressionError;
 pub use error::ImageError;
 #[cfg(feature = "parser")]
 pub use error::ParserError;
+#[cfg(feature = "render")]
+pub use error::RenderError;
 #[cfg(feature = "encryption")]
 pub use error::EncryptionError;
 #[cfg(feature = "signatures")]
@@ -118,6 +122,8 @@ pub use object::{
     StreamBuilder,
 };
 pub use page::{Page, PageBuilder};
+#[cfg(feature = "render")]
+pub use render::{PdfRenderer, PdfiumLibrary, RgbaImage, Viewport};
 pub use types::{Matrix, ObjectId, Rectangle};
 pub use writer::PdfWriter;
 
@@ -159,6 +165,10 @@ pub mod prelude {
     #[cfg(feature = "parser")]
     pub use crate::parser::PdfReader;
     pub use crate::page::{Page, PageBuilder};
+    #[cfg(feature = "render")]
+    pub use crate::render::{PdfRenderer, PdfiumLibrary, RgbaImage, Viewport};
+    #[cfg(feature = "render")]
+    pub use crate::error::RenderError;
     pub use crate::types::{Matrix, ObjectId, Rectangle};
 }
 

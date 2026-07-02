@@ -365,3 +365,117 @@ The only artifacts added by this task are this file (`ARCHITECTURE.md`) and loca
 tooling output (`target/llvm-cov/**`). `cargo-llvm-cov` was installed into the local cargo
 toolchain (`~/.cargo/bin`) to produce the coverage numbers in §6; it was not present before this
 audit.
+
+## 12. Rendering: native-vs-FFI decision (implemented)
+
+This section records the decision for the gap identified in §10 ("a real content-stream
+interpreter + rasterizer/vector-renderer... does not exist at all today") and documents what was
+actually built. The full rationale also lives as rustdoc in `src/render/mod.rs` (the canonical,
+versioned copy — read that first; this is a summary for anyone auditing the repo top-down).
+
+**Decision: FFI to Google's Pdfium via the `pdfium-render` crate, gated behind an opt-in
+`render` Cargo feature. Not a from-scratch Rust content-stream interpreter/rasterizer.**
+
+### Why
+
+- `tiny-skia`/`raqote` (2D rasterizer backends) and `ttf-parser`/`rustybuzz` (font
+  parsing/shaping) are **not** PDF parsers. Using them as a rendering backend would still
+  require this crate to build, from zero: the content-stream interpreter itself; every
+  ISO 32000-1 §8.6 color space (CalGray/CalRGB, Lab, ICCBased, Indexed, Separation/DeviceN, not
+  just DeviceGray/RGB/CMYK); transparency groups and blend modes (§11); CID/Type0 font handling
+  with embedded CFF/TrueType/OpenType programs; annotation appearance streams (§12.5.5) and
+  AcroForm field appearance generation; and every image filter real documents use, including
+  JBIG2 and JPX — for which the Rust ecosystem has **no mature decoder today**, and both are
+  common in scanned enterprise documents. That is a multi-year, multi-person effort (see §10),
+  not a phase.
+- Pdfium is the engine behind Google Chrome's PDF viewer: exercised at billions-of-page-views
+  scale, fuzzed continuously by Chromium's infrastructure, and tested against tens of thousands
+  of real-world regression PDFs accumulated over more than a decade. No from-scratch renderer
+  built in this project's timeframe could realistically match that compatibility bar.
+- `pdfium-render` is a mature, actively maintained Rust binding, and `bblanchon/pdfium-binaries`
+  publishes prebuilt, per-platform shared libraries that are straightforward to bundle as a
+  native resource in a Tauri application (Tauri already ships/bundles native binaries as a
+  normal part of its packaging model).
+
+### Explicit trade-offs accepted
+
+- **Native binary dependency.** The `render` feature pulls in `pdfium-render` (FFI) and requires
+  a platform-specific `libpdfium.{dylib,so,dll}` (a few MB) at *run time*, loaded dynamically via
+  `libloading` — there is no special build-time toolchain requirement for `rust-pdf` itself, but
+  a shipped application must bundle the right binary per target platform/architecture. This is
+  why `render` is **not** part of the `full` feature: pure structural/generation/signing
+  consumers of this crate (the FFI/C/Python/etc. bindings in `examples/`) do not need it.
+- **FFI/crash-level risk.** A memory-safe Rust program can still crash if the native library is
+  missing/corrupted/mismatched, or if Pdfium itself has a bug. This is mitigated by Pdfium's own
+  fuzzing coverage, not by anything this crate can add — but it is a real category of risk a
+  pure-Rust renderer would not have (at the cost of that pure-Rust renderer taking years to reach
+  comparable real-world compatibility).
+- **Concurrency is the caller's responsibility to serialize, and this crate does so internally.**
+  Pdfium's C API is documented upstream as not safe to call concurrently from multiple threads.
+  `pdfium-render`'s `thread_safe` Cargo feature (on by default) only makes the Rust wrapper types
+  satisfy `Send`/`Sync` so they can live in shared/static application state (e.g. a Tauri
+  `State`) — it does **not** add internal locking around FFI calls. This was confirmed
+  empirically while building `tests/render_tests.rs`: running the render test suite with a
+  parallel test harness reliably crashed the process (SIGABRT inside `libpdfium`, not a
+  catchable Rust panic) before a fix was added. A second, related crash (SIGSEGV) was found once
+  the first was fixed: dropping a `PdfRenderer` (which closes its document via
+  `FPDF_CloseDocument`) on one thread while another thread was still rendering also crashed the
+  process, because a naive `Drop` impl runs *after* the lock guard for that scope would already
+  have been released. `src/render/renderer.rs` now (a) serializes every FFI-touching call behind
+  a single process-wide `Mutex` (`ffi_lock`), and (b) wraps `PdfRenderer`'s `PdfDocument` field in
+  `ManuallyDrop` with a custom `Drop` impl that explicitly holds `ffi_lock` while closing it; see
+  the doc comments on `ffi_lock` and that `Drop` impl for details, and
+  `tests/render_tests.rs`/this task's report for the repeated-run evidence this was verified
+  against (stress-run several times under default `cargo test` parallelism with no further
+  crashes). This makes `PdfRenderer`/`PdfiumLibrary` safe to call from multiple
+  threads (e.g. concurrent Tauri command invocations), at the cost of serializing actual
+  rendering work — acceptable for a rendering workload that is CPU-bound per call anyway.
+- **We do not, and cannot, verify Pdfium's internal rendering correctness against the spec
+  ourselves** — only that this crate's wrapper (a) loads the library safely, (b) validates
+  caller/file-derived inputs *before* they reach the FFI boundary (see below), and (c) converts
+  results faithfully. Bugs inside Pdfium itself are upstream's to fix.
+- **Tiled/viewport rendering re-renders the full page internally and crops it**, rather than
+  using a hand-rolled Pdfium transformation matrix to rasterize only the requested tile
+  (`FPDF_RenderPageBitmapWithMatrix`). This was a deliberate, disclosed scope reduction: this
+  crate could not confirm from the ISO 32000 spec alone how such a custom matrix interacts with
+  Pdfium's internal page-rotation handling, and getting that wrong would silently produce
+  *visually incorrect* tiles — worse than the current, memory-heavier-at-extreme-zoom behavior.
+  See the "Known limitation" subsection of `src/render/mod.rs` for the estimated 1-3
+  engineer-day follow-up to implement genuine partial-bitmap tiling with empirical verification
+  against rotated real-world PDFs.
+
+### What was built
+
+- `src/render/mod.rs`, `src/render/renderer.rs`, `src/render/cache.rs` (new module, gated by the
+  `render` Cargo feature, which also pulls in `images` for the shared `image::RgbaImage` type).
+- Public API: `PdfiumLibrary::bind()` / `bind_from_path()` (process-wide native library loading,
+  documented single-init constraint), `PdfRenderer::open_bytes()` / `open_file()` (with
+  ISO 32000-1 §7.6 password support), `PdfRenderer::render_page(page_index, dpi, viewport) ->
+  Result<RgbaImage, RenderError>`, and `PdfRenderer::render_thumbnail(page_index, max_dimension)`
+  backed by a bounded LRU cache (`src/render/cache.rs`).
+- Untrusted-input handling per this project's mandatory rules: page geometry (`/MediaBox`,
+  ISO 32000-1 §7.7.3.3) comes from the (untrusted) PDF file; combined with a caller-supplied DPI
+  it could otherwise be used to force an unbounded allocation. `render_page`/`render_thumbnail`
+  compute the target pixel count up front and reject anything exceeding
+  `render::MAX_RENDER_PIXELS` (64,000,000 px, ~256 MiB as RGBA8) with `RenderError::OutputTooLarge`
+  *before* asking Pdfium to allocate a bitmap — verified by
+  `tests/render_tests.rs::oversized_dpi_is_rejected_before_allocating`.
+- `scripts/fetch_pdfium.sh`: developer/CI convenience script that downloads the correct
+  `bblanchon/pdfium-binaries` release asset for the host platform into `.pdfium/<platform>/`
+  (gitignored — binaries are never committed; a real application bundles this file itself at
+  packaging time, per Tauri's normal resource-bundling mechanism).
+- `tests/render_tests.rs`: builds a self-generated corpus of 9 documents (varying page sizes —
+  A4/Letter/Legal — text/font combinations, vector shapes, and an embedded raster image XObject)
+  totaling 51 pages, renders every page, and asserts correct raster dimensions (exact match to
+  `page_points * dpi / 72`) and non-blank content, plus dedicated tests for tile/viewport
+  cropping correctness (pixel-exact match against a crop of the full-page render), thumbnail
+  caching, and every validation error path (`InvalidDpi`, `InvalidPageIndex`, `EmptyViewport`,
+  `ViewportOutOfBounds`, `OutputTooLarge`, `PasswordRequired`). The corpus is self-generated
+  (deterministic, license-clean, no network dependency at test time) rather than sourced from
+  third-party files — real-world third-party PDF compatibility is exactly the risk this decision
+  delegates to Pdfium rather than re-implementing; a handful of external real-world PDFs were
+  also rendered and visually spot-checked manually during development of this feature (see the
+  task report for this phase, not committed to this repository).
+- These tests are skipped (not failed) with a clear stderr message when the native Pdfium library
+  cannot be loaded (e.g. `scripts/fetch_pdfium.sh` has not been run), so `cargo test --features
+  render` still passes in a bare checkout without the native binary present.

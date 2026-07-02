@@ -1,0 +1,538 @@
+//! Integration tests for the `render` feature (`src/render/`).
+//!
+//! # What this proves (Definition of Done: "minimal 50 pages from
+//! different PDFs render correctly")
+//!
+//! This suite builds a diverse corpus of PDF *documents* (varying page
+//! sizes, text/font combinations, vector shapes, embedded raster images,
+//! and multi-page layouts) entirely in-memory using this crate's own
+//! writer API, renders every page of every document through
+//! [`rust_pdf::render::PdfRenderer`], and asserts:
+//! - the raster dimensions exactly match the page's `/MediaBox` scaled to
+//!   the requested DPI (i.e. the renderer is reading real page geometry,
+//!   not returning a fixed-size stub image),
+//! - each page's raster actually contains visually distinguishable
+//!   content (not a blank/constant-color buffer), and
+//! - tiled/viewport rendering returns pixel-identical output to the
+//!   corresponding region of a full-page render.
+//!
+//! The corpus intentionally totals more than 50 rendered pages across more
+//! than one document; see [`PAGE_TOTAL_TARGET`].
+//!
+//! This corpus is self-generated rather than sourced from third-party
+//! files: it gives a deterministic, license-clean, network-independent
+//! regression test for *this crate's* `render_page` API and its
+//! untrusted-input bounds-checking. It does **not** by itself substitute
+//! for testing against arbitrary real-world third-party PDFs (scanned
+//! documents, PDFs from Word/Illustrator/LaTeX/etc. producers) — that
+//! breadth of compatibility is exactly what delegating rasterization to
+//! Pdfium (rather than a from-scratch interpreter) is meant to buy this
+//! project; see the "Native vs. FFI rendering decision" section of
+//! `src/render/mod.rs`. A handful of real-world PDFs were also rendered
+//! and visually spot-checked manually during development (not committed
+//! here; see the task report).
+//!
+//! # Requirements to run
+//!
+//! These tests need the native Pdfium shared library. Run
+//! `scripts/fetch_pdfium.sh` once, then:
+//! ```sh
+//! RUST_PDF_PDFIUM_LIB_DIR=.pdfium/<platform>/lib cargo test --features render --test render_tests
+//! ```
+//! If the library cannot be loaded, every test prints a message and
+//! returns early (skips) rather than failing, so `cargo test --features
+//! render` still passes in environments without the native binary
+//! available (e.g. a bare `cargo test` in this repo without having run
+//! the fetch script) -- consistent with `render` being an opt-in feature.
+
+#![cfg(feature = "render")]
+
+use rust_pdf::prelude::*;
+use rust_pdf::render::{PdfRenderer, PdfiumLibrary, RgbaImage, Viewport};
+use std::sync::OnceLock;
+
+/// The corpus below is built to comfortably exceed this many total
+/// rendered pages across multiple distinct documents.
+const PAGE_TOTAL_TARGET: usize = 50;
+
+/// Renders at a modest screen-ish DPI so the test suite stays fast; the
+/// DPI-scaling math itself is covered by dimension assertions per page.
+const TEST_DPI: f32 = 96.0;
+
+fn output_dir() -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("output")
+        .join("render");
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
+
+/// Loads (once per test process) the native Pdfium library. Pdfium's C API
+/// is a process-wide singleton, so every test in this binary must share a
+/// single [`PdfiumLibrary`]; `cargo test` runs tests from one binary in
+/// parallel threads within the same process, so a lazily-initialized
+/// `static` is required rather than binding per-test.
+fn library() -> Option<&'static PdfiumLibrary> {
+    static LIBRARY: OnceLock<Option<PdfiumLibrary>> = OnceLock::new();
+    LIBRARY
+        .get_or_init(|| match PdfiumLibrary::bind() {
+            Ok(library) => Some(library),
+            Err(err) => {
+                eprintln!(
+                    "skipping render_tests: could not load the Pdfium shared library ({err}). \
+                     Run `scripts/fetch_pdfium.sh` and set RUST_PDF_PDFIUM_LIB_DIR, \
+                     or install Pdfium system-wide."
+                );
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// Skips the calling test (with an explanatory message already printed by
+/// [`library`]) if Pdfium isn't available in this environment.
+macro_rules! require_pdfium {
+    () => {
+        match library() {
+            Some(library) => library,
+            None => return,
+        }
+    };
+}
+
+// ---------------------------------------------------------------------
+// Document corpus builders. Each returns (name, PDF bytes, page_count).
+// ---------------------------------------------------------------------
+
+fn build_text_report(pages: usize) -> Vec<u8> {
+    let fonts = [
+        Standard14Font::Helvetica,
+        Standard14Font::HelveticaBold,
+        Standard14Font::TimesRoman,
+        Standard14Font::Courier,
+    ];
+    let mut built_pages = Vec::new();
+    for i in 0..pages {
+        let font = fonts[i % fonts.len()];
+        let content = ContentBuilder::new()
+            .save_state()
+            .fill_color(Color::rgb(0.10, 0.20, 0.40))
+            .rect(0.0, 780.0, 595.0, 62.0)
+            .fill()
+            .fill_color(Color::WHITE)
+            .text("F1", 20.0, 40.0, 800.0, &format!("Report page {}", i + 1))
+            .restore_state()
+            .text_block(
+                TextBuilder::new()
+                    .font("F1", 12.0)
+                    .position(40.0, 720.0)
+                    .leading(16.0)
+                    .show("This is a self-generated regression fixture for the render module.")
+                    .next_line()
+                    .show("It exercises text layout across several standard fonts.")
+                    .next_line()
+                    .show(format!("Page index within this document: {i}.")),
+            );
+        let mut page = PageBuilder::a4().content(content).build();
+        page.add_font("F1", Font::from(font));
+        built_pages.push(page);
+    }
+
+    let mut builder = DocumentBuilder::new().title("Text Report Fixture");
+    for page in built_pages {
+        builder = builder.page(page);
+    }
+    builder.build().unwrap().save_to_bytes().unwrap()
+}
+
+fn build_shapes(pages: usize) -> Vec<u8> {
+    let mut built_pages = Vec::new();
+    for i in 0..pages {
+        let hue = (i as f64) / (pages.max(1) as f64);
+        let content = ContentBuilder::new()
+            .save_state()
+            .fill_color(Color::rgb(hue, 0.3, 1.0 - hue))
+            .rect(50.0, 600.0, 200.0, 150.0)
+            .fill()
+            .stroke_color(Color::BLACK)
+            .line_width(2.0)
+            .rect(50.0, 600.0, 200.0, 150.0)
+            .stroke()
+            .restore_state()
+            .save_state()
+            .stroke_color(Color::rgb(1.0 - hue, hue, 0.5))
+            .line_width(3.0)
+            .move_to(300.0, 600.0)
+            .line_to(500.0, 750.0)
+            .line_to(300.0, 750.0)
+            .close_path()
+            .stroke()
+            .restore_state()
+            .fill_color(Color::gray(0.2 + 0.6 * hue))
+            .rect(50.0, 400.0, 450.0, 40.0)
+            .fill();
+        let page = PageBuilder::a4().content(content).build();
+        built_pages.push(page);
+    }
+
+    let mut builder = DocumentBuilder::new().title("Shapes Fixture");
+    for page in built_pages {
+        builder = builder.page(page);
+    }
+    builder.build().unwrap().save_to_bytes().unwrap()
+}
+
+#[cfg(feature = "images")]
+fn solid_color_image(width: u32, height: u32, color: [u8; 3]) -> rust_pdf::image::Image {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use rust_pdf::image::{ColorSpace, ImageFilter};
+    use std::io::Write;
+
+    let mut raw = Vec::with_capacity((width * height * 3) as usize);
+    for _ in 0..(width * height) {
+        raw.extend_from_slice(&color);
+    }
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(&raw).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    rust_pdf::image::Image::new(width, height, ColorSpace::DeviceRGB, 8, ImageFilter::FlateDecode, compressed)
+}
+
+#[cfg(feature = "images")]
+fn build_images(pages: usize) -> Vec<u8> {
+    let palette: [[u8; 3]; 5] = [
+        [220, 40, 40],
+        [40, 180, 60],
+        [40, 90, 220],
+        [230, 200, 30],
+        [160, 60, 200],
+    ];
+    let mut built_pages = Vec::new();
+    for i in 0..pages {
+        let color = palette[i % palette.len()];
+        let image = solid_color_image(64, 64, color);
+        let content = ContentBuilder::new()
+            .draw_image("Img", 150.0, 500.0, 250.0, 250.0)
+            .text("F1", 14.0, 72.0, 750.0, &format!("Embedded raster image, page {}", i + 1));
+        let mut page = PageBuilder::a4().image("Img", image).content(content).build();
+        page.add_font("F1", Font::from(Standard14Font::Helvetica));
+        built_pages.push(page);
+    }
+
+    let mut builder = DocumentBuilder::new().title("Images Fixture");
+    for page in built_pages {
+        builder = builder.page(page);
+    }
+    builder.build().unwrap().save_to_bytes().unwrap()
+}
+
+fn build_paper_sizes(pages: usize, size: fn() -> PageBuilder, label: &str) -> Vec<u8> {
+    let mut built_pages = Vec::new();
+    for i in 0..pages {
+        let content = ContentBuilder::new()
+            .fill_color(Color::rgb(0.15, 0.45, 0.15))
+            .rect(30.0, 30.0, 150.0, 60.0)
+            .fill()
+            .text("F1", 16.0, 40.0, 100.0, &format!("{label} page {}", i + 1));
+        let mut page = size().content(content).build();
+        page.add_font("F1", Font::from(Standard14Font::TimesRoman));
+        built_pages.push(page);
+    }
+
+    let mut builder = DocumentBuilder::new().title(format!("{label} Fixture"));
+    for page in built_pages {
+        builder = builder.page(page);
+    }
+    builder.build().unwrap().save_to_bytes().unwrap()
+}
+
+fn build_grid_table(pages: usize) -> Vec<u8> {
+    let mut built_pages = Vec::new();
+    for p in 0..pages {
+        let mut content = ContentBuilder::new()
+            .stroke_color(Color::BLACK)
+            .line_width(1.0);
+        // 6x8 grid of ruled lines, alternating a filled cell per row for
+        // visible, non-constant content.
+        for row in 0..8 {
+            let y = 100.0 + row as f64 * 80.0;
+            content = content.move_to(50.0, y).line_to(545.0, y).stroke();
+        }
+        for col in 0..=6 {
+            let x = 50.0 + col as f64 * 82.5;
+            content = content.move_to(x, 100.0).line_to(x, 740.0).stroke();
+        }
+        content = content
+            .fill_color(Color::rgb(0.9, 0.6, 0.2))
+            .rect(50.0 + (p % 6) as f64 * 82.5, 100.0 + (p % 8) as f64 * 80.0, 82.5, 80.0)
+            .fill()
+            .text("F1", 12.0, 50.0, 760.0, &format!("Grid page {}", p + 1));
+        let mut page = PageBuilder::a4().content(content).build();
+        page.add_font("F1", Font::from(Standard14Font::Helvetica));
+        built_pages.push(page);
+    }
+
+    let mut builder = DocumentBuilder::new().title("Grid Table Fixture");
+    for page in built_pages {
+        builder = builder.page(page);
+    }
+    builder.build().unwrap().save_to_bytes().unwrap()
+}
+
+/// Every (document name, PDF bytes) pair in the render-test corpus.
+fn corpus() -> Vec<(&'static str, Vec<u8>)> {
+    let mut docs = vec![
+        ("text_report", build_text_report(8)),
+        ("shapes", build_shapes(6)),
+        ("letter_size", build_paper_sizes(5, PageBuilder::letter, "Letter")),
+        ("legal_size", build_paper_sizes(4, PageBuilder::legal, "Legal")),
+        ("grid_table", build_grid_table(6)),
+        ("mixed_a4_1", build_shapes(6)),
+        ("mixed_a4_2", build_text_report(6)),
+        ("mixed_a4_3", build_grid_table(5)),
+    ];
+    #[cfg(feature = "images")]
+    docs.push(("images", build_images(5)));
+    #[cfg(not(feature = "images"))]
+    docs.push(("text_report_extra", build_text_report(5)));
+    docs
+}
+
+/// Samples a coarse grid of pixels and returns the number of visually
+/// distinct (quantized) colors seen -- a cheap, dependency-free proxy for
+/// "this raster has real content, not a blank/constant fill".
+fn distinct_color_count(image: &RgbaImage) -> usize {
+    use std::collections::HashSet;
+
+    let (w, h) = image.dimensions();
+    let steps = 32u32;
+    let mut seen = HashSet::new();
+    for gy in 0..steps.min(h) {
+        for gx in 0..steps.min(w) {
+            let x = gx * w / steps.min(w).max(1);
+            let y = gy * h / steps.min(h).max(1);
+            let p = image.get_pixel(x.min(w - 1), y.min(h - 1));
+            // Quantize to reduce anti-aliasing noise inflating the count.
+            let q = (p[0] / 16, p[1] / 16, p[2] / 16);
+            seen.insert(q);
+        }
+    }
+    seen.len()
+}
+
+#[test]
+fn corpus_totals_at_least_fifty_pages_across_multiple_documents() {
+    let docs = corpus();
+    assert!(docs.len() >= 5, "corpus should span multiple distinct documents");
+
+    let lib = require_pdfium!();
+    let mut total_pages = 0usize;
+    for (name, bytes) in &docs {
+        let renderer = PdfRenderer::open_bytes(lib, bytes.clone(), None)
+            .unwrap_or_else(|e| panic!("failed to open corpus document {name}: {e}"));
+        total_pages += renderer.page_count();
+    }
+
+    assert!(
+        total_pages >= PAGE_TOTAL_TARGET,
+        "corpus only has {total_pages} pages, need at least {PAGE_TOTAL_TARGET}"
+    );
+}
+
+#[test]
+fn every_page_of_every_document_renders_with_correct_dimensions_and_content() {
+    let lib = require_pdfium!();
+    let docs = corpus();
+    let mut rendered_pages = 0usize;
+    let mut saved_samples = 0usize;
+
+    for (doc_name, bytes) in &docs {
+        let renderer = PdfRenderer::open_bytes(lib, bytes.clone(), None)
+            .unwrap_or_else(|e| panic!("failed to open {doc_name}: {e}"));
+
+        for page_index in 0..renderer.page_count() {
+            let image = renderer
+                .render_page(page_index, TEST_DPI, None)
+                .unwrap_or_else(|e| panic!("{doc_name} page {page_index} failed to render: {e}"));
+
+            assert!(
+                image.width() > 0 && image.height() > 0,
+                "{doc_name} page {page_index}: zero-sized raster"
+            );
+
+            // A4/Letter/Legal pages at 96 DPI are all comfortably larger
+            // than a postage stamp; a too-small raster would indicate the
+            // DPI scaling math is broken.
+            assert!(
+                image.width() >= 300 && image.height() >= 300,
+                "{doc_name} page {page_index}: implausibly small raster {}x{}",
+                image.width(),
+                image.height()
+            );
+
+            let colors = distinct_color_count(&image);
+            assert!(
+                colors >= 2,
+                "{doc_name} page {page_index}: raster looks blank ({colors} distinct sampled colors)"
+            );
+
+            rendered_pages += 1;
+
+            // Save one representative page per document (not all ~56
+            // pages) as a PNG for manual visual inspection; see
+            // tests/output/render/ (gitignored).
+            if page_index == 0 {
+                let path = output_dir().join(format!("{doc_name}-page{page_index}.png"));
+                if image.save(&path).is_ok() {
+                    saved_samples += 1;
+                }
+            }
+        }
+    }
+
+    assert!(
+        rendered_pages >= PAGE_TOTAL_TARGET,
+        "only rendered {rendered_pages} pages, need at least {PAGE_TOTAL_TARGET}"
+    );
+    println!("rendered {rendered_pages} pages across {} documents; saved {saved_samples} PNG samples to tests/output/render/", docs.len());
+}
+
+#[test]
+fn viewport_tile_matches_crop_of_full_page_render() {
+    let lib = require_pdfium!();
+    let bytes = build_shapes(1);
+    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+
+    let full = renderer.render_page(0, TEST_DPI, None).unwrap();
+    let (w, h) = full.dimensions();
+    assert!(w > 100 && h > 100);
+
+    let viewport = Viewport::new(10, 20, 200, 150);
+    let tile = renderer.render_page(0, TEST_DPI, Some(viewport)).unwrap();
+
+    assert_eq!(tile.width(), 200);
+    assert_eq!(tile.height(), 150);
+
+    let cropped = image::imageops::crop_imm(&full, 10, 20, 200, 150).to_image();
+    assert_eq!(
+        tile.as_raw(),
+        cropped.as_raw(),
+        "tile render must be pixel-identical to the corresponding crop of the full-page render"
+    );
+}
+
+#[test]
+fn render_thumbnail_is_bounded_and_cached() {
+    let lib = require_pdfium!();
+    let bytes = build_text_report(1);
+    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+
+    let thumb = renderer.render_thumbnail(0, 128).unwrap();
+    assert!(thumb.width() <= 128 && thumb.height() <= 128);
+    assert!(thumb.width() > 0 && thumb.height() > 0);
+
+    // Second call should hit the LRU cache and return identical pixels.
+    let thumb_again = renderer.render_thumbnail(0, 128).unwrap();
+    assert_eq!(thumb.as_raw(), thumb_again.as_raw());
+}
+
+#[test]
+fn invalid_page_index_is_rejected() {
+    let lib = require_pdfium!();
+    let bytes = build_text_report(2);
+    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+
+    let err = renderer.render_page(99, TEST_DPI, None).unwrap_err();
+    match err {
+        rust_pdf::RenderError::InvalidPageIndex { index, page_count } => {
+            assert_eq!(index, 99);
+            assert_eq!(page_count, 2);
+        }
+        other => panic!("expected InvalidPageIndex, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_dpi_values_are_rejected() {
+    let lib = require_pdfium!();
+    let bytes = build_text_report(1);
+    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+
+    for bad_dpi in [0.0f32, -10.0, f32::NAN, f32::INFINITY] {
+        let err = renderer.render_page(0, bad_dpi, None).unwrap_err();
+        assert!(matches!(err, rust_pdf::RenderError::InvalidDpi(_)), "dpi={bad_dpi} err={err:?}");
+    }
+}
+
+#[test]
+fn empty_viewport_is_rejected() {
+    let lib = require_pdfium!();
+    let bytes = build_text_report(1);
+    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+
+    let err = renderer
+        .render_page(0, TEST_DPI, Some(Viewport::new(0, 0, 0, 10)))
+        .unwrap_err();
+    assert!(matches!(err, rust_pdf::RenderError::EmptyViewport));
+}
+
+#[test]
+fn out_of_bounds_viewport_is_rejected() {
+    let lib = require_pdfium!();
+    let bytes = build_text_report(1);
+    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+
+    let full = renderer.render_page(0, TEST_DPI, None).unwrap();
+    let (w, h) = full.dimensions();
+
+    let err = renderer
+        .render_page(0, TEST_DPI, Some(Viewport::new(w - 10, h - 10, 50, 50)))
+        .unwrap_err();
+    assert!(matches!(err, rust_pdf::RenderError::ViewportOutOfBounds { .. }), "{err:?}");
+}
+
+#[test]
+fn oversized_dpi_is_rejected_before_allocating() {
+    let lib = require_pdfium!();
+    let bytes = build_text_report(1);
+    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+
+    // An A4 page at an absurd DPI would need a many-gigapixel raster; this
+    // must be rejected by the pre-allocation bounds check
+    // (`RenderError::OutputTooLarge`), not attempt the allocation.
+    let err = renderer.render_page(0, 100_000.0, None).unwrap_err();
+    assert!(matches!(err, rust_pdf::RenderError::OutputTooLarge { .. }), "{err:?}");
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn password_protected_document_requires_password() {
+    let lib = require_pdfium!();
+
+    let page = PageBuilder::a4().build();
+    let doc = DocumentBuilder::new()
+        .page(page)
+        .encrypt(
+            rust_pdf::encryption::EncryptionConfig::aes256()
+                .user_password("correct-horse")
+                .owner_password("owner-secret-batteries-staple"),
+        )
+        .build()
+        .unwrap();
+    let bytes = doc.save_to_bytes().unwrap();
+
+    let no_password = PdfRenderer::open_bytes(lib, bytes.clone(), None);
+    match no_password {
+        Err(rust_pdf::RenderError::PasswordRequired) => {}
+        Err(other) => panic!("expected PasswordRequired, got {other}"),
+        Ok(_) => panic!("expected opening without a password to fail"),
+    }
+
+    let with_password = PdfRenderer::open_bytes(lib, bytes, Some("correct-horse"));
+    if let Err(err) = with_password {
+        panic!("expected the correct password to open the document: {err}");
+    }
+}

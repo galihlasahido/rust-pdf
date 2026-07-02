@@ -53,6 +53,11 @@ pub enum PdfError {
     /// Error during form field operations.
     #[error("Form error: {0}")]
     Form(#[from] FormError),
+
+    /// Error during page rasterization/rendering.
+    #[cfg(feature = "render")]
+    #[error("Render error: {0}")]
+    Render(#[from] RenderError),
 }
 
 /// Errors related to PDF object handling.
@@ -307,6 +312,105 @@ pub enum FormError {
     /// Invalid option index.
     #[error("Invalid option index: {0}")]
     InvalidOptionIndex(usize),
+}
+
+/// Errors related to page rasterization via the Pdfium FFI backend
+/// (`render` feature).
+///
+/// See the [`crate::render`] module documentation for the native-vs-FFI
+/// rationale behind this error type wrapping `pdfium_render::PdfiumError`
+/// rather than reimplementing a content-stream interpreter's own error set.
+#[cfg(feature = "render")]
+#[derive(Debug, Error)]
+pub enum RenderError {
+    /// Failed to load the native Pdfium shared library from any of the
+    /// configured search locations.
+    #[error("failed to load the Pdfium shared library (searched: {tried}): {source}")]
+    LibraryLoad {
+        /// Human-readable description of the search locations that were tried.
+        tried: String,
+        /// Underlying `pdfium-render` error.
+        #[source]
+        source: pdfium_render::prelude::PdfiumError,
+    },
+
+    /// Pdfium failed to load/parse the document (corrupt file, wrong
+    /// password, unsupported security handler, truncated data, etc).
+    #[error("failed to open PDF document: {0}")]
+    DocumentLoad(#[source] pdfium_render::prelude::PdfiumError),
+
+    /// The document is encrypted and requires a password (ISO 32000-1
+    /// §7.6.4) that was not supplied, or the supplied password was wrong.
+    #[error("document requires a (correct) password to open")]
+    PasswordRequired,
+
+    /// `page_index` was out of range for the document's page count.
+    #[error("page index {index} out of range (document has {page_count} pages)")]
+    InvalidPageIndex {
+        /// The requested zero-based page index.
+        index: usize,
+        /// The document's actual page count.
+        page_count: usize,
+    },
+
+    /// Pdfium reported an error while rendering a specific page.
+    #[error("failed to render page {page_index}: {source}")]
+    PageRender {
+        /// The zero-based page index that failed to render.
+        page_index: usize,
+        /// Underlying `pdfium-render` error.
+        #[source]
+        source: pdfium_render::prelude::PdfiumError,
+    },
+
+    /// The requested output raster would exceed the configured maximum
+    /// pixel budget. This guards against unbounded allocation driven by a
+    /// (possibly adversarial) page `/MediaBox` combined with caller-supplied
+    /// DPI -- untrusted-input input sizes must be bounds-checked before
+    /// allocating, per this crate's mandatory rules.
+    #[error(
+        "requested render of {width}x{height} px ({pixels} px total) exceeds the \
+         maximum of {max_pixels} px; lower the DPI or request a smaller viewport"
+    )]
+    OutputTooLarge {
+        /// Requested output width in pixels.
+        width: u32,
+        /// Requested output height in pixels.
+        height: u32,
+        /// `width * height` as `u64` (computed with widening to avoid overflow).
+        pixels: u64,
+        /// The configured maximum number of pixels per render call.
+        max_pixels: u64,
+    },
+
+    /// The requested viewport (tile) rectangle is not fully contained
+    /// within the full-page raster it would be cropped from.
+    #[error(
+        "viewport at ({x},{y}) of size {width}x{height} is out of bounds for a \
+         page rendered at {page_width}x{page_height} px"
+    )]
+    ViewportOutOfBounds {
+        /// Requested viewport left offset, in device pixels.
+        x: u32,
+        /// Requested viewport top offset, in device pixels.
+        y: u32,
+        /// Requested viewport width, in device pixels.
+        width: u32,
+        /// Requested viewport height, in device pixels.
+        height: u32,
+        /// Full-page raster width, in device pixels, at the requested DPI.
+        page_width: u32,
+        /// Full-page raster height, in device pixels, at the requested DPI.
+        page_height: u32,
+    },
+
+    /// The requested viewport had a zero width or height.
+    #[error("viewport width and height must both be greater than zero")]
+    EmptyViewport,
+
+    /// `dpi` was not a finite, positive number.
+    #[error("invalid DPI value: {0} (must be finite and > 0)")]
+    InvalidDpi(f32),
 }
 
 /// A specialized Result type for PDF operations.

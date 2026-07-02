@@ -15,6 +15,12 @@
 mod ascii85;
 mod ascii_hex;
 mod ccitt;
+// `dct` depends on the optional `jpeg-decoder` crate (pulled in by the
+// `parser` feature); gate the module itself, not just its call site below,
+// so `compression`/`images` can build standalone without `parser` (see
+// `decode_filter`'s already-gated `DCTDecode` arm for the matching runtime
+// behavior when this feature is off).
+#[cfg(feature = "jpeg-decoder")]
 mod dct;
 mod lzw;
 mod predictor;
@@ -23,6 +29,7 @@ mod run_length;
 pub use ascii85::decode_ascii85;
 pub use ascii_hex::decode_ascii_hex;
 pub use ccitt::{decode_ccitt, CcittParams};
+#[cfg(feature = "jpeg-decoder")]
 pub use dct::{decode_dct, DctImage};
 pub use lzw::decode_lzw;
 pub use predictor::{apply_predictor, PredictorParams};

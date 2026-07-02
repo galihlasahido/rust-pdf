@@ -27,6 +27,16 @@ target/
 *.so
 *.dll
 
+# Prebuilt Pdfium binaries fetched by scripts/fetch_pdfium.sh for local
+# development/testing of the `render` feature. Never commit these: they are
+# large per-platform native binaries bundled at *application* packaging
+# time (see ARCHITECTURE.md), not part of this library's source.
+/.pdfium/
+
+# Rendered raster output produced by tests/render_tests.rs for manual
+# visual inspection (PNG files, potentially large).
+/tests/output/render/
+
 # Test generated files are in tests/output/ and already ignored by /tests/output/*.pdf
 # PEM files in tests/output/
 /tests/output/*.pem
