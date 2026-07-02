@@ -10,6 +10,40 @@
 //! let reader = PdfReader::from_file("document.pdf")?;
 //! println!("Page count: {}", reader.page_count());
 //! ```
+//!
+//! # Large-file streaming
+//!
+//! [`PdfReader`] never materializes the whole object graph. Opening a
+//! document ([`PdfReader::from_file`]/[`PdfReader::from_bytes`]) only parses
+//! the header, the cross-reference table/stream chain (ISO 32000-1 7.5.4 /
+//! 7.5.8), and the trailer -- all small relative to file size. Every actual
+//! PDF object (page dictionaries, content streams, fonts, images, ...) is
+//! parsed lazily, on first access, straight from its xref-table byte offset
+//! ([`PdfReader::resolve_reference`]), and cached (see "Thread safety"
+//! below) so repeat access doesn't re-parse.
+//!
+//! [`PdfReader::from_file`] additionally memory-maps the file (via
+//! [`memmap2`]) instead of reading it into a heap buffer, so opening a
+//! multi-gigabyte PDF does not require multi-gigabyte process memory up
+//! front; unread regions of the file are backed by the OS page cache, not
+//! this process's private memory.
+//!
+//! [`PdfReader::page_ref`]/[`PdfReader::get_page`] locate the Nth page by
+//! descending the page tree using each `/Pages` node's `/Count` entry (ISO
+//! 32000-1 7.7.3.2, Table 29) to skip whole sibling subtrees without
+//! resolving anything inside them, rather than walking/parsing every page
+//! from 0 to N-1. For the common case of a single, flat `/Kids` array (every
+//! child is itself a leaf page) this is a direct array index -- no other
+//! object is touched at all.
+//!
+//! # Thread safety
+//!
+//! [`PdfReader`] is `Send + Sync` and cheap to share: wrap it in an
+//! [`std::sync::Arc`] and call [`PdfReader::resolve_reference`]/
+//! [`PdfReader::get_page`]/etc. from as many threads as you like (e.g. one
+//! per page being rendered/exported concurrently). Its object cache is an
+//! [`std::sync::RwLock`], not a per-thread copy, so a page resolved by one
+//! thread is visible (and not re-parsed) by another.
 
 mod inline_image;
 mod lexer;
@@ -32,10 +66,12 @@ use crate::document::PdfVersion;
 use crate::error::{ParserError, PdfResult};
 use crate::object::{Object, PdfDictionary};
 use crate::types::ObjectId;
+use memmap2::Mmap;
 use objects::parse_indirect_object;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use trailer::parse_trailer;
 use xref::parse_xref_table;
 
@@ -55,31 +91,156 @@ fn xref_stm_offset(dict: &PdfDictionary) -> Option<u64> {
     }
 }
 
+/// Bound on the total number of node dictionaries resolved while locating a
+/// single page by index ([`PdfReader::page_ref`]/[`PdfReader::get_page`]).
+/// This is a *total* budget shared across the whole walk (not a per-branch
+/// counter), so even an adversarial `/Kids` structure (deliberately-wrong
+/// `/Count`, pathological fan-out) cannot force unbounded work -- it just
+/// makes the lookup fail (return `None`) once the budget is exhausted,
+/// rather than hang or allocate without bound. Mirrors the bound
+/// `crate::editor::graph::EditableDocument` uses for its own (full,
+/// eager) page-tree walk.
+const MAX_PAGE_TREE_WALK_NODES: usize = 500_000;
+
+/// Bound on `/Kids` nesting depth followed while locating a page by index.
+const MAX_PAGE_TREE_WALK_DEPTH: u32 = 64;
+
+/// Backing storage for a [`PdfReader`]'s raw file bytes.
+///
+/// [`PdfReader::from_file`] memory-maps the file so opening even a
+/// multi-gigabyte PDF does not require reading the whole file into the
+/// process's heap up front, and so that the OS page cache -- not this
+/// process's private memory -- backs any region of the file this reader
+/// never actually touches (e.g. objects on pages the caller never visits).
+/// [`PdfReader::from_bytes`] instead keeps ownership of a caller-supplied
+/// in-memory buffer, for callers that already have the bytes (e.g.
+/// downloaded content, tests).
+///
+/// Both variants deref to `&[u8]`, so every existing offset-based parsing
+/// routine in this module works unchanged regardless of which backing is in
+/// use.
+enum DataSource {
+    /// Bytes owned directly by this process (from [`PdfReader::from_bytes`]).
+    Owned(Vec<u8>),
+    /// A read-only memory mapping of a file (from [`PdfReader::from_file`]).
+    Mapped(Mmap),
+}
+
+impl std::ops::Deref for DataSource {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            DataSource::Owned(v) => v,
+            DataSource::Mapped(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Debug for DataSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataSource::Owned(v) => f.debug_tuple("Owned").field(&v.len()).finish(),
+            DataSource::Mapped(m) => f.debug_tuple("Mapped").field(&m.len()).finish(),
+        }
+    }
+}
+
+/// A fully decoded object stream (ISO 32000-1 7.5.7), cached by
+/// [`PdfReader::resolve_compressed_object`] so that resolving several
+/// compressed objects out of the same `/ObjStm` only pays the Flate
+/// decompression cost (and the cost of re-parsing the `/ObjStm`'s own
+/// indirect-object header) once, not once per compressed object requested.
+#[derive(Debug)]
+struct DecodedObjectStream {
+    /// Fully filter-decoded stream data (header pairs followed by the N
+    /// object bodies, per 7.5.7).
+    data: Vec<u8>,
+    /// Byte offset within `data` where the first object body begins
+    /// (`/First`).
+    first: usize,
+    /// Number of objects in the stream (`/N`).
+    num_objects: usize,
+}
+
 /// A PDF document reader.
 ///
 /// Provides read-only access to PDF document structure and content.
+///
+/// See the [module docs](crate::parser) for the lazy-loading/memory-mapping
+/// design and thread-safety guarantees: this type is `Send + Sync` and is
+/// meant to be shared behind an [`Arc`] across multiple rendering/export
+/// threads.
 #[derive(Debug)]
 pub struct PdfReader {
-    /// Raw PDF data.
-    data: Vec<u8>,
+    /// Raw PDF data (owned buffer or memory-mapped file).
+    data: DataSource,
     /// PDF version.
     version: PdfVersion,
     /// Cross-reference table.
     xref: XrefTable,
     /// Trailer information.
     trailer: Trailer,
-    /// Object cache.
-    object_cache: HashMap<ObjectId, Object>,
+    /// Cache of already-resolved top-level indirect objects, keyed by id.
+    /// An [`RwLock`] (rather than requiring `&mut self`) so many threads
+    /// can call [`PdfReader::resolve_reference`] concurrently on a single
+    /// shared `Arc<PdfReader>` -- see the module-level "Thread safety"
+    /// docs.
+    object_cache: RwLock<HashMap<ObjectId, Object>>,
+    /// Cache of already-decoded object streams (ISO 32000-1 7.5.7), keyed
+    /// by the stream's own object number. See [`DecodedObjectStream`].
+    object_stream_cache: RwLock<HashMap<u32, Arc<DecodedObjectStream>>>,
 }
 
+// Compile-time guarantee that `PdfReader` can be shared across threads
+// (e.g. wrapped in `Arc<PdfReader>` and used to render/export multiple
+// pages concurrently). If a future field addition silently breaks this
+// (e.g. reintroducing an `Rc`/`Cell`), this fails to compile rather than
+// only failing at a call site far from the actual cause.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PdfReader>();
+};
+
 impl PdfReader {
-    /// Opens a PDF file for reading.
+    /// Opens a PDF file for reading via a memory-mapped, read-only view of
+    /// its bytes (see the [module docs](crate::parser) "Large-file
+    /// streaming" section) rather than reading the whole file into a heap
+    /// buffer. This is the entry point large-file/desktop-viewer callers
+    /// should use.
     pub fn from_file(path: impl AsRef<Path>) -> PdfResult<Self> {
-        let data = fs::read(path)?;
-        Self::from_bytes(data)
+        let file = fs::File::open(path)?;
+
+        // SAFETY: `memmap2::Mmap::map` is `unsafe` because the OS gives no
+        // guarantee the mapped file won't be mutated or truncated by
+        // another process/thread while it's mapped, which could in
+        // principle change the bytes a concurrent reader observes mid-read.
+        // This is the standard, documented caveat of memory-mapped I/O (and
+        // applies equally to every production PDF viewer that mmaps its
+        // input). We only ever read through the mapping (never write), and
+        // every parsing routine in this module already treats file bytes
+        // as untrusted and bounds-checks every offset/length taken from
+        // them (per this crate's mandatory rules) -- so a mid-read external
+        // mutation can at worst produce a `ParserError`/garbled parse of
+        // already-untrusted data, not a Rust-level memory-safety violation:
+        // the OS still guarantees the mapped address range stays backed by
+        // *some* valid (if possibly stale/changed) memory for the mapping's
+        // whole lifetime.
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        Self::open(DataSource::Mapped(mmap))
     }
 
-    /// Opens a PDF from bytes.
+    /// Opens a PDF already held in memory for reading.
+    ///
+    /// Prefer [`PdfReader::from_file`] for large files: it avoids copying
+    /// the whole file into this buffer up front.
+    pub fn from_bytes(data: Vec<u8>) -> PdfResult<Self> {
+        Self::open(DataSource::Owned(data))
+    }
+
+    /// Shared implementation of [`PdfReader::from_file`]/
+    /// [`PdfReader::from_bytes`].
     ///
     /// If the cross-reference table cannot be located or parsed (a
     /// corrupt/truncated file, or one with a broken `/Prev` chain), this
@@ -88,7 +249,7 @@ impl PdfReader {
     /// This mirrors the behaviour of production PDF readers, which never
     /// simply give up on a broken xref table when the objects themselves
     /// are still present in the file.
-    pub fn from_bytes(data: Vec<u8>) -> PdfResult<Self> {
+    fn open(data: DataSource) -> PdfResult<Self> {
         // Parse header
         let version = Self::parse_header(&data)?;
 
@@ -101,18 +262,7 @@ impl PdfReader {
             None => recovery::recover(&data).ok_or(ParserError::InvalidTrailer)?,
         };
 
-        // Check for encryption
-        if trailer.encrypt.is_some() {
-            return Err(ParserError::EncryptedPdf.into());
-        }
-
-        Ok(Self {
-            data,
-            version,
-            xref,
-            trailer,
-            object_cache: HashMap::new(),
-        })
+        Self::finish(data, version, xref, trailer)
     }
 
     /// Like [`PdfReader::from_bytes`], but always uses recovery-mode
@@ -121,9 +271,22 @@ impl PdfReader {
     /// is useful for diagnosing/repairing files whose xref table parses
     /// "successfully" but points at the wrong offsets.
     pub fn from_bytes_recovery_only(data: Vec<u8>) -> PdfResult<Self> {
+        let data = DataSource::Owned(data);
         let version = Self::parse_header(&data)?;
         let (xref, trailer) = recovery::recover(&data).ok_or(ParserError::InvalidTrailer)?;
 
+        Self::finish(data, version, xref, trailer)
+    }
+
+    /// Final validation (rejects encrypted documents -- not yet supported
+    /// by this reader) and struct construction shared by every
+    /// constructor.
+    fn finish(
+        data: DataSource,
+        version: PdfVersion,
+        xref: XrefTable,
+        trailer: Trailer,
+    ) -> PdfResult<Self> {
         if trailer.encrypt.is_some() {
             return Err(ParserError::EncryptedPdf.into());
         }
@@ -133,7 +296,8 @@ impl PdfReader {
             version,
             xref,
             trailer,
-            object_cache: HashMap::new(),
+            object_cache: RwLock::new(HashMap::new()),
+            object_stream_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -433,47 +597,62 @@ impl PdfReader {
         }
     }
 
-    /// Gets an object by its ID.
-    pub fn get_object(&self, id: ObjectId) -> Option<&Object> {
-        // First check cache
-        if let Some(obj) = self.object_cache.get(&id) {
-            return Some(obj);
-        }
-
-        // Object not in cache - we'd need to parse it
-        // For now, return None (cache is only populated during resolve_reference)
-        None
+    /// Returns an already-resolved object from the cache, if present.
+    ///
+    /// This is a cache-only lookup: it does **not** parse the object if it
+    /// hasn't been resolved yet (use [`PdfReader::resolve_reference`] for
+    /// that -- which also populates this cache).
+    pub fn get_object(&self, id: ObjectId) -> Option<Object> {
+        self.object_cache.read().ok()?.get(&id).cloned()
     }
 
     /// Resolves an object reference, returning the referenced object.
+    ///
+    /// The first call for a given `id` parses it lazily, straight from its
+    /// xref-table byte offset (see the [module docs](crate::parser)); the
+    /// result is cached (behind an [`RwLock`], safe to call concurrently
+    /// from multiple threads sharing one `Arc<PdfReader>`) so subsequent
+    /// calls for the same `id` are a cache hit.
     ///
     /// Never panics on a malformed/adversarial xref table: every byte
     /// offset taken from the (untrusted) xref data is validated against
     /// the actual file length before use.
     pub fn resolve_reference(&self, id: ObjectId) -> Option<Object> {
-        // Check cache first
-        if let Some(obj) = self.object_cache.get(&id) {
-            return Some(obj.clone());
+        // Check cache first.
+        if let Some(obj) = self.get_object(id) {
+            return Some(obj);
         }
 
         // Get xref entry
         let entry = self.xref.get(id.number)?;
 
-        match entry {
+        let obj = match entry {
             XrefEntry::InUse { offset, .. } => {
                 // Parse object at offset. `offset` comes straight from the
                 // (untrusted) xref table/stream, so it must be checked
                 // against the file length rather than indexed directly.
                 let data = self.data.get(*offset as usize..)?;
                 let (_, (_, _, obj)) = parse_indirect_object(data).ok()?;
-                Some(obj)
+                obj
             }
             XrefEntry::Compressed {
                 object_stream,
                 index,
-            } => self.resolve_compressed_object(*object_stream, *index),
-            XrefEntry::Free { .. } => None,
+            } => self.resolve_compressed_object(*object_stream, *index)?,
+            XrefEntry::Free { .. } => return None,
+        };
+
+        // Populate the cache. `or_insert_with` (rather than an
+        // unconditional `insert`) avoids clobbering a value another thread
+        // may have raced in and inserted first with a redundant clone; both
+        // are equal (same `id`, same underlying file), so either winner is
+        // correct to return.
+        if let Ok(mut cache) = self.object_cache.write() {
+            let cached = cache.entry(id).or_insert_with(|| obj.clone());
+            return Some(cached.clone());
         }
+
+        Some(obj)
     }
 
     /// Resolves an object from a compressed object stream (ISO 32000-1
@@ -482,7 +661,71 @@ impl PdfReader {
     /// before use; this function returns `None` rather than panicking on
     /// any malformed value.
     fn resolve_compressed_object(&self, stream_num: u32, index: u32) -> Option<Object> {
-        // Get the object stream
+        let decoded = self.decoded_object_stream(stream_num)?;
+        let index = index as usize;
+
+        // Parse the header (N pairs of obj_num, offset). Cheap relative to
+        // decompression: `/First` bounds this to the header region only,
+        // not the whole (already-decoded, already-cached) stream.
+        let header = decoded.data.get(..decoded.first)?;
+        let objects_data = decoded.data.get(decoded.first..)?;
+
+        let header_str = std::str::from_utf8(header).ok()?;
+        let nums: Vec<i64> = header_str
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+
+        if nums.len() < (index + 1) * 2 {
+            return None;
+        }
+
+        let obj_offset = *nums.get(index * 2 + 1)?;
+        if obj_offset < 0 {
+            return None;
+        }
+        let obj_offset = obj_offset as usize;
+
+        // Find end offset (next object's offset or end of data). Guard
+        // against a corrupt/adversarial header claiming an out-of-range
+        // `next_offset` too.
+        let next_offset = if index + 1 < decoded.num_objects && nums.len() >= (index + 2) * 2 {
+            let n = *nums.get((index + 1) * 2 + 1)?;
+            if n < 0 {
+                return None;
+            }
+            (n as usize).min(objects_data.len())
+        } else {
+            objects_data.len()
+        };
+
+        if obj_offset > next_offset {
+            return None;
+        }
+
+        // Parse the object
+        let obj_data = objects_data.get(obj_offset..next_offset)?;
+        let (_, obj) = objects::parse_object(obj_data).ok()?;
+
+        Some(obj)
+    }
+
+    /// Returns the fully filter-decoded contents of object stream
+    /// `stream_num` (ISO 32000-1 7.5.7), decoding (and parsing its
+    /// `/N`/`/First` header) at most once per stream regardless of how many
+    /// compressed objects within it are subsequently requested, or how many
+    /// threads request them concurrently.
+    fn decoded_object_stream(&self, stream_num: u32) -> Option<Arc<DecodedObjectStream>> {
+        if let Some(cached) = self
+            .object_stream_cache
+            .read()
+            .ok()
+            .and_then(|c| c.get(&stream_num).cloned())
+        {
+            return Some(cached);
+        }
+
+        // Get the object stream.
         let stream_entry = self.xref.get(stream_num)?;
         let offset = stream_entry.offset()?;
 
@@ -514,49 +757,160 @@ impl PdfReader {
             _ => return None,
         };
 
-        // Parse the header (N pairs of obj_num, offset).
-        let header = stream_data.get(..first)?;
-        let objects_data = stream_data.get(first..)?;
+        let decoded = Arc::new(DecodedObjectStream {
+            data: stream_data,
+            first,
+            num_objects,
+        });
 
-        let header_str = std::str::from_utf8(header).ok()?;
-        let nums: Vec<i64> = header_str
-            .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-
-        let index = index as usize;
-        if nums.len() < (index + 1) * 2 {
-            return None;
+        if let Ok(mut cache) = self.object_stream_cache.write() {
+            let cached = cache.entry(stream_num).or_insert_with(|| decoded.clone());
+            return Some(cached.clone());
         }
 
-        let obj_offset = *nums.get(index * 2 + 1)?;
-        if obj_offset < 0 {
-            return None;
-        }
-        let obj_offset = obj_offset as usize;
+        Some(decoded)
+    }
 
-        // Find end offset (next object's offset or end of data). Guard
-        // against a corrupt/adversarial header claiming an out-of-range
-        // `next_offset` too.
-        let next_offset = if index + 1 < num_objects && nums.len() >= (index + 2) * 2 {
-            let n = *nums.get((index + 1) * 2 + 1)?;
-            if n < 0 {
-                return None;
-            }
-            (n as usize).min(objects_data.len())
-        } else {
-            objects_data.len()
+    /// Returns the object id of the page at `index` (0-based, ISO 32000-1
+    /// 7.7.3.2 page-tree order), without resolving pages `0..index` first.
+    ///
+    /// See the [module docs](crate::parser) "Large-file streaming" section
+    /// for how this stays cheap even deep into a very large page tree.
+    /// Returns `None` if `index` is out of range, the catalog/page tree is
+    /// malformed, or the walk hits [`MAX_PAGE_TREE_WALK_NODES`]/
+    /// [`MAX_PAGE_TREE_WALK_DEPTH`] (an adversarial or badly corrupt
+    /// `/Kids` structure).
+    pub fn page_ref(&self, index: usize) -> Option<ObjectId> {
+        let catalog = match self.resolve_reference(self.trailer.root)? {
+            Object::Dictionary(d) => d,
+            _ => return None,
+        };
+        let pages_id = match catalog.get("Pages") {
+            Some(Object::Reference(id)) => *id,
+            _ => return None,
         };
 
-        if obj_offset > next_offset {
+        let mut budget = MAX_PAGE_TREE_WALK_NODES;
+        self.page_ref_at(pages_id, index, 0, &mut budget)
+    }
+
+    /// Returns the page dictionary at `index` (0-based). See
+    /// [`PdfReader::page_ref`].
+    pub fn get_page(&self, index: usize) -> Option<PdfDictionary> {
+        match self.resolve_reference(self.page_ref(index)?)? {
+            Object::Dictionary(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Recursive step of [`PdfReader::page_ref`]. `node_id` is either a
+    /// `/Pages` intermediate node or a `/Page` leaf; `index` is relative to
+    /// the first leaf under `node_id`.
+    fn page_ref_at(
+        &self,
+        node_id: ObjectId,
+        index: usize,
+        depth: u32,
+        budget: &mut usize,
+    ) -> Option<ObjectId> {
+        if depth > MAX_PAGE_TREE_WALK_DEPTH {
             return None;
         }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
 
-        // Parse the object
-        let obj_data = objects_data.get(obj_offset..next_offset)?;
-        let (_, obj) = objects::parse_object(obj_data).ok()?;
+        let dict = match self.resolve_reference(node_id)? {
+            Object::Dictionary(d) => d,
+            _ => return None,
+        };
 
-        Some(obj)
+        let kids = match dict.get("Kids") {
+            Some(Object::Array(k)) => k,
+            // Leaf `/Page` node (or something with no `/Kids` at all,
+            // leniently treated as a leaf like `crate::editor::graph`
+            // does): it *is* index 0 relative to itself, nothing else.
+            _ => return if index == 0 { Some(node_id) } else { None },
+        };
+
+        // Fast path: if this node's declared `/Count` exactly equals its
+        // number of direct `/Kids`, every kid must itself be a single leaf
+        // page. Proof: `/Count` (ISO 32000-1 Table 29) is the sum of each
+        // kid's own leaf count, each of which is >= 1; N kids summing to
+        // exactly N forces every one of them to contribute exactly 1. That
+        // lets us index straight into `kids` without resolving *any* of
+        // them -- the common case of a single, flat page tree (e.g. every
+        // page directly under the root `/Pages` node) is therefore O(1)
+        // here, not O(index).
+        if let Some(Object::Integer(count)) = dict.get("Count") {
+            if *count >= 0 && *count as usize == kids.len() {
+                return match kids.get(index) {
+                    Some(Object::Reference(id)) => Some(*id),
+                    _ => None,
+                };
+            }
+        }
+
+        // General case (nested/unbalanced tree, or a flat-looking node
+        // whose Count didn't match its Kids length): walk siblings in
+        // order, using each one's own subtree leaf count to skip whole
+        // subtrees without descending into them.
+        let mut remaining = index;
+        for kid in kids.iter() {
+            let Object::Reference(kid_id) = kid else {
+                continue;
+            };
+            let count = self.subtree_leaf_count(*kid_id, depth + 1, budget)?;
+            if remaining < count {
+                return self.page_ref_at(*kid_id, remaining, depth + 1, budget);
+            }
+            remaining -= count;
+        }
+
+        None
+    }
+
+    /// Returns the number of leaf pages under `node_id` *without*
+    /// descending into it when possible: an intermediate `/Pages` node
+    /// carries a `/Count` entry (ISO 32000-1 Table 29, required) that
+    /// states this directly, and a node without `/Kids` is itself exactly
+    /// one leaf.
+    ///
+    /// Falls back to actually counting a subtree's leaves (bounded by
+    /// `depth`/`budget`, same as the caller) only when `/Count` is missing
+    /// or not a valid non-negative integer -- i.e. only for a
+    /// non-conformant producer, never for a spec-conformant file.
+    fn subtree_leaf_count(&self, node_id: ObjectId, depth: u32, budget: &mut usize) -> Option<usize> {
+        if depth > MAX_PAGE_TREE_WALK_DEPTH {
+            return None;
+        }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+
+        let dict = match self.resolve_reference(node_id)? {
+            Object::Dictionary(d) => d,
+            _ => return None,
+        };
+
+        match dict.get("Kids") {
+            Some(Object::Array(kids)) => match dict.get("Count") {
+                Some(Object::Integer(n)) if *n >= 0 => Some(*n as usize),
+                _ => {
+                    let mut total = 0usize;
+                    for kid in kids.iter() {
+                        if let Object::Reference(kid_id) = kid {
+                            total = total
+                                .checked_add(self.subtree_leaf_count(*kid_id, depth + 1, budget)?)?;
+                        }
+                    }
+                    Some(total)
+                }
+            },
+            _ => Some(1),
+        }
     }
 
     /// Returns the raw PDF data.
@@ -966,5 +1320,368 @@ mod tests {
         let reader = PdfReader::from_bytes(pdf_bytes).unwrap();
 
         assert_eq!(reader.page_count(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Large-file streaming: memory-mapped I/O, object caching, and
+    // random-access page lookup (see the module docs).
+    // ---------------------------------------------------------------
+
+    /// [`PdfReader::from_file`] must open successfully via the
+    /// memory-mapped path (not just `from_bytes`) and behave identically
+    /// to a buffer-backed reader for ordinary structural access.
+    #[test]
+    fn test_from_file_uses_memory_mapped_backing() {
+        let pdf_bytes = create_simple_pdf();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &pdf_bytes).unwrap();
+
+        let reader = PdfReader::from_file(file.path()).unwrap();
+        assert!(matches!(reader.data, DataSource::Mapped(_)));
+        assert_eq!(reader.page_count(), 1);
+        assert!(reader.catalog().is_some());
+    }
+
+    /// `PdfReader::from_file` on a nonexistent path must return an error,
+    /// not panic (the underlying `File::open`/`Mmap::map` failure must
+    /// propagate through `?`, not `.unwrap()`).
+    #[test]
+    fn test_from_file_missing_path_errors_not_panics() {
+        let result = PdfReader::from_file("/no/such/path/does-not-exist.pdf");
+        assert!(result.is_err());
+    }
+
+    /// A freshly opened reader has resolved nothing yet, but the *first*
+    /// [`PdfReader::resolve_reference`] call for a given id populates the
+    /// cache so a subsequent [`PdfReader::get_object`] (cache-only) call
+    /// finds it -- this is what makes repeated access to the same object
+    /// (e.g. a page visited twice) cheap.
+    #[test]
+    fn test_resolve_reference_populates_get_object_cache() {
+        let reader = PdfReader::from_bytes(create_simple_pdf()).unwrap();
+        let root = reader.trailer().root;
+
+        assert!(reader.get_object(root).is_none(), "nothing resolved yet");
+        let resolved = reader.resolve_reference(root).unwrap();
+        assert_eq!(reader.get_object(root), Some(resolved));
+    }
+
+    /// Builds a document whose page tree is a single, flat `/Kids` array
+    /// (every kid is directly a `/Page` leaf) with `count` pages, each
+    /// carrying a distinct `/Idx` marker so a test can confirm exactly
+    /// which page object a lookup returned without needing to decode any
+    /// content stream.
+    fn flat_page_tree_pdf(count: u32) -> Vec<u8> {
+        let mut b = RawPdfBuilder::new();
+        let pages_obj_num = 2u32;
+        let mut page_offsets = Vec::new();
+        for i in 0..count {
+            let off = b.object(
+                3 + i,
+                &format!(
+                    "<< /Type /Page /Parent {pages_obj_num} 0 R /Idx {i} \
+                     /MediaBox [0 0 612 792] /Resources << >> >>"
+                ),
+            );
+            page_offsets.push(off);
+        }
+        let catalog_off = b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let kids = (0..count).map(|i| format!("{} 0 R", 3 + i)).collect::<Vec<_>>().join(" ");
+        let pages_off = b.object(
+            pages_obj_num,
+            &format!("<< /Type /Pages /Kids [{kids}] /Count {count} >>"),
+        );
+
+        let mut entries = vec![(1, catalog_off), (pages_obj_num, pages_off)];
+        for (i, off) in page_offsets.iter().enumerate() {
+            entries.push((3 + i as u32, *off));
+        }
+        b.xref_and_trailer(&entries, 3 + count, "/Root 1 0 R");
+        b.finish()
+    }
+
+    #[test]
+    fn test_get_page_flat_tree_direct_index() {
+        let reader = PdfReader::from_bytes(flat_page_tree_pdf(2_000)).unwrap();
+        assert_eq!(reader.page_count(), 2_000);
+
+        for &i in &[0usize, 1, 999, 1_999] {
+            let page = reader.get_page(i).unwrap_or_else(|| panic!("page {i}"));
+            assert_eq!(page.get("Idx"), Some(&Object::Integer(i as i64)));
+        }
+        assert!(reader.get_page(2_000).is_none());
+    }
+
+    /// The flat-tree fast path in `page_ref_at` must never resolve any
+    /// page dictionary other than the ones on the direct path to the
+    /// target (here: the catalog, the `/Pages` root, and the target leaf
+    /// itself) -- i.e. looking up the last of 2,000 pages must not touch
+    /// the other 1,999. This is the concrete "no O(N) parse" guarantee
+    /// behind the random-access DoD requirement.
+    #[test]
+    fn test_get_page_flat_tree_does_not_resolve_other_pages() {
+        let reader = PdfReader::from_bytes(flat_page_tree_pdf(5_000)).unwrap();
+        let page = reader.get_page(4_999).unwrap();
+        assert_eq!(page.get("Idx"), Some(&Object::Integer(4_999)));
+
+        let cached = reader.object_cache.read().unwrap().len();
+        // Catalog + /Pages root + the one target leaf page.
+        assert!(cached <= 3, "expected only the path-to-target objects cached, got {cached}");
+    }
+
+    /// Builds a two-level balanced tree: a root `/Pages` node with two
+    /// intermediate `/Pages` kids, each owning `per_branch` leaf pages.
+    /// Root `/Count` != root `/Kids.len()` here (2 kids, but
+    /// `2 * per_branch` total leaves), so this exercises the general
+    /// (`/Count`-guided sibling-skipping) descent path rather than the
+    /// flat-tree fast path.
+    fn nested_page_tree_pdf(per_branch: u32) -> Vec<u8> {
+        let mut b = RawPdfBuilder::new();
+        let total = per_branch * 2;
+
+        // Leaf pages for branch A (indices 0..per_branch) then branch B
+        // (indices per_branch..2*per_branch). Object numbers: leaves start
+        // at 4 (1=Catalog, 2=root Pages, 3.. branch Pages nodes).
+        let mut leaf_offsets = Vec::new();
+        for i in 0..total {
+            let off = b.object(
+                4 + i,
+                &format!(
+                    "<< /Type /Page /Idx {i} /MediaBox [0 0 612 792] /Resources << >> >>"
+                ),
+            );
+            leaf_offsets.push(off);
+        }
+
+        let branch_a_kids: String =
+            (0..per_branch).map(|i| format!("{} 0 R", 4 + i)).collect::<Vec<_>>().join(" ");
+        let branch_b_kids: String = (per_branch..total)
+            .map(|i| format!("{} 0 R", 4 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let branch_a_num = 4 + total;
+        let branch_b_num = branch_a_num + 1;
+        let branch_a_off = b.object(
+            branch_a_num,
+            &format!("<< /Type /Pages /Parent 2 0 R /Kids [{branch_a_kids}] /Count {per_branch} >>"),
+        );
+        let branch_b_off = b.object(
+            branch_b_num,
+            &format!("<< /Type /Pages /Parent 2 0 R /Kids [{branch_b_kids}] /Count {per_branch} >>"),
+        );
+
+        let catalog_off = b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let root_off = b.object(
+            2,
+            &format!(
+                "<< /Type /Pages /Kids [{branch_a_num} 0 R {branch_b_num} 0 R] /Count {total} >>"
+            ),
+        );
+
+        let mut entries = vec![
+            (1, catalog_off),
+            (2, root_off),
+            (branch_a_num, branch_a_off),
+            (branch_b_num, branch_b_off),
+        ];
+        for (i, off) in leaf_offsets.iter().enumerate() {
+            entries.push((4 + i as u32, *off));
+        }
+        b.xref_and_trailer(&entries, branch_b_num + 1, "/Root 1 0 R");
+        b.finish()
+    }
+
+    #[test]
+    fn test_get_page_nested_tree_count_guided_descent() {
+        let reader = PdfReader::from_bytes(nested_page_tree_pdf(50)).unwrap();
+        assert_eq!(reader.page_count(), 100);
+
+        for &i in &[0usize, 1, 49, 50, 51, 99] {
+            let page = reader.get_page(i).unwrap_or_else(|| panic!("page {i}"));
+            assert_eq!(page.get("Idx"), Some(&Object::Integer(i as i64)));
+        }
+        assert!(reader.get_page(100).is_none());
+    }
+
+    /// Same shape as [`test_get_page_nested_tree_count_guided_descent`],
+    /// but branch A's `/Pages` node itself omits `/Count` (non-conformant).
+    /// This specifically exercises `subtree_leaf_count`'s recursive
+    /// fallback (an intermediate node *with* `/Kids` but no valid
+    /// `/Count`), not just the "no `/Kids` => 1 leaf" base case.
+    #[test]
+    fn test_get_page_nested_tree_missing_count_on_intermediate_node_falls_back() {
+        let mut b = RawPdfBuilder::new();
+
+        let leaf_a0 = b.object(10, "<< /Type /Page /Idx 0 >>");
+        let leaf_a1 = b.object(11, "<< /Type /Page /Idx 1 >>");
+        let leaf_b0 = b.object(12, "<< /Type /Page /Idx 2 >>");
+
+        // Branch A has /Kids but *no* /Count.
+        let branch_a_off = b.object(5, "<< /Type /Pages /Kids [10 0 R 11 0 R] >>");
+        let branch_b_off = b.object(6, "<< /Type /Pages /Kids [12 0 R] /Count 1 >>");
+
+        let catalog_off = b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let root_off = b.object(2, "<< /Type /Pages /Kids [5 0 R 6 0 R] /Count 3 >>");
+
+        b.xref_and_trailer(
+            &[
+                (1, catalog_off),
+                (2, root_off),
+                (5, branch_a_off),
+                (6, branch_b_off),
+                (10, leaf_a0),
+                (11, leaf_a1),
+                (12, leaf_b0),
+            ],
+            13,
+            "/Root 1 0 R",
+        );
+
+        let reader = PdfReader::from_bytes(b.finish()).unwrap();
+        assert_eq!(reader.get_page(0).unwrap().get("Idx"), Some(&Object::Integer(0)));
+        assert_eq!(reader.get_page(1).unwrap().get("Idx"), Some(&Object::Integer(1)));
+        assert_eq!(reader.get_page(2).unwrap().get("Idx"), Some(&Object::Integer(2)));
+        assert!(reader.get_page(3).is_none());
+    }
+
+    /// A `/Pages` node with `/Kids` but no (or an invalid) `/Count` is
+    /// not spec-conformant (`/Count` is required, ISO 32000-1 Table 29),
+    /// but `page_ref`/`get_page` must still find the right leaf via the
+    /// bounded fallback in `subtree_leaf_count` rather than simply
+    /// failing the whole lookup.
+    #[test]
+    fn test_get_page_falls_back_when_count_missing() {
+        let mut b = RawPdfBuilder::new();
+        let leaf0_off = b.object(3, "<< /Type /Page /Idx 0 >>");
+        let leaf1_off = b.object(4, "<< /Type /Page /Idx 1 >>");
+        let catalog_off = b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        // No /Count at all on the Pages node.
+        let pages_off = b.object(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] >>");
+        b.xref_and_trailer(
+            &[(1, catalog_off), (2, pages_off), (3, leaf0_off), (4, leaf1_off)],
+            5,
+            "/Root 1 0 R",
+        );
+
+        let reader = PdfReader::from_bytes(b.finish()).unwrap();
+        assert_eq!(reader.get_page(0).unwrap().get("Idx"), Some(&Object::Integer(0)));
+        assert_eq!(reader.get_page(1).unwrap().get("Idx"), Some(&Object::Integer(1)));
+        assert!(reader.get_page(2).is_none());
+    }
+
+    /// A `/Pages` node whose `/Kids` lists itself must not hang
+    /// `page_ref`/`get_page` (mirrors
+    /// `crate::editor::graph`'s equivalent cyclic-tree regression test).
+    /// No `/Count` is set, so this also exercises the recursive fallback
+    /// path's own cycle/budget bound, not just the depth cap on the
+    /// direct-descent path.
+    #[test]
+    fn test_get_page_cyclic_kids_does_not_hang() {
+        let mut b = RawPdfBuilder::new();
+        let catalog_off = b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let pages_off = b.object(2, "<< /Type /Pages /Kids [2 0 R] >>");
+        b.xref_and_trailer(&[(1, catalog_off), (2, pages_off)], 3, "/Root 1 0 R");
+
+        let reader = PdfReader::from_bytes(b.finish()).unwrap();
+        // Must terminate; a self-referential Pages node has no leaves.
+        assert!(reader.get_page(0).is_none());
+    }
+
+    /// Resolving two different compressed objects out of the same
+    /// `/ObjStm` must decode/parse that stream only once (see
+    /// `decoded_object_stream`), not once per compressed object.
+    #[test]
+    fn test_compressed_object_stream_decoded_once_for_multiple_objects() {
+        let mut b = RawPdfBuilder::new();
+        let obj1_off = b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+
+        let objstm_body = b"<< /Type /Pages /Kids [] /Count 0 >> << /Foo (bar) >>";
+        let header = b"2 0 5 37"; // "obj_num offset" pairs relative to /First
+        let mut full = header.to_vec();
+        full.push(b' ');
+        full.extend_from_slice(objstm_body);
+        let first = header.len() + 1;
+        let objstm_off =
+            b.stream_object(3, &format!("/Type /ObjStm /N 2 /First {}", first), &full);
+
+        let (w1, w2, w3) = (1usize, 4usize, 2usize);
+        let mut entries = Vec::new();
+        let mut push_entry = |t: u8, f2: u32, f3: u16| {
+            entries.push(t);
+            entries.extend_from_slice(&f2.to_be_bytes());
+            entries.extend_from_slice(&f3.to_be_bytes());
+        };
+        push_entry(0, 0, 65535); // object 0: free (required head entry)
+        push_entry(1, obj1_off as u32, 0); // object 1: Catalog
+        push_entry(2, 3, 0); // object 2: compressed in stream 3, index 0
+        push_entry(1, objstm_off as u32, 0); // object 3: the ObjStm itself
+        push_entry(0, 0, 0); // object 4: unused/free filler
+        push_entry(2, 3, 1); // object 5: compressed in stream 3, index 1
+
+        b.stream_object(
+            6,
+            &format!(
+                "/Type /XRef /W [{} {} {}] /Index [0 6] /Size 6 /Root 1 0 R",
+                w1, w2, w3
+            ),
+            &entries,
+        );
+        let xref_stream_off = {
+            let marker = b"6 0 obj";
+            b.buf
+                .windows(marker.len())
+                .rposition(|w| w == marker)
+                .expect("xref stream object header must be present") as u64
+        };
+        b.buf
+            .extend_from_slice(format!("startxref\n{}\n%%EOF\n", xref_stream_off).as_bytes());
+
+        let reader = PdfReader::from_bytes(b.finish()).unwrap();
+        assert!(reader.resolve_reference(ObjectId::new(2)).is_some());
+        assert!(reader.resolve_reference(ObjectId::new(5)).is_some());
+        assert_eq!(
+            reader.object_stream_cache.read().unwrap().len(),
+            1,
+            "both compressed objects came from the same ObjStm, which should be decoded once"
+        );
+    }
+
+    /// Simple concurrent-access stress test (per this crate's DoD: a
+    /// straightforward multi-thread stress run is acceptable in lieu of
+    /// loom/miri for this module). Many threads share one `Arc<PdfReader>`
+    /// and repeatedly resolve pages/objects at once; this must complete
+    /// without panicking, deadlocking, or any thread observing a wrong
+    /// result -- `RwLock`-guarded caches are the only shared mutable
+    /// state, so this is exercising that they hand out correct,
+    /// consistent values under real contention.
+    #[test]
+    fn test_concurrent_page_access_from_multiple_threads_does_not_race_or_deadlock() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let reader = Arc::new(PdfReader::from_bytes(flat_page_tree_pdf(200)).unwrap());
+        let mut handles = Vec::new();
+
+        for t in 0..8 {
+            let reader = Arc::clone(&reader);
+            handles.push(thread::spawn(move || {
+                for iter in 0..500 {
+                    let index = (t * 37 + iter) % 200;
+                    let page = reader
+                        .get_page(index)
+                        .unwrap_or_else(|| panic!("thread {t} iter {iter}: page {index}"));
+                    assert_eq!(
+                        page.get("Idx"),
+                        Some(&Object::Integer(index as i64)),
+                        "thread {t} iter {iter}: wrong page returned for index {index}"
+                    );
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
     }
 }
