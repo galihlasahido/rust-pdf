@@ -30,3 +30,5 @@ target/
 # Test generated files are in tests/output/ and already ignored by /tests/output/*.pdf
 # PEM files in tests/output/
 /tests/output/*.pem
+/rust-pdf-implementation-prompts.md
+/rust-pdf-workflow.js
