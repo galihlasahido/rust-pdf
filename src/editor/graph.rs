@@ -1,5 +1,6 @@
 //! Core mutable object graph for [`EditableDocument`].
 
+use super::audit::{self, RedactionAuditEntry};
 use crate::error::{EditorError, PdfResult};
 use crate::object::{Object, PdfDictionary};
 use crate::parser::PdfReader;
@@ -44,6 +45,26 @@ pub struct EditableDocument {
     /// `/Outlines` tree) mutate this same id in the overlay rather than
     /// allocating a new catalog object.
     pub(crate) root: ObjectId,
+    /// The redaction audit trail (see [`crate::editor::audit`]), seeded
+    /// from whatever was already persisted in the base file's catalog (if
+    /// any) and appended to by every `redact_*`/`strip_document_metadata`
+    /// call this session.
+    pub(crate) audit_log: Vec<RedactionAuditEntry>,
+    /// Object id the audit log stream is written to. `None` until the
+    /// first redaction this session needs to persist one (an id is
+    /// allocated lazily rather than always reserving one, so opening a
+    /// document read-only never allocates an unused object).
+    pub(crate) audit_log_object_id: Option<ObjectId>,
+    /// Set once any `redact_*`/`strip_document_metadata` call has run.
+    /// [`EditableDocument::save_incremental`]/`save_incremental_to_bytes`
+    /// refuse to run while this is set: an incremental update only
+    /// *appends* bytes (ISO 32000-1 7.5.6), so the pre-redaction content
+    /// this session just removed from the object graph would still be
+    /// sitting in the file's earlier bytes, completely recoverable -
+    /// exactly the "hidden revision" problem redaction must not
+    /// reintroduce. Use [`EditableDocument::save_full_rewrite`] (or
+    /// `save_full_rewrite_to_bytes`) after redacting.
+    pub(crate) redaction_applied: bool,
 }
 
 impl EditableDocument {
@@ -89,11 +110,23 @@ impl EditableDocument {
             .unwrap_or(0)
             + 1;
 
+        let audit_log_object_id = match catalog.get(audit::AUDIT_LOG_CATALOG_KEY) {
+            Some(Object::Reference(id)) => Some(*id),
+            _ => None,
+        };
+        let audit_log = audit::load_from_catalog(&catalog, |id| match reader.resolve_reference(id) {
+            Some(Object::Stream(s)) => s.decode_all().ok(),
+            _ => None,
+        });
+
         Ok(Self {
             reader,
             overlay: IndexMap::new(),
             next_object_number,
             root,
+            audit_log,
+            audit_log_object_id,
+            redaction_applied: false,
         })
     }
 

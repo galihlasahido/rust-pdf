@@ -141,7 +141,10 @@ pub mod prelude {
     };
     pub use crate::document::{Document, DocumentBuilder, DocumentInfo, PdfVersion};
     #[cfg(feature = "parser")]
-    pub use crate::editor::{AnnotationInfo, AnnotationKind, BookmarkNode, Destination, EditableDocument, StructNode, StructType};
+    pub use crate::editor::{
+        AnnotationInfo, AnnotationKind, BookmarkNode, Destination, EditableDocument, RedactionAuditEntry, StructNode,
+        StructType,
+    };
     pub use crate::error::{PdfError, PdfResult};
     #[cfg(feature = "compression")]
     pub use crate::error::CompressionError;

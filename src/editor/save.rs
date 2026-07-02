@@ -36,6 +36,12 @@ impl EditableDocument {
     ///
     /// A no-op edit (nothing recorded in the overlay) writes the original
     /// bytes back out unchanged.
+    ///
+    /// Returns [`EditorError::RedactionRequiresFullRewrite`] if any
+    /// `redact_*`/`strip_document_metadata` call
+    /// ([`crate::editor::redact`]) has run this session - see that
+    /// module's docs for why an incremental update cannot make a
+    /// redaction permanent.
     pub fn save_incremental(&self, path: impl AsRef<Path>) -> PdfResult<()> {
         let bytes = self.save_incremental_to_bytes()?;
         let mut file = File::create(path)?;
@@ -46,6 +52,9 @@ impl EditableDocument {
     /// Like [`EditableDocument::save_incremental`], returning the bytes
     /// instead of writing them to a file.
     pub fn save_incremental_to_bytes(&self) -> PdfResult<Vec<u8>> {
+        if self.redaction_applied {
+            return Err(EditorError::RedactionRequiresFullRewrite.into());
+        }
         let mut out = self.reader.raw_data().to_vec();
         if self.overlay.is_empty() {
             return Ok(out);

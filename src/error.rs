@@ -319,6 +319,21 @@ pub enum EditorError {
     /// No annotation with the given object id exists on the expected page.
     #[error("no annotation {0} {1} R found")]
     AnnotationNotFound(u32, u16),
+
+    /// [`crate::editor::EditableDocument::save_incremental`] (or
+    /// `save_incremental_to_bytes`) was called after a `redact_*`/
+    /// `strip_document_metadata` call this session. An incremental
+    /// update only *appends* bytes (ISO 32000-1 7.5.6), so the
+    /// pre-redaction content those calls removed from the object graph
+    /// would still be fully recoverable in the file's earlier bytes -
+    /// exactly the "hidden revision" problem redaction must not
+    /// reintroduce. Use `save_full_rewrite`/`save_full_rewrite_to_bytes`
+    /// instead.
+    #[error(
+        "cannot save incrementally after redaction: the pre-redaction content would remain \
+         recoverable in the file's earlier bytes; use save_full_rewrite/save_full_rewrite_to_bytes instead"
+    )]
+    RedactionRequiresFullRewrite,
 }
 
 /// Errors related to PDF encryption.

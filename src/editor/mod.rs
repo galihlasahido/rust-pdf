@@ -48,20 +48,31 @@
 //! much larger feature (effectively a text layout engine) and is out of
 //! scope here; see `ARCHITECTURE.md`/the task report for an effort
 //! estimate.
+//!
+//! [`EditableDocument::apply_redaction`]/[`EditableDocument::redact_text`]
+//! build on top of the above for *permanent* redaction (text, images and
+//! metadata actually removed from the object graph - not just visually
+//! covered - plus an audit trail via [`RedactionAuditEntry`]), gated on
+//! always finishing with [`EditableDocument::save_full_rewrite`] rather
+//! than `save_incremental`; see `src/editor/redact.rs`'s module docs for
+//! the full algorithm and its disclosed limitations.
 
 mod annotations;
+mod audit;
 mod content_ops;
 mod content_stream;
 mod forms;
 mod graph;
 mod outline;
 mod pages;
+mod redact;
 mod save;
 mod structure;
 mod text_extract;
 mod util;
 
 pub use annotations::{AnnotationInfo, AnnotationKind};
+pub use audit::RedactionAuditEntry;
 pub use graph::EditableDocument;
 pub use outline::{BookmarkNode, Destination};
 pub use structure::{StructNode, StructType};

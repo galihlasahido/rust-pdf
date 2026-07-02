@@ -162,7 +162,12 @@ impl EditableDocument {
     /// Resolves the effective `/Resources` dictionary for a page, following
     /// `/Parent` (inheritable attribute, ISO 32000-1 Table 30) if the leaf
     /// doesn't set it directly.
-    fn effective_resources(&self, mut id: ObjectId) -> PdfResult<PdfDictionary> {
+    ///
+    /// `pub(super)` rather than private so [`crate::editor::redact`] (area
+    /// and font/`ToUnicode` bookkeeping needs the same font-resource
+    /// resolution this module already implements) can reuse it instead of
+    /// duplicating the `/Parent`-inheritance walk.
+    pub(super) fn effective_resources(&self, mut id: ObjectId) -> PdfResult<PdfDictionary> {
         for _ in 0..64 {
             let dict = self.get_dictionary(id)?;
             if let Some(res) = dict.get("Resources") {
@@ -178,7 +183,7 @@ impl EditableDocument {
         Ok(PdfDictionary::new())
     }
 
-    fn resolve_dict_or_ref(&self, obj: &Object) -> PdfResult<PdfDictionary> {
+    pub(super) fn resolve_dict_or_ref(&self, obj: &Object) -> PdfResult<PdfDictionary> {
         match obj {
             Object::Dictionary(d) => Ok(d.clone()),
             Object::Reference(id) => self.get_dictionary(*id),
