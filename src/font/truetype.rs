@@ -53,6 +53,21 @@ pub enum FontLoadError {
     /// The font collection index requested does not exist.
     #[error("font collection does not contain face index {0}")]
     NoSuchFace(u32),
+    /// `ttf-parser` panicked while parsing the font data instead of
+    /// returning an error.
+    ///
+    /// `ttf-parser` is now unmaintained (RUSTSEC-2026-0192; see
+    /// `docs/THREAT_MODEL.md`) and this crate's `font_load` fuzz target has
+    /// found at least one malformed input (a `ttcf` collection header with
+    /// an out-of-range table offset) that trips an internal `assert!`
+    /// inside `ttf-parser` rather than failing gracefully. Since embedded
+    /// font programs are fully attacker-controlled untrusted input, [`load`]
+    /// isolates the parse call with `catch_unwind` and surfaces any panic
+    /// as this variant instead of letting it abort the host process.
+    ///
+    /// [`load`]: TrueTypeFont::load
+    #[error("ttf-parser panicked while parsing font data (malformed/adversarial input)")]
+    Panicked,
 }
 
 /// The outline flavor of a loaded font, which determines whether it must be
@@ -122,7 +137,23 @@ impl TrueTypeFont {
             return Err(FontLoadError::TooLarge(data.len()));
         }
 
-        let face = ttf_parser::Face::parse(&data, face_index).map_err(|e| match e {
+        // `ttf-parser`'s public API is documented as panic-free, but per
+        // `FontLoadError::Panicked`'s doc comment, fuzzing found a malformed
+        // `ttcf` collection header that trips an internal `assert!` instead
+        // of returning `Err`. `data`/`face_index` here are fully
+        // attacker-controlled (an embedded `FontFile2`/`FontFile3` stream
+        // from an untrusted PDF), so the parse is isolated with
+        // `catch_unwind`: `AssertUnwindSafe` is sound here because `data`
+        // and `face_index` are only read (never mutated) by the closure, so
+        // there is no way for a panic mid-parse to leave them in an
+        // observably inconsistent state that could violate an invariant
+        // elsewhere.
+        let parse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ttf_parser::Face::parse(&data, face_index)
+        }))
+        .map_err(|_| FontLoadError::Panicked)?;
+
+        let face = parse_result.map_err(|e| match e {
             ttf_parser::FaceParsingError::FaceIndexOutOfBounds => {
                 FontLoadError::NoSuchFace(face_index)
             }
@@ -582,6 +613,26 @@ mod tests {
         data.truncate(20); // chop off most of the table directory/data
         let err = TrueTypeFont::load(data, 0).unwrap_err();
         assert!(matches!(err, FontLoadError::Malformed(_)));
+    }
+
+    /// Regression test for a crash found by the `font_load` cargo-fuzz
+    /// target: a malformed `ttcf` (TrueType Collection) header whose face
+    /// table offset overflows `u32` trips an internal `assert!` inside
+    /// `ttf-parser` (`parser.rs`, `self.offset as u64 + len as u64 <=
+    /// u32::MAX as u64`) instead of returning `Err`. Before the
+    /// `catch_unwind` isolation added to [`TrueTypeFont::load`], this input
+    /// aborted the whole process -- a trivial DoS given that embedded font
+    /// programs are fully attacker-controlled. `load` must now return
+    /// `Err(FontLoadError::Panicked)` instead of unwinding past this call.
+    #[test]
+    fn malformed_ttc_offset_overflow_does_not_panic() {
+        let data = vec![
+            0x74, 0x74, 0x63, 0x66, 0xe3, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x04, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x60,
+        ];
+        let err = TrueTypeFont::load(data, 0).unwrap_err();
+        assert!(matches!(err, FontLoadError::Panicked | FontLoadError::Malformed(_)));
     }
 
     #[test]

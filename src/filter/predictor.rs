@@ -99,6 +99,13 @@ fn apply_tiff_predictor(
     let mut out = Vec::with_capacity(data.len());
     for row in data.chunks(row_bytes) {
         let mut row = row.to_vec();
+        // The *actual* number of bytes in this row, which for every row
+        // but a possibly-short final one equals `row_bytes` -- but unlike
+        // `row_bytes` (derived from the attacker-controlled `/Columns` and
+        // `/Colors` declared in `/DecodeParms`), this is always bounded by
+        // the already-size-checked decoded stream `data`. Used below to
+        // size the repacked row instead of trusting `row_bytes` directly.
+        let row_len = row.len();
         match bpc {
             8 => {
                 for i in colors..row.len() {
@@ -119,13 +126,22 @@ fn apply_tiff_predictor(
             }
             1 | 2 | 4 => {
                 // Unpack sub-byte samples, apply horizontal differencing per
-                // component, then repack.
+                // component, then repack. `columns`/`colors` are attacker
+                // -controlled `/DecodeParms` integers (ISO 32000-1 Table 8)
+                // that need not be consistent with the actual row length,
+                // so the sample count must come from `saturating_mul` (not
+                // a bare `*`, which would panic on overflow in a build with
+                // overflow checks enabled) and `unpack_bits` itself caps it
+                // against `row.len()` -- see that function's doc comment.
                 let mask: u16 = (1u16 << bpc) - 1;
-                let mut samples = unpack_bits(&row, bpc as u32, columns * colors);
+                let mut samples = unpack_bits(&row, bpc as u32, columns.saturating_mul(colors));
                 for i in colors..samples.len() {
                     samples[i] = (samples[i].wrapping_add(samples[i - colors])) & mask;
                 }
-                row = pack_bits(&samples, bpc as u32, row_bytes);
+                // Repack to `row_len` (the real row length), not the
+                // outer, attacker-influenced `row_bytes` -- see `row_len`'s
+                // doc comment above and `pack_bits`'s doc comment.
+                row = pack_bits(&samples, bpc as u32, row_len);
             }
             _ => {
                 return Err(CompressionError::DecompressionFailed(format!(
@@ -140,7 +156,24 @@ fn apply_tiff_predictor(
     Ok(out)
 }
 
+/// Unpacks `count` `bpc`-bit big-endian samples from `row` into `u16`s,
+/// zero-padding any sample that runs past the end of `row`.
+///
+/// `count` is capped to the number of samples that could possibly be
+/// present in `row` (`row.len() * 8` bits, divided by `bpc`) *before* it is
+/// used to size the output allocation. Callers pass `count` derived from a
+/// stream's `/Columns`/`/Colors` `DecodeParms` (ISO 32000-1 Table 8), which
+/// are attacker-controlled integers with no required relationship to the
+/// actual decoded row size (`row`, which is itself already bounded by
+/// [`crate::filter::MAX_DECODED_SIZE`]). Without this cap, a tiny stream
+/// declaring e.g. `/Columns 2000000000` would force a multi-gigabyte
+/// `Vec::with_capacity` allocation here -- a decompression-bomb variant
+/// that bypasses `MAX_DECODED_SIZE` entirely, since that limit only bounds
+/// the Flate/LZW decompression stage, not this predictor post-processing
+/// step.
 fn unpack_bits(row: &[u8], bpc: u32, count: usize) -> Vec<u16> {
+    let max_samples_in_row = row.len().saturating_mul(8) / (bpc.max(1) as usize) + 1;
+    let count = count.min(max_samples_in_row);
     let mut out = Vec::with_capacity(count);
     let mut bit_pos = 0usize;
     for _ in 0..count {
@@ -161,6 +194,14 @@ fn unpack_bits(row: &[u8], bpc: u32, count: usize) -> Vec<u16> {
     out
 }
 
+/// Packs `samples` back into `bpc`-bit big-endian fields in a buffer of
+/// exactly `out_len` bytes.
+///
+/// `out_len` must come from an actually-observed byte length (e.g. the
+/// current row's real length), never straight from an attacker-controlled
+/// `/DecodeParms` value -- see `apply_tiff_predictor`'s `row_len` doc
+/// comment, which exists specifically so this function is never asked to
+/// allocate a buffer sized off a declared-but-unverified dimension.
 fn pack_bits(samples: &[u16], bpc: u32, out_len: usize) -> Vec<u8> {
     let mut out = vec![0u8; out_len];
     let mut bit_pos = 0usize;
@@ -372,5 +413,62 @@ mod tests {
         // no panic occurs regardless.
         let result = apply_predictor(&[0, 5], params);
         assert!(result.is_ok());
+    }
+
+    /// Adversarial regression test: a tiny (2-byte) TIFF-predicted stream
+    /// declaring an astronomically large `/Columns` must not force a
+    /// multi-gigabyte allocation or run for an unbounded amount of time.
+    /// This is the "declared dimension disagrees with actual data size"
+    /// decompression-bomb variant described on [`unpack_bits`] and
+    /// [`pack_bits`] -- it bypasses [`crate::filter::MAX_DECODED_SIZE`]
+    /// entirely because that limit only bounds the Flate/LZW decompression
+    /// stage, not this predictor post-processing step, so it has to be
+    /// bounded here independently.
+    #[test]
+    fn tiff_predictor_huge_declared_columns_does_not_bomb() {
+        let params = PredictorParams {
+            predictor: 2,
+            colors: 1,
+            bits_per_component: 4,
+            // Absurdly large relative to the 2-byte input: naively this
+            // would ask `unpack_bits`/`pack_bits` to allocate on the order
+            // of `columns * 2` bytes (~4 GB) from a 2-byte stream.
+            columns: 2_000_000_000,
+        };
+        let start = std::time::Instant::now();
+        let result = apply_predictor(&[0xAB, 0xCD], params);
+        // Must complete near-instantly; a multi-gigabyte allocation/loop
+        // would take far longer than this on any real machine.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "predictor took too long on an adversarial /Columns value"
+        );
+        // The exact decoded bytes aren't the point (the declared /Columns
+        // doesn't match the real 2-byte row, so the value is degenerate
+        // either way); what matters is that it returned instead of
+        // hanging or aborting the process.
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    /// Same idea as [`tiff_predictor_huge_declared_columns_does_not_bomb`]
+    /// but with `/Colors` inflated instead of `/Columns`, and large enough
+    /// that a bare (non-saturating) `columns * colors` multiplication would
+    /// overflow `usize` -- which must not panic even in an
+    /// overflow-checked build.
+    #[test]
+    fn tiff_predictor_huge_declared_colors_does_not_overflow_or_bomb() {
+        let params = PredictorParams {
+            predictor: 2,
+            colors: i64::MAX,
+            bits_per_component: 2,
+            columns: i64::MAX,
+        };
+        let start = std::time::Instant::now();
+        let result = apply_predictor(&[0x11, 0x22, 0x33], params);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "predictor took too long on adversarial /Columns and /Colors values"
+        );
+        assert!(result.is_ok() || result.is_err());
     }
 }

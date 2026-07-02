@@ -1,0 +1,57 @@
+# cargo-audit configuration.
+#
+# Every entry below is a *documented, reviewed* exception, not a blanket
+# suppression. See docs/THREAT_MODEL.md ("Supply-chain / dependency
+# vulnerabilities") for the full rationale and the re-review trigger for
+# each one. Do not add an entry here without also updating that doc.
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (rsa 0.9.10, "Marvin Attack" timing side channel in
+    # PKCS#1 v1.5 decryption). No patched version of `rsa` exists upstream
+    # as of this writing. This crate is used only for verifying/generating
+    # detached CMS/PKCS#7 signatures over already-public document hashes
+    # (src/signatures/*) -- it never performs RSA *decryption* of secret
+    # data, and the private key (when generating a signature) is supplied
+    # by the caller/HSM, not decrypted by this code from attacker input, so
+    # the network-observable timing side channel described in the advisory
+    # does not apply to this crate's usage. Re-review when a patched `rsa`
+    # ships.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0192 (ttf-parser 0.25.1, unmaintained). A real,
+    # actively-used production dependency (the `fonts` feature's embedded
+    # TrueType/OpenType font loader, src/font/truetype.rs) that parses
+    # fully attacker-controlled bytes from a PDF's FontFile2/FontFile3
+    # streams. See docs/THREAT_MODEL.md section 7.2 for why this is
+    # accepted rather than swapped out, the concrete panic-on-malformed-
+    # input issue this phase's fuzzing found and mitigated at this crate's
+    # call site (`TrueTypeFont::load`'s `catch_unwind`), and the specific
+    # re-review triggers (memory-safety issue reported upstream, a fork/
+    # successor emerging, or a non-panic crash found by fuzzing).
+    "RUSTSEC-2026-0192",
+
+    # RUSTSEC-2026-0173 (proc-macro-error2 2.0.1, unmaintained). Reachable
+    # only via `lopdf` (a dev-dependency used solely for interop tests) ->
+    # `jiff` -> `defmt-macros`, and `defmt` is one of jiff's *optional*
+    # dependencies gated behind a Cargo feature neither `lopdf` nor this
+    # crate enables -- verified via `cargo tree -i proc-macro-error2
+    # --all-features` showing no active edge. It is a Cargo.lock artifact,
+    # never actually compiled into any build this crate produces. See
+    # docs/THREAT_MODEL.md section 7.3 for the full verification and the
+    # re-review trigger (if `jiff`'s `defmt` feature ever gets activated).
+    "RUSTSEC-2026-0173",
+]
+# All three RustSec "informational" categories, spelled out explicitly
+# (this also happens to be cargo-audit's own default when this key is
+# omitted entirely -- made explicit here so that is not accidentally
+# relied upon implicitly). This only controls whether an advisory in one
+# of these categories is *reported* in `cargo audit`'s output; it does not
+# by itself fail the build (no `-D`/`--deny` flag is wired into CI). Every
+# `unmaintained`/`unsound`/`notice` advisory actually reviewed so far has
+# its own dedicated, per-crate entry in `ignore` above with a specific
+# rationale -- this key intentionally does NOT hide any of these
+# categories wholesale, so a brand-new, not-yet-reviewed advisory in any
+# of them still surfaces for a human to triage (and add its own `ignore`
+# entry + docs/THREAT_MODEL.md section) rather than being silently
+# suppressed by category.
+informational_warnings = ["unmaintained", "unsound", "notice"]

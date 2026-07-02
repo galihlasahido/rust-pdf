@@ -31,6 +31,14 @@ pub unsafe extern "C" fn pdf_create_simple(
         return ptr::null_mut();
     }
 
+    // SAFETY: `text` is non-null (checked above) and, per this function's
+    // `# Safety` contract, points to a valid null-terminated C string owned
+    // by the caller for at least the duration of this call. `CStr::from_ptr`
+    // itself only requires the pointer be valid up to and including its
+    // first NUL byte, which that contract guarantees; `.to_str()` right
+    // after independently validates the bytes as UTF-8 before we ever treat
+    // them as a Rust `&str`, so a non-UTF-8-but-otherwise-valid C string
+    // cannot cause anything worse than the `Err` branch below.
     let c_str = match CStr::from_ptr(text).to_str() {
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
@@ -73,6 +81,13 @@ pub unsafe extern "C" fn pdf_get_data(
         return 0;
     }
 
+    // SAFETY: `handle`/`out_data` are non-null (checked above). Per this
+    // function's `# Safety` contract, `handle` was returned by a
+    // `pdf_create_*` call and not yet freed via `pdf_free` (so it points to
+    // a live, exclusively-owned `PdfHandle` -- this module never hands out
+    // more than one reference to the same handle concurrently), and
+    // `out_data` points to valid, correctly-aligned storage for one
+    // `*const u8` that this call may write through.
     let pdf = &*handle;
     *out_data = pdf.data.as_ptr();
     pdf.data.len()
@@ -93,7 +108,14 @@ pub unsafe extern "C" fn pdf_save_to_file(
         return -1;
     }
 
+    // SAFETY: `handle` is non-null (checked above) and, per this function's
+    // `# Safety` contract, was returned by a `pdf_create_*` call and not yet
+    // freed, so it points to a live `PdfHandle` we may borrow immutably.
     let pdf = &*handle;
+    // SAFETY: `path` is non-null (checked above) and, per the same
+    // contract, points to a valid null-terminated C string for the
+    // duration of this call; see `pdf_create_simple`'s matching comment for
+    // why a non-UTF-8 string is still handled safely (`Err` branch below).
     let path_str = match CStr::from_ptr(path).to_str() {
         Ok(s) => s,
         Err(_) => return -1,
@@ -113,6 +135,15 @@ pub unsafe extern "C" fn pdf_save_to_file(
 #[no_mangle]
 pub unsafe extern "C" fn pdf_free(handle: *mut PdfHandle) {
     if !handle.is_null() {
+        // SAFETY: `handle` is non-null (checked above) and, per this
+        // function's `# Safety` contract, was returned by a `Box::into_raw`
+        // call in `pdf_create_*` (the only place a `PdfHandle` is
+        // constructed) and has not already been freed -- so it is exactly
+        // the pointer `Box::from_raw` requires, reconstructing the `Box`
+        // that owns it and dropping it exactly once here. Callers must not
+        // use `handle` again after this call (also documented above); this
+        // module cannot enforce that itself since the pointer crosses the
+        // FFI boundary into caller-controlled code.
         drop(Box::from_raw(handle));
     }
 }

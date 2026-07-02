@@ -150,8 +150,21 @@ impl PdfStream {
     /// Decompresses the stream data if it's compressed with FlateDecode.
     ///
     /// Returns the decompressed data, or the original data if not compressed.
+    ///
+    /// `self.data`/`self.dictionary` come straight from an untrusted PDF
+    /// file, so the decompressed output is capped at
+    /// [`crate::filter::MAX_DECODED_SIZE`] -- the same bound
+    /// [`PdfStream::decode_all`] enforces -- to defend against a
+    /// "decompression bomb" stream that claims a tiny compressed size but
+    /// expands to gigabytes. Prefer [`PdfStream::decode_all`] for new code:
+    /// it also handles the full filter set (`LZWDecode`, `ASCII85Decode`,
+    /// etc.) instead of only `FlateDecode`, and returns the original bytes
+    /// unchanged for a filter it doesn't understand rather than the
+    /// possibly-misleading `Ok(original_data)` this method returns for any
+    /// non-`FlateDecode` `/Filter` value.
     #[cfg(feature = "compression")]
     pub fn decompress(&self) -> Result<Vec<u8>, CompressionError> {
+        use crate::filter::MAX_DECODED_SIZE;
         use flate2::read::ZlibDecoder;
         use std::io::Read;
 
@@ -167,9 +180,20 @@ impl PdfStream {
 
         let mut decoder = ZlibDecoder::new(&self.data[..]);
         let mut decompressed = Vec::new();
-        decoder
+        // `take` bounds worst-case allocation from a decompression bomb;
+        // read one extra byte over the limit so an exactly-`MAX_DECODED_SIZE`
+        // stream is distinguishable from one that keeps producing more data
+        // past the limit (mirrors `filter::decode_flate`).
+        let mut limited = (&mut decoder).take(MAX_DECODED_SIZE as u64 + 1);
+        limited
             .read_to_end(&mut decompressed)
             .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))?;
+
+        if decompressed.len() > MAX_DECODED_SIZE {
+            return Err(CompressionError::DecompressionFailed(
+                "FlateDecode: decoded output exceeds maximum allowed size".to_string(),
+            ));
+        }
 
         Ok(decompressed)
     }
@@ -382,6 +406,50 @@ mod tests {
             // Decompress and verify
             let decompressed = compressed.decompress().unwrap();
             assert_eq!(String::from_utf8_lossy(&decompressed), original_data);
+        }
+
+        /// Regression test: [`PdfStream::decompress`] must reject a
+        /// "decompression bomb" -- a small `FlateDecode` stream that
+        /// expands to far more than [`crate::filter::MAX_DECODED_SIZE`] --
+        /// instead of allocating unbounded memory. This is the same class
+        /// of bug tracked historically as untrusted-input risk register
+        /// item #4 (`object/stream.rs` `decompress()`); unlike
+        /// [`PdfStream::decode_all`] (which has always gone through
+        /// [`crate::filter::decode_filter`] and so was already bounded),
+        /// this older method had no size cap prior to this fix.
+        #[test]
+        fn decompress_rejects_flate_bomb_exceeding_max_decoded_size() {
+            use crate::filter::MAX_DECODED_SIZE;
+            use crate::object::{PdfDictionary, PdfName};
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+
+            // All-zero data compresses extremely well, so this stays a
+            // tiny compressed payload despite expanding past
+            // `MAX_DECODED_SIZE` when decompressed. Fed through the encoder
+            // one 1 MiB chunk at a time so the test itself never holds the
+            // whole (500+ MiB) logical plaintext in memory at once.
+            let chunk = vec![0u8; 1024 * 1024];
+            let chunks_needed = (MAX_DECODED_SIZE / chunk.len()) + 2;
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+            for _ in 0..chunks_needed {
+                encoder
+                    .write_all(&chunk)
+                    .expect("writing to an in-memory encoder cannot fail");
+            }
+            let bomb = encoder
+                .finish()
+                .expect("finishing an in-memory encoder cannot fail");
+
+            let mut dict = PdfDictionary::new();
+            dict.set("Filter", Object::Name(PdfName::new_unchecked("FlateDecode")));
+            let stream = PdfStream::with_dictionary(dict, bomb);
+
+            let err = stream
+                .decompress()
+                .expect_err("a stream decompressing past MAX_DECODED_SIZE must be rejected");
+            assert!(matches!(err, CompressionError::DecompressionFailed(_)));
         }
 
         #[test]
