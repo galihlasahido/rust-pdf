@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_real() {
-        assert_eq!(Object::Real(3.14).to_pdf_string(), "3.14");
+        assert_eq!(Object::Real(3.25).to_pdf_string(), "3.25");
         assert_eq!(Object::Real(1.0).to_pdf_string(), "1");
         assert_eq!(Object::Real(0.5).to_pdf_string(), "0.5");
     }
@@ -265,7 +265,7 @@ mod tests {
     fn test_from_conversions() {
         let _: Object = true.into();
         let _: Object = 42i32.into();
-        let _: Object = 3.14f64.into();
+        let _: Object = 3.25f64.into();
         let _: Object = "test".into();
     }
 
@@ -275,8 +275,8 @@ mod tests {
         assert_eq!(int.as_integer(), Some(42));
         assert_eq!(int.as_real(), Some(42.0));
 
-        let real = Object::Real(3.14);
+        let real = Object::Real(3.25);
         assert_eq!(real.as_integer(), None);
-        assert_eq!(real.as_real(), Some(3.14));
+        assert_eq!(real.as_real(), Some(3.25));
     }
 }

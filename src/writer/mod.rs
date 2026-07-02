@@ -127,7 +127,7 @@ impl<W: Write> PdfWriter<W> {
                 // Encrypt string content
                 let plain_bytes = s.as_bytes();
                 let encrypted = handler
-                    .encrypt_data(&plain_bytes, id.number, id.generation)
+                    .encrypt_data(plain_bytes, id.number, id.generation)
                     .map_err(|e| WriterError::Structure(e.to_string()))?;
                 Ok(Object::String(PdfString::Hex(encrypted)))
             }

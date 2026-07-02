@@ -1013,7 +1013,7 @@ fn test_grid_pattern() {
         let y = 300.0 + (*row as f64 * 45.0);
         content = content
             .save_state()
-            .fill_color(color.clone())
+            .fill_color(*color)
             .rect(x, y, 45.0, 45.0)
             .fill()
             .restore_state();
@@ -1058,7 +1058,7 @@ fn test_color_palette() {
 
         content = content
             .save_state()
-            .fill_color(color.clone())
+            .fill_color(*color)
             .rect(x, y, 40.0, 40.0)
             .fill()
             .restore_state();
@@ -1231,7 +1231,7 @@ fn test_text_colors() {
         let y = 740.0 - (i as f64 * 30.0);
         content = content
             .save_state()
-            .fill_color(color.clone())
+            .fill_color(*color)
             .text("F1", 14.0, 72.0, y, text)
             .restore_state();
     }
@@ -1252,7 +1252,7 @@ fn test_text_colors() {
         let x = 72.0 + (i as f64 * 70.0);
         content = content
             .save_state()
-            .fill_color(color.clone())
+            .fill_color(*color)
             .text("F1", 24.0, x, 400.0, "TEXT")
             .restore_state();
     }
@@ -1969,7 +1969,7 @@ fn test_chart_bar() {
         let bar_height = *value * 4.0;
         content = content
             .save_state()
-            .fill_color(color.clone())
+            .fill_color(*color)
             .rect(x, 300.0, 60.0, bar_height)
             .fill()
             .restore_state()
@@ -2546,7 +2546,7 @@ fn test_multipage_report() {
             .text("F3", 10.0, 72.0, 815.0, "Technical Report - System Architecture Overview")
             .restore_state()
             // Title
-            .text("F1", 20.0, 72.0, 750.0, *title)
+            .text("F1", 20.0, 72.0, 750.0, title)
             // Body
             .text_block(
                 TextBuilder::new()
@@ -3719,7 +3719,6 @@ mod encryption_tests {
 
 #[cfg(feature = "signatures")]
 mod signature_tests {
-    use super::*;
     use rust_pdf::signatures::{
         ByteRange, SignatureAlgorithm, SignatureConfig, SignatureInfo,
     };

@@ -4,11 +4,12 @@ use super::permissions::Permissions;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Encryption algorithm to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EncryptionAlgorithm {
     /// AES-128 encryption (PDF 1.5+, V=4, R=4).
     Aes128,
     /// AES-256 encryption (PDF 2.0, V=5, R=6).
+    #[default]
     Aes256,
 }
 
@@ -35,12 +36,6 @@ impl EncryptionAlgorithm {
             EncryptionAlgorithm::Aes128 => 4,
             EncryptionAlgorithm::Aes256 => 6,
         }
-    }
-}
-
-impl Default for EncryptionAlgorithm {
-    fn default() -> Self {
-        EncryptionAlgorithm::Aes256
     }
 }
 

@@ -173,6 +173,55 @@ impl PdfStream {
 
         Ok(decompressed)
     }
+
+    /// Fully decodes the stream data by applying every filter named in
+    /// `/Filter` (a single name or an array of names), in order, using the
+    /// matching entries of `/DecodeParms` (ISO 32000-1:2008 Section 7.4,
+    /// Table 6). Unlike [`PdfStream::decompress`] (which only understands
+    /// `FlateDecode`), this supports the full filter set implemented in
+    /// [`crate::filter`]: `ASCIIHexDecode`, `ASCII85Decode`,
+    /// `RunLengthDecode`, `LZWDecode`, `FlateDecode` (both with PNG/TIFF
+    /// predictor support), `DCTDecode` and `CCITTFaxDecode`.
+    ///
+    /// For image streams whose last filter is `DCTDecode` or
+    /// `CCITTFaxDecode`, the returned bytes are the final raw/packed image
+    /// samples, not something meant to be filtered further.
+    #[cfg(feature = "compression")]
+    pub fn decode_all(&self) -> Result<Vec<u8>, CompressionError> {
+        use crate::filter::decode_filter;
+
+        let filters: Vec<String> = match self.dictionary.get("Filter") {
+            Some(Object::Name(n)) => vec![n.as_str().to_string()],
+            Some(Object::Array(arr)) => arr
+                .iter()
+                .filter_map(|o| match o {
+                    Object::Name(n) => Some(n.as_str().to_string()),
+                    _ => None,
+                })
+                .collect(),
+            _ => return Ok(self.data.clone()),
+        };
+
+        let parms: Vec<Option<PdfDictionary>> = match self.dictionary.get("DecodeParms") {
+            Some(Object::Dictionary(d)) => vec![Some(d.clone())],
+            Some(Object::Array(arr)) => arr
+                .iter()
+                .map(|o| match o {
+                    Object::Dictionary(d) => Some(d.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let mut data = self.data.clone();
+        for (i, filter) in filters.iter().enumerate() {
+            let params = parms.get(i).and_then(|p| p.as_ref());
+            data = decode_filter(filter, &data, params)?;
+        }
+
+        Ok(data)
+    }
 }
 
 /// Builder for creating PDF streams fluently.
@@ -315,7 +364,7 @@ mod tests {
 
             // For very small data, compression might not reduce size,
             // but the filter should still be applied
-            assert!(compressed.len() > 0);
+            assert!(!compressed.is_empty());
             assert!(compressed.len() != original_len || original_len < 50);
         }
 
@@ -374,6 +423,110 @@ mod tests {
 
             // Should not be compressed because compress() was not called
             assert!(!stream.is_compressed());
+        }
+    }
+
+    #[cfg(feature = "compression")]
+    mod decode_all_tests {
+        use super::*;
+        use crate::object::PdfArray;
+
+        #[test]
+        fn decode_all_passthrough_when_no_filter() {
+            let stream = PdfStream::from_text("raw data");
+            assert_eq!(stream.decode_all().unwrap(), b"raw data");
+        }
+
+        #[test]
+        fn decode_all_ascii_hex() {
+            let mut dict = PdfDictionary::new();
+            dict.set("Filter", Object::Name(PdfName::new_unchecked("ASCIIHexDecode")));
+            let stream = PdfStream::from_raw(dict, b"48656C6C6F>".to_vec());
+            assert_eq!(stream.decode_all().unwrap(), b"Hello");
+        }
+
+        #[test]
+        fn decode_all_run_length() {
+            let mut dict = PdfDictionary::new();
+            dict.set("Filter", Object::Name(PdfName::new_unchecked("RunLengthDecode")));
+            let stream = PdfStream::from_raw(dict, vec![4, b'H', b'e', b'l', b'l', b'o', 128]);
+            assert_eq!(stream.decode_all().unwrap(), b"Hello");
+        }
+
+        #[test]
+        fn decode_all_filter_chain_ascii85_then_flate() {
+            let original = b"Hello, chained filters!".to_vec();
+            let flate_stream = PdfStream::from_text(String::from_utf8(original.clone()).unwrap())
+                .with_compression()
+                .unwrap();
+            let flate_bytes = flate_stream.data().to_vec();
+            let ascii85 = crate::filter::decode_ascii85; // sanity: module is reachable
+            let _ = ascii85; // silence unused import when feature combos vary
+
+            // Encode: raw -> Flate -> ASCII85, so Filter = [ASCII85Decode FlateDecode]
+            // must be applied in that order to recover the original bytes.
+            let ascii85_encoded = ascii85_encode_for_test(&flate_bytes);
+
+            let mut dict = PdfDictionary::new();
+            let mut filters = PdfArray::new();
+            filters.push(Object::Name(PdfName::new_unchecked("ASCII85Decode")));
+            filters.push(Object::Name(PdfName::new_unchecked("FlateDecode")));
+            dict.set("Filter", Object::Array(filters));
+
+            let stream = PdfStream::from_raw(dict, ascii85_encoded);
+            assert_eq!(stream.decode_all().unwrap(), original);
+        }
+
+        #[test]
+        fn decode_all_flate_with_png_predictor() {
+            // 2x2 grayscale image, 1 byte/pixel, PNG "Up" filter on row 2.
+            let raw_rows: Vec<u8> = vec![0, 10, 20, 2, 1, 1];
+            let stream_data = PdfStream::new(raw_rows.clone()).with_compression().unwrap();
+
+            let mut dict = stream_data.dictionary.clone();
+            let mut parms = PdfDictionary::new();
+            parms.set("Predictor", Object::Integer(15));
+            parms.set("Colors", Object::Integer(1));
+            parms.set("BitsPerComponent", Object::Integer(8));
+            parms.set("Columns", Object::Integer(2));
+            dict.set("DecodeParms", Object::Dictionary(parms));
+
+            let stream = PdfStream::from_raw(dict, stream_data.data().to_vec());
+            let decoded = stream.decode_all().unwrap();
+            // Row1 (filter=None): [10,20]; Row2 (filter=Up): [1,1] + [10,20] = [11,21]
+            assert_eq!(decoded, vec![10, 20, 11, 21]);
+        }
+
+        #[test]
+        fn decode_all_unsupported_filter_errors_cleanly() {
+            let mut dict = PdfDictionary::new();
+            dict.set("Filter", Object::Name(PdfName::new_unchecked("JBIG2Decode")));
+            let stream = PdfStream::from_raw(dict, b"whatever".to_vec());
+            assert!(stream.decode_all().is_err());
+        }
+
+        /// Minimal ASCII85 encoder used only to build test fixtures (the
+        /// production code only needs to *decode* ASCII85).
+        fn ascii85_encode_for_test(data: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for chunk in data.chunks(4) {
+                let mut buf = [0u8; 4];
+                buf[..chunk.len()].copy_from_slice(chunk);
+                let value = u32::from_be_bytes(buf);
+                if chunk.len() == 4 && value == 0 {
+                    out.push(b'z');
+                    continue;
+                }
+                let mut digits = [0u8; 5];
+                let mut v = value;
+                for i in (0..5).rev() {
+                    digits[i] = (v % 85) as u8 + 0x21;
+                    v /= 85;
+                }
+                out.extend_from_slice(&digits[..chunk.len() + 1]);
+            }
+            out.extend_from_slice(b"~>");
+            out
         }
     }
 }

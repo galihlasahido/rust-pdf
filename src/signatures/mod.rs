@@ -51,9 +51,10 @@ use crate::error::SignatureError;
 pub type SignatureResult<T> = Result<T, SignatureError>;
 
 /// Supported signature algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignatureAlgorithm {
     /// RSA with SHA-256.
+    #[default]
     RsaSha256,
     /// RSA with SHA-384.
     RsaSha384,
@@ -127,11 +128,6 @@ pub(crate) fn digest_for_algorithm(algo: SignatureAlgorithm, data: &[u8]) -> Vec
     }
 }
 
-impl Default for SignatureAlgorithm {
-    fn default() -> Self {
-        SignatureAlgorithm::RsaSha256
-    }
-}
 
 /// PDF signature dictionary field names.
 pub mod fields {

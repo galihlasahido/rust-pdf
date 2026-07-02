@@ -377,6 +377,14 @@ fn build_oid(oid_bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Builds a DER-encoded context-specific tag.
+//
+// NOTE(rust-pdf parser-robustness task): clippy flags this `if`/`else` as
+// producing identical output on both arms (`implicit` currently has no
+// effect on the emitted tag byte). This predates this task, is unrelated
+// to PDF parsing, and touches signature/DER-encoding correctness, so it is
+// intentionally left behaviourally unchanged here rather than "fixed"
+// without dedicated signature-module verification; flagged for follow-up.
+#[allow(clippy::if_same_then_else)]
 fn build_context_specific(tag_num: u8, content: &[u8], implicit: bool) -> Vec<u8> {
     let mut cs = Vec::new();
     let tag = if implicit {

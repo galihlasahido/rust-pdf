@@ -64,6 +64,8 @@ pub mod document;
 #[cfg(feature = "encryption")]
 pub mod encryption;
 pub mod error;
+#[cfg(feature = "compression")]
+pub mod filter;
 pub mod font;
 pub mod forms;
 #[cfg(feature = "images")]
@@ -110,7 +112,7 @@ pub use forms::{
 #[cfg(feature = "images")]
 pub use image::{ColorSpace, Image, ImageFilter, ImageXObject};
 #[cfg(feature = "parser")]
-pub use parser::{PdfReader, Trailer, XrefEntry, XrefTable};
+pub use parser::{parse_inline_image, InlineImage, PdfReader, Trailer, XrefEntry, XrefTable};
 pub use object::{
     DictionaryBuilder, Object, PdfArray, PdfDictionary, PdfName, PdfStream, PdfString,
     StreamBuilder,

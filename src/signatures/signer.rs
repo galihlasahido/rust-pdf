@@ -1166,8 +1166,8 @@ impl IncrementalSigner {
         let sig_dict_id = next_obj_id;
         let sig_field_id = next_obj_id + 1;
         let appearance_id = next_obj_id + 2;
-        let acro_form_id = if existing_acro_form.is_some() {
-            existing_acro_form.unwrap()
+        let acro_form_id = if let Some(id) = existing_acro_form {
+            id
         } else {
             next_obj_id + 3
         };

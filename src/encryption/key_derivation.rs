@@ -30,6 +30,7 @@ pub struct EncryptionKeys {
 /// - Algorithm 2.B (computing U and UE values)
 /// - Algorithm 2.C (computing O and OE values)
 /// - Algorithm 2.D (computing Perms value)
+///
 /// from ISO 32000-2.
 pub fn derive_aes256_keys(
     user_password: &str,
@@ -307,7 +308,7 @@ fn aes_cbc_encrypt_no_padding(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result
 
     type Aes256CbcEnc = Encryptor<aes::Aes256>;
 
-    if plaintext.len() % 16 != 0 {
+    if !plaintext.len().is_multiple_of(16) {
         return Err(EncryptionError::CipherFailed(
             "Plaintext must be block-aligned for no-padding encryption".into(),
         ));
@@ -372,6 +373,11 @@ fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, 
 /// Returns the file encryption key if successful.
 ///
 /// This implements Algorithm 11 from ISO 32000-2.
+///
+/// Not yet wired into any public decryption API (the crate does not
+/// currently offer PDF *decryption*, only encryption), but covered by unit
+/// tests below; kept `pub` for forthcoming decryption support.
+#[allow(dead_code)]
 pub fn verify_user_password(
     password: &str,
     u_value: &[u8],
@@ -411,13 +417,14 @@ pub fn verify_user_password(
 }
 
 /// AES-256-CBC decryption without padding.
+#[allow(dead_code)]
 fn aes_cbc_decrypt_no_padding(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
     use aes::cipher::{BlockDecryptMut, KeyIvInit};
     use cbc::Decryptor;
 
     type Aes256CbcDec = Decryptor<aes::Aes256>;
 
-    if ciphertext.len() % 16 != 0 {
+    if !ciphertext.len().is_multiple_of(16) {
         return Err(EncryptionError::CipherFailed(
             "Ciphertext must be block-aligned".into(),
         ));
