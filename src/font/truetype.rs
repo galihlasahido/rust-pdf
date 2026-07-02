@@ -58,12 +58,26 @@ pub enum FontLoadError {
     ///
     /// `ttf-parser` is now unmaintained (RUSTSEC-2026-0192; see
     /// `docs/THREAT_MODEL.md`) and this crate's `font_load` fuzz target has
-    /// found at least one malformed input (a `ttcf` collection header with
-    /// an out-of-range table offset) that trips an internal `assert!`
-    /// inside `ttf-parser` rather than failing gracefully. Since embedded
-    /// font programs are fully attacker-controlled untrusted input, [`load`]
-    /// isolates the parse call with `catch_unwind` and surfaces any panic
-    /// as this variant instead of letting it abort the host process.
+    /// found malformed inputs (a `ttcf` collection header with an
+    /// out-of-range table offset) that trip an internal `debug_assert!`
+    /// inside `ttf-parser` (`parser::Stream::read_bytes`) rather than
+    /// failing gracefully. Since embedded font programs are fully
+    /// attacker-controlled untrusted input, [`load`] isolates the parse
+    /// call with `catch_unwind` and surfaces any panic as this variant
+    /// instead of letting it unwind past this crate's API.
+    ///
+    /// **This is defense-in-depth only, not the primary fix**: `catch_unwind`
+    /// only helps in ordinary (`panic = "unwind"`) binaries. `cargo fuzz`
+    /// builds link `libfuzzer-sys`, whose panic hook calls
+    /// `std::process::abort()` *inside the hook itself*, i.e. before
+    /// unwinding ever starts — so under the `font_load` fuzz target this
+    /// variant is never actually produced for the known `ttcf` crashers;
+    /// the process aborts regardless of `catch_unwind`. The real fix for
+    /// those inputs is [`load`] rejecting the malformed structure *before*
+    /// ever calling into `ttf-parser` (see the `ttcf` header validation at
+    /// the top of [`load`]); `catch_unwind` here only guards against some
+    /// *other*, not-yet-fuzz-discovered panic inside `ttf-parser` in a
+    /// normal (non-fuzz) host application.
     ///
     /// [`load`]: TrueTypeFont::load
     #[error("ttf-parser panicked while parsing font data (malformed/adversarial input)")]
@@ -123,6 +137,71 @@ impl fmt::Debug for TrueTypeFont {
     }
 }
 
+/// Length in bytes of a `ttcf` (TrueType/OpenType Collection) header up to
+/// and including `numFonts`: `TTCTag` (4) + `majorVersion`+`minorVersion`
+/// (4, read together as a single skipped `u32` by `ttf-parser`) +
+/// `numFonts` (4). See the OpenType spec, "Font Collections"
+/// (<https://learn.microsoft.com/en-us/typography/opentype/spec/otff#font-collections>).
+const TTCF_HEADER_LEN: usize = 12;
+
+/// Size in bytes of a single `Offset32` entry in a `ttcf` header's
+/// `offsetTable` (one per face in the collection).
+const TTCF_OFFSET_ENTRY_SIZE: u64 = 4;
+
+/// Rejects `ttcf` (font collection) headers that would make `ttf-parser`
+/// 0.25.1's `Face::parse` trip an internal `debug_assert!` instead of
+/// returning an `Err`.
+///
+/// `ttf-parser`'s `RawFace::parse` reads a `ttcf` header's `numFonts: u32`
+/// field straight from the file and immediately requests
+/// `numFonts * size_of::<Offset32>()` bytes from its internal `Stream`
+/// (`Stream::read_array32::<Offset32>`) *before* checking that count
+/// against the amount of data actually remaining. `Stream::read_bytes`
+/// itself then hits `debug_assert!(self.offset as u64 + len as u64 <=
+/// u32::MAX as u64)` — a sanity check the crate's own doc comment
+/// characterizes as guarding against "an incorrect parsing logic from the
+/// caller side" — before it ever reaches the real (non-debug) bounds
+/// check a few lines later. A small file with a garbage-but-huge
+/// `numFonts` (e.g. `0xFF000000`) makes `offset + len` overflow
+/// `u32::MAX` and trips that assertion.
+///
+/// In an ordinary binary this only aborts when compiled with debug
+/// assertions on (`cargo test`/dev builds), where `catch_unwind` in
+/// [`TrueTypeFont::load`] already turns it into `Err`. But `cargo fuzz`
+/// binaries link `libfuzzer-sys`, whose panic hook calls
+/// `std::process::abort()` from *within the hook*, before any unwinding
+/// (and therefore before `catch_unwind`'s landing pad) ever runs — so
+/// relying on `catch_unwind` alone does not actually protect the
+/// `font_load` fuzz target, and three crash artifacts
+/// (`fuzz/artifacts/font_load/crash-*`, now covered by
+/// `tests::rejects_the_three_font_load_fuzz_crashers` below)
+/// demonstrated exactly that. This function re-derives the same
+/// overflow condition ourselves, as a plain comparison rather than an
+/// assertion, and rejects the input *before* it ever reaches
+/// `ttf_parser::Face::parse` — so the debug assertion can never fire, no
+/// matter how the caller's binary was compiled.
+///
+/// Returns `Ok(())` for anything that isn't a (potentially malformed)
+/// `ttcf` header short enough to read `numFonts` from; such inputs are
+/// left to `ttf-parser` to accept or reject in the ordinary way.
+fn reject_ttcf_offset_table_overflow(data: &[u8]) -> Result<(), FontLoadError> {
+    const TTCF_MAGIC: [u8; 4] = *b"ttcf";
+
+    if data.len() < TTCF_HEADER_LEN || data[0..4] != TTCF_MAGIC {
+        return Ok(());
+    }
+
+    let num_fonts = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+    let offset_table_len = u64::from(num_fonts) * TTCF_OFFSET_ENTRY_SIZE;
+    if (TTCF_HEADER_LEN as u64) + offset_table_len > u64::from(u32::MAX) {
+        return Err(FontLoadError::Malformed(
+            ttf_parser::FaceParsingError::MalformedFont,
+        ));
+    }
+
+    Ok(())
+}
+
 impl TrueTypeFont {
     /// Loads and validates a TrueType/OpenType font program from raw bytes.
     ///
@@ -136,6 +215,12 @@ impl TrueTypeFont {
         if data.len() > MAX_FONT_SIZE_BYTES {
             return Err(FontLoadError::TooLarge(data.len()));
         }
+
+        // Must run before ever calling into `ttf-parser`: see this
+        // function's doc comment for why `catch_unwind` below is not
+        // sufficient on its own to stop this specific input shape from
+        // aborting the process under a `cargo fuzz` binary.
+        reject_ttcf_offset_table_overflow(&data)?;
 
         // `ttf-parser`'s public API is documented as panic-free, but per
         // `FontLoadError::Panicked`'s doc comment, fuzzing found a malformed
@@ -615,24 +700,86 @@ mod tests {
         assert!(matches!(err, FontLoadError::Malformed(_)));
     }
 
-    /// Regression test for a crash found by the `font_load` cargo-fuzz
-    /// target: a malformed `ttcf` (TrueType Collection) header whose face
-    /// table offset overflows `u32` trips an internal `assert!` inside
-    /// `ttf-parser` (`parser.rs`, `self.offset as u64 + len as u64 <=
-    /// u32::MAX as u64`) instead of returning `Err`. Before the
-    /// `catch_unwind` isolation added to [`TrueTypeFont::load`], this input
-    /// aborted the whole process -- a trivial DoS given that embedded font
-    /// programs are fully attacker-controlled. `load` must now return
-    /// `Err(FontLoadError::Panicked)` instead of unwinding past this call.
+    /// Regression tests for the three crashes the `font_load` cargo-fuzz
+    /// target found (previously committed as
+    /// `fuzz/artifacts/font_load/crash-*`, now removed since they are
+    /// reproduced here): each is a malformed `ttcf` (TrueType Collection)
+    /// header whose garbage `numFonts` field, multiplied by the `Offset32`
+    /// entry size, overflows `u32::MAX` and trips an internal
+    /// `debug_assert!` inside `ttf-parser` 0.25.1
+    /// (`parser::Stream::read_bytes`, `self.offset as u64 + len as u64 <=
+    /// u32::MAX as u64`) instead of `ttf-parser` returning `Err`.
+    ///
+    /// Note this is a *stronger* guarantee than "doesn't unwind past
+    /// `load`": `TrueTypeFont::load`'s `catch_unwind` wrapper around the
+    /// `ttf_parser::Face::parse` call does **not** actually stop these
+    /// specific inputs from aborting the process when the caller is a
+    /// `cargo fuzz`/`libfuzzer-sys` binary, because that harness's panic
+    /// hook calls `std::process::abort()` from inside the hook itself,
+    /// before any unwinding (and therefore before `catch_unwind`'s landing
+    /// pad) ever runs -- confirmed by literally reproducing all three
+    /// crashes via `cargo +nightly fuzz run font_load
+    /// fuzz/artifacts/font_load/crash-*` before this fix. The actual fix is
+    /// `reject_ttcf_offset_table_overflow` rejecting the malformed
+    /// structure *before* `load` ever calls into `ttf-parser`, so these
+    /// assertions below check specifically for `FontLoadError::Malformed`
+    /// (the proactive-validation path), not `FontLoadError::Panicked` (the
+    /// `catch_unwind` fallback path), to prove the real fix -- not just the
+    /// unwind-safety net -- is what's rejecting these inputs.
     #[test]
-    fn malformed_ttc_offset_overflow_does_not_panic() {
-        let data = vec![
+    fn rejects_the_three_font_load_fuzz_crashers() {
+        // fuzz/artifacts/font_load/crash-30b0cd3a693fc48b90c680dbb6857cfd09505a6a
+        let crash_1: &[u8] = &[
             0x74, 0x74, 0x63, 0x66, 0xe3, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x04, 0xff,
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0x60,
         ];
-        let err = TrueTypeFont::load(data, 0).unwrap_err();
-        assert!(matches!(err, FontLoadError::Panicked | FontLoadError::Malformed(_)));
+        // fuzz/artifacts/font_load/crash-4a98e9e6b19576b075447f7db3230247c43c2fd1
+        let crash_2: &[u8] = &[
+            0x74, 0x74, 0x63, 0x66, 0xff, 0xff, 0xff, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0x00, 0x00, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+            0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+            0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+            0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+            0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x01, 0x00, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+            0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x74,
+            0x74, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x63, 0x6b, 0x6b,
+        ];
+        // fuzz/artifacts/font_load/crash-8bd76a58989e17683c849737aef872fa2038bdfd
+        let crash_3: &[u8] = &[
+            0x74, 0x74, 0x63, 0x66, 0xff, 0xff, 0x3f, 0xff, 0xff, 0x00, 0x00, 0x00, 0x04, 0xff,
+            0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+            0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+            0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x74, 0x63, 0x66, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0xff, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6b, 0x6b,
+            0x6b, 0x6b, 0x67, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+            0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x63, 0x6b, 0x6b,
+        ];
+
+        for crash in [crash_1, crash_2, crash_3] {
+            let err = TrueTypeFont::load(crash.to_vec(), 0).unwrap_err();
+            assert!(
+                matches!(err, FontLoadError::Malformed(_)),
+                "expected proactive ttcf validation to reject {crash:x?} with \
+                 FontLoadError::Malformed, got {err:?}"
+            );
+            // Face index 1 (the second face index the fuzz harness also
+            // exercises) must be rejected identically.
+            let err = TrueTypeFont::load(crash.to_vec(), 1).unwrap_err();
+            assert!(matches!(err, FontLoadError::Malformed(_)));
+        }
+    }
+
+    #[test]
+    fn ttcf_offset_table_within_bounds_is_not_rejected_by_prevalidation() {
+        // A `ttcf` header with a small, plausible `numFonts` must not be
+        // rejected by `reject_ttcf_offset_table_overflow` itself (it should
+        // still fail later, in `ttf-parser`, for being otherwise
+        // malformed/truncated -- just not via the overflow guard).
+        let mut data = vec![0u8; TTCF_HEADER_LEN];
+        data[0..4].copy_from_slice(b"ttcf");
+        data[8..12].copy_from_slice(&1u32.to_be_bytes()); // numFonts = 1
+        assert!(reject_ttcf_offset_table_overflow(&data).is_ok());
     }
 
     #[test]
