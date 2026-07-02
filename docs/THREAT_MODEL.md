@@ -319,6 +319,67 @@ requesting `jiff`'s `defmt` feature (would show up as a new edge in
 `cargo tree -i proc-macro-error2`), re-evaluate whether it's still
 inert.
 
+### 7.4 `RUSTSEC-2026-0195` / `RUSTSEC-2026-0194` — `quick-xml 0.39.4` (DoS in `NsReader`/attribute parsing)
+
+Both advisories (published 2026-06-29) describe the same class of problem:
+`quick-xml < 0.41.0` lets a hostile XML document force pathological cost on
+the *parser itself* while it is still parsing — RUSTSEC-2026-0195 is an
+unbounded heap allocation per start-tag namespace declaration in
+`NsReader`/`NamespaceResolver::push` (no consumer-visible size cap before the
+event is even returned), and RUSTSEC-2026-0194 is an `O(N²)`
+duplicate-attribute-name scan in `BytesStart::attributes()`/`NsReader` for a
+start tag with `N` attributes. Both were reported as reachable by a remote,
+unauthenticated attacker in a real-world XML-over-the-network consumer
+(NLnet Labs Routinator parsing a crafted RRDP `snapshot.xml`).
+
+**Reachability in this crate.** `quick-xml` is pulled in transitively and
+*only* via `tauri` → `tauri-codegen`/`tauri-utils` → `plist 1.9.0` (verified
+with `cargo tree -i quick-xml --all-features`, single path, no other edge).
+Two things about how `plist` is actually exercised matter here:
+
+- `tauri-utils::config::file_associations_plist` only *builds* a
+  `plist::Value` from the Tauri app's own `tauri.conf.json` file-association
+  list (developer-authored config) — no XML is parsed on this path at all,
+  so neither advisory (both are parse-time cost blow-ups) applies to it.
+- The one call that does parse XML, `plist::Value::from_file` in
+  `tauri-codegen`'s `context.rs` (feeding `tauri::generate_context!()`),
+  runs inside the **proc-macro expansion of the downstream Tauri
+  application's own build** — i.e. at `cargo build` time of the app that
+  embeds this library, reading a local `Info.plist` file that lives in that
+  app's own source tree and is authored by the same developer building the
+  app. It never runs against this crate's actual runtime attack surface
+  (§2: "whoever produced the PDF file (or an embedded font/ICC/JPEG payload
+  inside it) that this process opens"). A build already trusts its own
+  build-time inputs and build scripts completely (a malicious `Info.plist`
+  committed to the app's own repo is no more dangerous than a malicious
+  `build.rs`), so the DoS-via-untrusted-XML scenario both advisories
+  describe (a remote/unauthenticated attacker feeding crafted XML into a
+  live parsing service) does not exist on this path.
+- This crate's own XMP metadata handling (`src/editor/xmp.rs`, which *does*
+  parse attacker-controlled bytes from inside a PDF, per §2) does not use
+  `quick-xml` at all — confirmed by `grep -rn "quick_xml\|quick-xml"
+  src/editor/xmp.rs` returning nothing; it is a separate, from-scratch
+  implementation. So the one place this crate parses untrusted XML-like
+  content at runtime does not go through the vulnerable code at all.
+
+**No upgrade currently available.** `plist 1.9.0` (the latest version on
+crates.io as of this review, published 2026-04-26, predating both
+advisories) pins `quick_xml = "^0.39.2"`, which excludes the patched
+`>=0.41.0` line by semver (0.x caret rules: `^0.39.2` means `>=0.39.2,
+<0.40.0`). Confirmed directly: `cargo update -p quick-xml --precise
+0.41.0` fails resolution with "failed to select a version for the
+requirement `quick-xml = "^0.39.2"`" required by `plist v1.9.0`. Forcing it
+via a `[patch.crates-io]` override would require compiling `plist` against
+a `quick-xml` minor version it was never written or tested against — an
+unreviewed, unofficial fork-equivalent, out of scope for a dependency
+triage.
+
+**Re-review trigger:** `plist` publishes a version whose manifest allows
+`quick-xml >= 0.41`, at which point `cargo update -p plist` (or the next
+routine `tauri` bump that pulls it in) resolves this normally and the two
+`RUSTSEC-2026-0195`/`RUSTSEC-2026-0194` entries in `.cargo/audit.toml`'s
+`ignore` list should be removed.
+
 ## 8. Known residual risk / explicitly out of scope
 
 Carried over from the prior audit phase (`ARCHITECTURE.md` §9/§10) and

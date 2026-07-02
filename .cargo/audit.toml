@@ -40,6 +40,32 @@ ignore = [
     # docs/THREAT_MODEL.md section 7.3 for the full verification and the
     # re-review trigger (if `jiff`'s `defmt` feature ever gets activated).
     "RUSTSEC-2026-0173",
+
+    # RUSTSEC-2026-0195 (quick-xml 0.39.4, unbounded namespace-declaration
+    # allocation in `NsReader` -> memory-exhaustion DoS) and
+    # RUSTSEC-2026-0194 (quick-xml 0.39.4, O(N^2) duplicate-attribute-name
+    # scan in `BytesStart::attributes()`/`NsReader` -> CPU-exhaustion DoS).
+    # Both reach this crate transitively and *only* via
+    # tauri -> tauri-codegen/tauri-utils -> plist 1.9.0 (single edge, see
+    # `cargo tree -i quick-xml --all-features`). The one XML *parse* call
+    # on that path (`plist::Value::from_file` in tauri-codegen's
+    # `context.rs`, feeding `tauri::generate_context!()`) runs during the
+    # downstream Tauri app's own build (proc-macro expansion at that app's
+    # `cargo build` time), reading a local `Info.plist` the app's own
+    # developer authored -- never this crate's actual runtime attacker
+    # surface (a PDF file/embedded font opened by this process, see
+    # docs/THREAT_MODEL.md section 2). This crate's own XMP handling
+    # (src/editor/xmp.rs), which does parse attacker-controlled bytes from
+    # inside a PDF, does not use quick-xml at all (separate, from-scratch
+    # implementation). No patched `quick-xml` is currently reachable:
+    # `plist` 1.9.0 (latest on crates.io) still requires
+    # `quick_xml = "^0.39.2"`, which excludes the patched >=0.41.0 line;
+    # `cargo update -p quick-xml --precise 0.41.0` fails resolution against
+    # that requirement. See docs/THREAT_MODEL.md section 7.4 for the full
+    # rationale and the re-review trigger (a `plist` release that allows
+    # quick-xml >=0.41).
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0194",
 ]
 # All three RustSec "informational" categories, spelled out explicitly
 # (this also happens to be cargo-audit's own default when this key is
