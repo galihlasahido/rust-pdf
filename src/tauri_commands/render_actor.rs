@@ -85,6 +85,16 @@ struct RenderPageJob {
 enum RenderJob {
     RenderPage(RenderPageJob),
     CloseDocument(DocumentHandle),
+    /// Test-only seam: arms a one-shot panic that fires from *inside* the
+    /// `catch_unwind`-wrapped body of the next `RenderPage` job this actor
+    /// processes (see `run`), so tests can deterministically exercise "a
+    /// render job panics" without depending on finding a real PDF/Pdfium
+    /// input that happens to panic (which would be both fragile across
+    /// Pdfium versions/platforms and outside this crate's control). Never
+    /// constructed outside `#[cfg(test)]` code, so it compiles to nothing
+    /// in release builds and cannot be reached from real IPC callers.
+    #[cfg(test)]
+    InjectPanicOnNextRender,
 }
 
 /// Handle to the background rendering actor thread. See the module docs
@@ -113,22 +123,73 @@ impl RenderActor {
 
     fn run(receiver: mpsc::Receiver<RenderJob>) {
         let mut renderers: HashMap<DocumentHandle, PdfRenderer<'static>> = HashMap::new();
+        #[cfg(test)]
+        let mut panic_next_render = false;
         while let Ok(job) = receiver.recv() {
             match job {
                 RenderJob::RenderPage(job) => {
-                    let result = Self::handle_render(
-                        &mut renderers,
-                        job.handle,
-                        &job.path,
-                        job.password.as_deref(),
-                        job.page_index,
-                        job.dpi,
-                        job.viewport,
-                    );
-                    let _ = job.respond.send(result);
+                    let RenderPageJob {
+                        handle,
+                        path,
+                        password,
+                        page_index,
+                        dpi,
+                        viewport,
+                        respond,
+                    } = job;
+                    #[cfg(test)]
+                    let fire_test_panic = std::mem::take(&mut panic_next_render);
+                    // Mirrors `WorkerPool::worker_loop`'s per-job
+                    // `catch_unwind` (see `worker.rs`): a single
+                    // pathological input (e.g. a Pdfium call that hits an
+                    // internal `unwrap`/assertion inside `pdfium-render`
+                    // or this crate's own rendering code) must only fail
+                    // *that* `render_page` call, not permanently kill this
+                    // actor thread -- which, unlike a `WorkerPool` worker,
+                    // is the sole owner of every open document's
+                    // `PdfRenderer` and cannot simply be replaced by
+                    // another thread (see the module docs). `renderers`
+                    // is borrowed mutably across the `catch_unwind`
+                    // boundary; `AssertUnwindSafe` is sound here for the
+                    // same reason it is in `WorkerPool`: a panic
+                    // unwinding out of `handle_render` cannot leave the
+                    // `HashMap` itself in an invalid state (no partial
+                    // mutation of its structure straddles the panic
+                    // point), and `PdfRenderer`'s own FFI calls are
+                    // serialized under `ffi_lock`, whose poisoning is
+                    // already recovered from (see `ffi_lock`'s doc
+                    // comment in `src/render/renderer.rs`) rather than
+                    // left to propagate.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        if fire_test_panic {
+                            panic!(
+                                "render_actor test-injected panic (InjectPanicOnNextRender)"
+                            );
+                        }
+                        Self::handle_render(
+                            &mut renderers,
+                            handle,
+                            &path,
+                            password.as_deref(),
+                            page_index,
+                            dpi,
+                            viewport,
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(CommandError::internal(
+                            "internal error: render job panicked",
+                        ))
+                    });
+                    let _ = respond.send(result);
                 }
                 RenderJob::CloseDocument(handle) => {
                     renderers.remove(&handle);
+                }
+                #[cfg(test)]
+                RenderJob::InjectPanicOnNextRender => {
+                    panic_next_render = true;
                 }
             }
         }
@@ -323,5 +384,54 @@ mod tests {
         // the (still on-disk) file rather than erroring out.
         let page = actor.render_page(handle, path, None, 0, 72.0, None).await;
         assert!(page.is_ok());
+    }
+
+    /// Regression guard for the actor-thread panic-resilience gap: one
+    /// `render_page` call whose underlying job panics (simulated here via
+    /// `RenderJob::InjectPanicOnNextRender` -- see that variant's doc
+    /// comment for why a synthetic trigger is used instead of a real
+    /// pathological PDF) must only fail *that* call with a structured
+    /// `CommandError`, not permanently kill the actor thread. Every
+    /// subsequent `render_page` call -- including one for a page after the
+    /// panicking one, and one for a brand new document handle -- must
+    /// still succeed, exactly like `WorkerPool::survives_a_panicking_job`
+    /// (see `worker.rs`) proves for the general worker pool.
+    #[tokio::test]
+    async fn render_page_survives_a_panicking_job() {
+        let path = crate::tauri_commands::state::test_support::sample_pdf_path();
+        let handle = DocumentHandle(5);
+        let Some((actor, _)) = warm_up(handle, &path).await else {
+            return;
+        };
+
+        // Arm the one-shot test panic, then immediately issue the render
+        // call it should fire from. `send` (like `render_page`) goes
+        // through the same `mpsc::Sender`, so FIFO ordering guarantees
+        // the actor thread processes the arming job before this render
+        // job.
+        actor
+            .send(RenderJob::InjectPanicOnNextRender)
+            .expect("actor should still be accepting jobs");
+        let panicked = actor
+            .render_page(handle, path.clone(), None, 0, 72.0, None)
+            .await;
+        let err = panicked.expect_err("the injected panic must surface as an Err, not a crash");
+        assert_eq!(err.code, super::super::error::ErrorCode::Internal);
+
+        // The actor thread must still be alive and able to serve further
+        // render requests -- both for the same document handle and for a
+        // different one that has to be freshly opened.
+        let same_handle_after = actor.render_page(handle, path.clone(), None, 0, 72.0, None).await;
+        assert!(
+            same_handle_after.is_ok(),
+            "actor must keep serving the same document handle after a panicking job: {same_handle_after:?}"
+        );
+
+        let other_handle = DocumentHandle(6);
+        let other_handle_after = actor.render_page(other_handle, path, None, 0, 72.0, None).await;
+        assert!(
+            other_handle_after.is_ok(),
+            "actor must keep serving new document handles after a panicking job: {other_handle_after:?}"
+        );
     }
 }
