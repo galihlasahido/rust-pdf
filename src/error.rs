@@ -404,6 +404,12 @@ pub enum SignatureError {
     /// PKCS#7 encoding error.
     #[error("PKCS#7 encoding error: {0}")]
     Pkcs7Error(String),
+
+    /// RFC 3161 timestamp request/response error (malformed request,
+    /// malformed/untrusted TSA response, or a transport error surfaced by
+    /// the caller-supplied [`crate::signatures::TimestampAuthorityClient`]).
+    #[error("Timestamp error: {0}")]
+    TimestampError(String),
 }
 
 /// Errors related to form fields.

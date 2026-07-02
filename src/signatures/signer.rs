@@ -6,10 +6,155 @@
 
 use crate::document::Document;
 use crate::error::SignatureError;
-use super::{Certificate, Pkcs7Builder, PrivateKey, SignatureAlgorithm, SignatureConfig, SignatureResult};
+use super::config::PadesLevel;
+use super::{
+    digest_for_algorithm, fields, timestamp, Certificate, Pkcs7Builder, PrivateKey,
+    SignatureAlgorithm, SignatureConfig, SignatureResult,
+};
 
-/// Signature placeholder size in bytes (32KB should be enough for most signatures).
-const SIGNATURE_SIZE: usize = 32768;
+/// Lower/upper bounds clamped around `SignatureConfig::signature_size` when
+/// reserving space for the `/Contents` placeholder. The lower bound keeps a
+/// too-small caller-supplied value from producing a placeholder that can
+/// never fit even a bare RSA-2048 signature + certificate; the upper bound
+/// is a sanity ceiling against an unreasonably large caller-supplied value
+/// (this is caller/config-controlled, not attacker-controlled untrusted
+/// file input, but a defensive clamp costs nothing).
+const MIN_SIGNATURE_SIZE: usize = 4096;
+const MAX_SIGNATURE_SIZE: usize = 1 << 20; // 1 MiB
+
+/// Resolves the `/Contents` placeholder size (in bytes) to reserve, from
+/// `config.signature_size`, clamped to a sane range. PAdES "B-T" (an
+/// embedded RFC 3161 token, which itself embeds the TSA's certificate) and
+/// chains with several intermediate certificates need noticeably more room
+/// than a bare single-certificate signature -- see
+/// [`SignatureConfig::signature_size`].
+fn signature_placeholder_size(config: &SignatureConfig) -> usize {
+    config.signature_size.clamp(MIN_SIGNATURE_SIZE, MAX_SIGNATURE_SIZE)
+}
+
+/// Returns the PDF `/SubFilter` name for `level`. `adbe.pkcs7.detached` is
+/// the classic PKCS#7-detached subfilter (ISO 32000-1:2008 §12.8.1 /
+/// ISO 32000-2:2020 §12.8.1 both register it; exact table number not
+/// pinned down here). `ETSI.CAdES.detached` is the PAdES-profile subfilter
+/// per ETSI EN 319 142-1 ("PAdES digital signatures").
+fn sub_filter_for(level: PadesLevel) -> &'static str {
+    match level {
+        PadesLevel::None => fields::SUB_FILTER_PKCS7_DETACHED,
+        PadesLevel::B | PadesLevel::T => fields::SUB_FILTER_ETSI_CADES,
+    }
+}
+
+/// Builds the content stream + font object pair for a visible signature
+/// appearance form XObject (ISO 32000-1 §12.5.5 "Appearance Streams"), using
+/// a non-embedded standard Type1 font (`Helvetica`) so the appearance is
+/// self-contained regardless of what fonts the page itself uses.
+///
+/// Returns `(content_stream_bytes, uses_font)` -- `uses_font` is always
+/// `true` today but kept as a return value in case a future caller wants a
+/// borderless / text-free appearance.
+fn build_visible_appearance_content(config: &SignatureConfig, width: f32, height: f32) -> Vec<u8> {
+    let name = config.name.as_deref().unwrap_or("Unknown");
+    let date = format_pdf_display_timestamp();
+
+    let mut lines = vec![format!("Digitally signed by"), name.to_string(), format!("Date: {date}")];
+    if let Some(reason) = &config.reason {
+        lines.push(format!("Reason: {reason}"));
+    }
+
+    let mut content = String::new();
+    content.push_str("q\n0.4 0.4 0.4 RG 0.75 w\n");
+    content.push_str(&format!("0.5 0.5 {:.2} {:.2} re S\n", (width - 1.0).max(0.0), (height - 1.0).max(0.0)));
+    content.push_str("BT\n/F1 7 Tf\n0 0 0 rg\n");
+    let mut y = height - 11.0;
+    for (i, line) in lines.iter().enumerate() {
+        if i == 0 {
+            content.push_str(&format!("4 {:.2} Td\n", y.max(0.0)));
+        } else {
+            content.push_str("0 -9 Td\n");
+        }
+        content.push_str(&format!("({}) Tj\n", escape_pdf_string(line)));
+        y -= 9.0;
+    }
+    content.push_str("ET\nQ\n");
+    content.into_bytes()
+}
+
+/// Builds the final PKCS#7/CMS signature bytes for `data_to_sign`, applying
+/// [`SignatureConfig::pades_level`] (CAdES-BES `signing-certificate-v2`,
+/// see [`Pkcs7Builder::pades`]) and, if configured, requesting and
+/// embedding an RFC 3161 timestamp token (PAdES "B-T").
+///
+/// Shared by [`DocumentSigner::sign`] and [`IncrementalSigner::sign`] so the
+/// PAdES/timestamp behavior is identical for the first and any subsequent
+/// signature on a document.
+fn build_pkcs7_signature(
+    config: &SignatureConfig,
+    cert: &Certificate,
+    certificate_chain: &[Certificate],
+    data_to_sign: &[u8],
+    key: &PrivateKey,
+) -> SignatureResult<Vec<u8>> {
+    if config.pades_level == PadesLevel::T && config.timestamp_authority.is_none() {
+        return Err(SignatureError::SigningFailed(
+            "PadesLevel::T requires a timestamp_authority to be configured".to_string(),
+        ));
+    }
+
+    let mut pkcs7_builder = Pkcs7Builder::new()
+        .certificate(cert.clone())
+        .algorithm(config.algorithm)
+        .pades(matches!(config.pades_level, PadesLevel::B | PadesLevel::T));
+
+    for chain_cert in certificate_chain {
+        pkcs7_builder = pkcs7_builder.add_chain_certificate(chain_cert.clone());
+    }
+
+    let (cms_der, signature_value) = pkcs7_builder.build_with_signature(data_to_sign, key)?;
+
+    let Some(client) = config.timestamp_authority.as_ref() else {
+        return Ok(cms_der);
+    };
+
+    // PAdES "B-T" (CAdES-T, RFC 5126 / ETSI EN 319 122-1 §5.3): the
+    // timestamp token's message imprint is computed over the raw
+    // `SignatureValue` octets, not over the document bytes.
+    let digest = digest_for_algorithm(config.algorithm, &signature_value);
+    let request = timestamp::build_timestamp_request(config.algorithm, digest.clone(), true);
+    let response = client.timestamp(&request.der)?;
+    let token = timestamp::parse_timestamp_response(&response, config.algorithm, &digest, Some(request.nonce))?;
+
+    timestamp::embed_unsigned_timestamp_attribute(&cms_der, &token.token_der)
+}
+
+/// Builds a standalone `/Type /Font /Subtype /Type1 /BaseFont /Helvetica`
+/// object (ISO 32000-1 §9.6.2.2, one of the 14 standard fonts -- no
+/// embedding/`/Widths`/`/Encoding` needed) for a visible signature
+/// appearance's own `/Resources`.
+fn build_appearance_font_object(obj_id: u32) -> String {
+    format!("{obj_id} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
+}
+
+/// Formats the current time for display inside a visible signature
+/// appearance (human-readable, distinct from [`format_pdf_timestamp`]'s
+/// PDF `/M` date-string format).
+fn format_pdf_display_timestamp() -> String {
+    // Reuse the PDF date string's numeric fields rather than a second
+    // date/time implementation.
+    let pdf_ts = format_pdf_timestamp();
+    // pdf_ts looks like "D:YYYYMMDDHHmmSS+00'00'"; slice out the parts we
+    // want for a "YYYY-MM-DD HH:mm:SS UTC" display string.
+    if pdf_ts.len() >= 16 {
+        let year = &pdf_ts[2..6];
+        let month = &pdf_ts[6..8];
+        let day = &pdf_ts[8..10];
+        let hour = &pdf_ts[10..12];
+        let minute = &pdf_ts[12..14];
+        let second = &pdf_ts[14..16];
+        format!("{year}-{month}-{day} {hour}:{minute}:{second} UTC")
+    } else {
+        pdf_ts
+    }
+}
 
 /// Signs PDF documents with X.509 certificates.
 #[derive(Debug)]
@@ -115,15 +260,7 @@ impl DocumentSigner {
         let data_to_sign = self.extract_signed_data(&pdf_with_byte_range, &byte_range);
 
         // Create the PKCS#7 signature
-        let mut pkcs7_builder = Pkcs7Builder::new()
-            .certificate(cert.clone())
-            .algorithm(self.config.algorithm);
-
-        for chain_cert in &self.certificate_chain {
-            pkcs7_builder = pkcs7_builder.add_chain_certificate(chain_cert.clone());
-        }
-
-        let pkcs7_signature = pkcs7_builder.build(&data_to_sign, key)?;
+        let pkcs7_signature = build_pkcs7_signature(&self.config, cert, &self.certificate_chain, &data_to_sign, key)?;
 
         // Embed the signature into the PDF
         let signed_pdf = self.embed_signature(pdf_with_byte_range, &byte_range, &pkcs7_signature)?;
@@ -155,10 +292,14 @@ impl DocumentSigner {
         let sig_dict_id = next_obj_id;
         let sig_field_id = next_obj_id + 1;
         let appearance_id = next_obj_id + 2;
-        let acro_form_id = next_obj_id + 3;
+        // A visible appearance needs its own Type1 font object (the
+        // appearance form's `/Resources` is self-contained, see
+        // `build_appearance_object`); an invisible signature does not.
+        let font_id = self.config.visible.is_some().then_some(next_obj_id + 3);
+        let acro_form_id = next_obj_id + if font_id.is_some() { 4 } else { 3 };
         let updated_page_id = page_obj_num; // We'll update the existing page
         let updated_catalog_id = root_obj_num; // We'll update the existing catalog
-        let final_next_id = next_obj_id + 4;
+        let final_next_id = next_obj_id + if font_id.is_some() { 5 } else { 4 };
 
         // Track offsets for xref
         let mut object_offsets: Vec<(u32, usize)> = Vec::new();
@@ -175,11 +316,21 @@ impl DocumentSigner {
         output.extend_from_slice(sig_field.as_bytes());
         object_offsets.push((sig_field_id, sig_field_offset));
 
-        // 3. Build appearance XObject (empty form)
+        // 3. Build appearance XObject (empty form, or a visible one with
+        // signer name/date/reason if `SignatureConfig::visible` is set)
         let appearance_offset = output.len();
-        let appearance = self.build_appearance_object(appearance_id);
+        let appearance = self.build_appearance_object(appearance_id, font_id);
         output.extend_from_slice(appearance.as_bytes());
         object_offsets.push((appearance_id, appearance_offset));
+
+        // 3b. Build the appearance's font object, if a visible appearance
+        // was requested.
+        if let Some(font_id) = font_id {
+            let font_offset = output.len();
+            let font_obj = build_appearance_font_object(font_id);
+            output.extend_from_slice(font_obj.as_bytes());
+            object_offsets.push((font_id, font_offset));
+        }
 
         // 4. Build AcroForm object
         let acro_form_offset = output.len();
@@ -388,18 +539,19 @@ impl DocumentSigner {
     fn build_signature_dictionary(&self, obj_id: u32) -> String {
         let signer_name = self.config.name.as_deref().unwrap_or("Unknown");
         let timestamp = format_pdf_timestamp();
+        let placeholder_size = signature_placeholder_size(&self.config);
 
         let mut dict = format!("{} 0 obj\n<<\n", obj_id);
         dict.push_str("/Type /Sig\n");
         dict.push_str("/Filter /Adobe.PPKLite\n");
-        dict.push_str("/SubFilter /adbe.pkcs7.detached\n");
+        dict.push_str(&format!("/SubFilter /{}\n", sub_filter_for(self.config.pades_level)));
 
         // ByteRange placeholder with fixed-width (10 digits each)
         dict.push_str("/ByteRange [0000000000 0000000000 0000000000 0000000000]\n");
 
         // Contents placeholder for signature (hex encoded, so double the size)
         dict.push_str("/Contents <");
-        dict.push_str(&"0".repeat(SIGNATURE_SIZE * 2));
+        dict.push_str(&"0".repeat(placeholder_size * 2));
         dict.push_str(">\n");
 
         // Signer name
@@ -426,13 +578,17 @@ impl DocumentSigner {
     /// Builds the signature field widget annotation.
     fn build_signature_field(&self, field_id: u32, sig_dict_id: u32, appearance_id: u32, page_id: u32) -> String {
         let field_name = "Signature1";
+        let rect = match self.config.visible {
+            Some(v) => format!("[{} {} {} {}]", v.x, v.y, v.x + v.width, v.y + v.height),
+            None => "[0 0 0 0]".to_string(),
+        };
 
         let mut field = format!("{} 0 obj\n<<\n", field_id);
         field.push_str("/Type /Annot\n");
         field.push_str("/Subtype /Widget\n");
         field.push_str("/FT /Sig\n");
         field.push_str("/F 132\n"); // Flags: Print (4) + Locked (128)
-        field.push_str("/Rect [0 0 0 0]\n"); // Invisible signature
+        field.push_str(&format!("/Rect {}\n", rect));
         field.push_str(&format!("/T ({})\n", field_name));
         field.push_str(&format!("/V {} 0 R\n", sig_dict_id));
         field.push_str(&format!("/P {} 0 R\n", page_id));
@@ -441,16 +597,36 @@ impl DocumentSigner {
         field
     }
 
-    /// Builds the appearance XObject (empty form for invisible signature).
-    fn build_appearance_object(&self, obj_id: u32) -> String {
+    /// Builds the appearance XObject: an empty form for an invisible
+    /// signature (the default), or one drawing the signer name/date/reason
+    /// if `SignatureConfig::visible` is set (`font_id` is then the object
+    /// number of the `/Resources /Font /F1` this stream references).
+    fn build_appearance_object(&self, obj_id: u32, font_id: Option<u32>) -> String {
+        let Some(rect) = self.config.visible else {
+            let mut obj = format!("{} 0 obj\n<<\n", obj_id);
+            obj.push_str("/Type /XObject\n");
+            obj.push_str("/Subtype /Form\n");
+            obj.push_str("/FormType 1\n");
+            obj.push_str("/BBox [0 0 0 0]\n");
+            obj.push_str("/Resources << >>\n");
+            obj.push_str("/Length 0\n");
+            obj.push_str(">>\nstream\nendstream\nendobj\n");
+            return obj;
+        };
+
+        let font_id = font_id.expect("font_id must be set when config.visible is set");
+        let content = build_visible_appearance_content(&self.config, rect.width, rect.height);
+
         let mut obj = format!("{} 0 obj\n<<\n", obj_id);
         obj.push_str("/Type /XObject\n");
         obj.push_str("/Subtype /Form\n");
         obj.push_str("/FormType 1\n");
-        obj.push_str("/BBox [0 0 0 0]\n");
-        obj.push_str("/Resources << >>\n");
-        obj.push_str("/Length 0\n");
-        obj.push_str(">>\nstream\nendstream\nendobj\n");
+        obj.push_str(&format!("/BBox [0 0 {} {}]\n", rect.width, rect.height));
+        obj.push_str(&format!("/Resources << /Font << /F1 {} 0 R >> >>\n", font_id));
+        obj.push_str(&format!("/Length {}\n", content.len()));
+        obj.push_str(">>\nstream\n");
+        obj.push_str(&String::from_utf8_lossy(&content));
+        obj.push_str("\nendstream\nendobj\n");
         obj
     }
 
@@ -612,8 +788,8 @@ impl DocumentSigner {
         let hex_open = contents_start + 10;
 
         // Find the closing > by searching for it after the hex content
-        // We know the hex content is SIGNATURE_SIZE * 2 bytes of zeros
-        let expected_close = hex_open + 1 + (SIGNATURE_SIZE * 2);
+        // We know the hex content is `signature_placeholder_size` * 2 bytes of zeros
+        let expected_close = hex_open + 1 + (signature_placeholder_size(&self.config) * 2);
 
         // Verify there's a > at the expected position
         if expected_close >= pdf_bytes.len() || pdf_bytes[expected_close] != b'>' {
@@ -712,7 +888,7 @@ impl DocumentSigner {
         let sig_hex: String = signature.iter().map(|b| format!("{:02X}", b)).collect();
 
         // Pad with zeros to fill the placeholder
-        let placeholder_size = SIGNATURE_SIZE * 2;
+        let placeholder_size = signature_placeholder_size(&self.config) * 2;
         let padded_hex = if sig_hex.len() < placeholder_size {
             let padding = "0".repeat(placeholder_size - sig_hex.len());
             sig_hex + &padding
@@ -946,6 +1122,14 @@ impl IncrementalSigner {
         self
     }
 
+    /// Sets the signature configuration wholesale (PAdES level, RFC 3161
+    /// timestamp authority, visible appearance, etc. -- see
+    /// [`SignatureConfig`]).
+    pub fn config(mut self, config: SignatureConfig) -> Self {
+        self.config = config;
+        self
+    }
+
     /// Signs the PDF and returns the signed PDF bytes with the new signature.
     pub fn sign(self) -> SignatureResult<Vec<u8>> {
         let cert = self.certificate.as_ref().ok_or_else(|| {
@@ -969,15 +1153,7 @@ impl IncrementalSigner {
         let data_to_sign = self.extract_signed_data(&pdf_with_byte_range, &byte_range);
 
         // Create the PKCS#7 signature
-        let mut pkcs7_builder = Pkcs7Builder::new()
-            .certificate(cert.clone())
-            .algorithm(self.config.algorithm);
-
-        for chain_cert in &self.certificate_chain {
-            pkcs7_builder = pkcs7_builder.add_chain_certificate(chain_cert.clone());
-        }
-
-        let pkcs7_signature = pkcs7_builder.build(&data_to_sign, key)?;
+        let pkcs7_signature = build_pkcs7_signature(&self.config, cert, &self.certificate_chain, &data_to_sign, key)?;
 
         // Embed the signature
         let signed_pdf = self.embed_signature(pdf_with_byte_range, &byte_range, &pkcs7_signature)?;
@@ -1166,15 +1342,20 @@ impl IncrementalSigner {
         let sig_dict_id = next_obj_id;
         let sig_field_id = next_obj_id + 1;
         let appearance_id = next_obj_id + 2;
+        // A visible appearance needs its own Type1 font object; see
+        // `DocumentSigner::create_pdf_with_placeholder` for the same
+        // reasoning.
+        let font_id = self.config.visible.is_some().then_some(next_obj_id + 3);
+        let base_used: u32 = if font_id.is_some() { 4 } else { 3 };
         let acro_form_id = if let Some(id) = existing_acro_form {
             id
         } else {
-            next_obj_id + 3
+            next_obj_id + base_used
         };
         let final_next_id = if existing_acro_form.is_some() {
-            next_obj_id + 3
+            next_obj_id + base_used
         } else {
-            next_obj_id + 4
+            next_obj_id + base_used + 1
         };
 
         let sig_name = format!("Signature{}", sig_count + 1);
@@ -1196,9 +1377,18 @@ impl IncrementalSigner {
 
         // 3. Build appearance XObject
         let appearance_offset = output.len();
-        let appearance = self.build_appearance_object(appearance_id);
+        let appearance = self.build_appearance_object(appearance_id, font_id);
         output.extend_from_slice(appearance.as_bytes());
         object_offsets.push((appearance_id, appearance_offset));
+
+        // 3b. Build the appearance's font object, if a visible appearance
+        // was requested.
+        if let Some(font_id) = font_id {
+            let font_offset = output.len();
+            let font_obj = build_appearance_font_object(font_id);
+            output.extend_from_slice(font_obj.as_bytes());
+            object_offsets.push((font_id, font_offset));
+        }
 
         // 4. Build or update AcroForm
         let acro_form_offset = output.len();
@@ -1239,14 +1429,15 @@ impl IncrementalSigner {
     fn build_signature_dictionary(&self, obj_id: u32) -> String {
         let signer_name = self.config.name.as_deref().unwrap_or("Unknown");
         let timestamp = format_pdf_timestamp();
+        let placeholder_size = signature_placeholder_size(&self.config);
 
         let mut dict = format!("{} 0 obj\n<<\n", obj_id);
         dict.push_str("/Type /Sig\n");
         dict.push_str("/Filter /Adobe.PPKLite\n");
-        dict.push_str("/SubFilter /adbe.pkcs7.detached\n");
+        dict.push_str(&format!("/SubFilter /{}\n", sub_filter_for(self.config.pades_level)));
         dict.push_str("/ByteRange [0000000000 0000000000 0000000000 0000000000]\n");
         dict.push_str("/Contents <");
-        dict.push_str(&"0".repeat(SIGNATURE_SIZE * 2));
+        dict.push_str(&"0".repeat(placeholder_size * 2));
         dict.push_str(">\n");
         dict.push_str(&format!("/Name ({})\n", escape_pdf_string(signer_name)));
         dict.push_str(&format!("/M ({})\n", timestamp));
@@ -1267,12 +1458,17 @@ impl IncrementalSigner {
 
     /// Builds the signature field widget.
     fn build_signature_field(&self, field_id: u32, sig_dict_id: u32, appearance_id: u32, page_id: u32, field_name: &str) -> String {
+        let rect = match self.config.visible {
+            Some(v) => format!("[{} {} {} {}]", v.x, v.y, v.x + v.width, v.y + v.height),
+            None => "[0 0 0 0]".to_string(),
+        };
+
         let mut field = format!("{} 0 obj\n<<\n", field_id);
         field.push_str("/Type /Annot\n");
         field.push_str("/Subtype /Widget\n");
         field.push_str("/FT /Sig\n");
         field.push_str("/F 132\n");
-        field.push_str("/Rect [0 0 0 0]\n");
+        field.push_str(&format!("/Rect {}\n", rect));
         field.push_str(&format!("/T ({})\n", field_name));
         field.push_str(&format!("/V {} 0 R\n", sig_dict_id));
         field.push_str(&format!("/P {} 0 R\n", page_id));
@@ -1281,16 +1477,35 @@ impl IncrementalSigner {
         field
     }
 
-    /// Builds the appearance XObject.
-    fn build_appearance_object(&self, obj_id: u32) -> String {
+    /// Builds the appearance XObject: an empty form for an invisible
+    /// signature, or one drawing the signer name/date/reason if
+    /// `SignatureConfig::visible` is set.
+    fn build_appearance_object(&self, obj_id: u32, font_id: Option<u32>) -> String {
+        let Some(rect) = self.config.visible else {
+            let mut obj = format!("{} 0 obj\n<<\n", obj_id);
+            obj.push_str("/Type /XObject\n");
+            obj.push_str("/Subtype /Form\n");
+            obj.push_str("/FormType 1\n");
+            obj.push_str("/BBox [0 0 0 0]\n");
+            obj.push_str("/Resources << >>\n");
+            obj.push_str("/Length 0\n");
+            obj.push_str(">>\nstream\nendstream\nendobj\n");
+            return obj;
+        };
+
+        let font_id = font_id.expect("font_id must be set when config.visible is set");
+        let content = build_visible_appearance_content(&self.config, rect.width, rect.height);
+
         let mut obj = format!("{} 0 obj\n<<\n", obj_id);
         obj.push_str("/Type /XObject\n");
         obj.push_str("/Subtype /Form\n");
         obj.push_str("/FormType 1\n");
-        obj.push_str("/BBox [0 0 0 0]\n");
-        obj.push_str("/Resources << >>\n");
-        obj.push_str("/Length 0\n");
-        obj.push_str(">>\nstream\nendstream\nendobj\n");
+        obj.push_str(&format!("/BBox [0 0 {} {}]\n", rect.width, rect.height));
+        obj.push_str(&format!("/Resources << /Font << /F1 {} 0 R >> >>\n", font_id));
+        obj.push_str(&format!("/Length {}\n", content.len()));
+        obj.push_str(">>\nstream\n");
+        obj.push_str(&String::from_utf8_lossy(&content));
+        obj.push_str("\nendstream\nendobj\n");
         obj
     }
 
@@ -1474,7 +1689,7 @@ impl IncrementalSigner {
         })?;
 
         let hex_open = contents_start + 10;
-        let expected_close = hex_open + 1 + (SIGNATURE_SIZE * 2);
+        let expected_close = hex_open + 1 + (signature_placeholder_size(&self.config) * 2);
 
         if expected_close >= pdf_bytes.len() || pdf_bytes[expected_close] != b'>' {
             return Err(SignatureError::ByteRangeError("Could not find closing > for Contents".to_string()));
@@ -1543,7 +1758,7 @@ impl IncrementalSigner {
     fn embed_signature(&self, pdf_bytes: Vec<u8>, byte_range: &ByteRange, signature: &[u8]) -> SignatureResult<Vec<u8>> {
         let sig_hex: String = signature.iter().map(|b| format!("{:02X}", b)).collect();
 
-        let placeholder_size = SIGNATURE_SIZE * 2;
+        let placeholder_size = signature_placeholder_size(&self.config) * 2;
         let padded_hex = if sig_hex.len() < placeholder_size {
             let padding = "0".repeat(placeholder_size - sig_hex.len());
             sig_hex + &padding

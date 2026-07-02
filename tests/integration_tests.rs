@@ -3799,7 +3799,7 @@ mod signature_tests {
         assert!(config.location.is_none());
         assert!(config.contact_info.is_none());
         assert_eq!(config.algorithm, SignatureAlgorithm::RsaSha256);
-        assert_eq!(config.signature_size, 8192);
+        assert_eq!(config.signature_size, 16384);
         assert!(config.embed_certificate_chain);
     }
 

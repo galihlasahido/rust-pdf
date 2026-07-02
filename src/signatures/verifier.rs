@@ -2,13 +2,22 @@
 //!
 //! This module checks signatures produced by [`super::DocumentSigner`] and
 //! [`super::IncrementalSigner`] (and, best-effort, other PKCS#7/CMS detached
-//! signatures using the same `Adobe.PPKLite`/`adbe.pkcs7.detached` shape).
+//! signatures using the same `Adobe.PPKLite`/`adbe.pkcs7.detached` or
+//! `ETSI.CAdES.detached` shape).
 //!
-//! Verification only establishes that a signature is *cryptographically
-//! self-consistent* — the signed bytes match the embedded digest and the
-//! embedded certificate's public key validates the signature. It does
-//! **not** perform certificate chain / root-of-trust validation, revocation
-//! checking, or timestamp (RFC 3161) validation.
+//! [`VerifiedSignature::is_valid`] only establishes that a signature is
+//! *cryptographically self-consistent* — the signed bytes match the
+//! embedded digest (so this detects any modification of the document made
+//! after signing) and the embedded certificate's public key validates the
+//! signature. It does **not** by itself imply the certificate is trusted.
+//!
+//! Two additional, separately-reported checks build on top of that:
+//! - certificate chain / root-of-trust validation, via
+//!   [`SignatureVerifier::with_trust_anchors`] and
+//!   [`VerifiedSignature::chain`] (see [`crate::signatures::validate_chain`]
+//!   for what this does and does not check -- notably, no revocation
+//!   checking),
+//! - RFC 3161 timestamp validation, via [`VerifiedSignature::timestamp`].
 
 use std::fs;
 use std::path::Path;
@@ -20,18 +29,21 @@ use der::asn1::OctetString;
 use der::{Decode, Encode};
 
 use crate::error::SignatureError;
+use super::chain::{self, ChainValidationResult};
+use super::timestamp;
 use super::{digest_for_algorithm, ByteRange, Certificate, SignatureAlgorithm, SignatureResult};
 
 /// Verifies digital signatures embedded in a PDF document.
 #[derive(Debug)]
 pub struct SignatureVerifier {
     pdf_bytes: Vec<u8>,
+    trust_anchors: Vec<Certificate>,
 }
 
 impl SignatureVerifier {
     /// Creates a verifier for the given PDF bytes.
     pub fn new(pdf_bytes: Vec<u8>) -> Self {
-        Self { pdf_bytes }
+        Self { pdf_bytes, trust_anchors: Vec::new() }
     }
 
     /// Creates a verifier by reading a PDF file from disk.
@@ -40,6 +52,17 @@ impl SignatureVerifier {
             SignatureError::VerificationFailed(format!("Failed to read file: {}", e))
         })?;
         Ok(Self::new(pdf_bytes))
+    }
+
+    /// Sets the trust anchors (root/intermediate CA certificates) used for
+    /// certificate chain validation (see
+    /// [`crate::signatures::validate_chain`]). Without this,
+    /// [`VerifiedSignature::chain`] still reports the chain
+    /// it was able to build from the certificates embedded in each
+    /// signature, but `trusted` is always `false`.
+    pub fn with_trust_anchors(mut self, trust_anchors: Vec<Certificate>) -> Self {
+        self.trust_anchors = trust_anchors;
+        self
     }
 
     /// Finds and verifies every signature present in the PDF.
@@ -52,7 +75,7 @@ impl SignatureVerifier {
     pub fn verify(&self) -> SignatureResult<Vec<VerifiedSignature>> {
         Ok(find_signature_objects(&self.pdf_bytes)
             .into_iter()
-            .map(|raw| verify_one(&self.pdf_bytes, raw))
+            .map(|raw| verify_one(&self.pdf_bytes, raw, &self.trust_anchors))
             .collect())
     }
 }
@@ -66,7 +89,10 @@ pub struct VerifiedSignature {
     pub reason: Option<String>,
     /// The stated location of signing, if present.
     pub location: Option<String>,
-    /// The signing time as embedded in the PDF, if present.
+    /// The signing time as embedded in the PDF, if present. This is
+    /// asserted by the signer's own clock and is **not** trustworthy on its
+    /// own -- prefer `timestamp` (an RFC 3161 TSA-asserted time) when
+    /// present.
     pub signing_time: Option<String>,
     /// The byte range covered by this signature.
     pub byte_range: ByteRange,
@@ -75,12 +101,43 @@ pub struct VerifiedSignature {
     /// Whether the signature is cryptographically valid: the covered bytes
     /// match the embedded digest, and the embedded certificate's public key
     /// validates the signature. Does not imply the certificate is trusted.
+    ///
+    /// If this is `false` because the covered bytes don't match the
+    /// embedded digest, that specifically means the document was modified
+    /// after this signature was applied.
     pub is_valid: bool,
     /// Whether the certificate's validity period covers the current time.
     /// `None` if this could not be determined. Informational only — not
     /// folded into `is_valid`.
     pub certificate_valid_now: Option<bool>,
+    /// Certificate chain validation result (see
+    /// [`SignatureVerifier::with_trust_anchors`] and
+    /// [`crate::signatures::validate_chain`]).
+    /// `None` if the CMS `certificates` set couldn't be read at all (in
+    /// which case `error`/`is_valid` already reflect that failure).
+    pub chain: Option<ChainValidationResult>,
+    /// RFC 3161 timestamp validation result, if the signature carries a
+    /// `id-aa-signatureTimeStampToken` unsigned attribute (PAdES "B-T").
+    /// `None` if there is no timestamp token at all (not an error --most
+    /// signatures won't have one).
+    pub timestamp: Option<TimestampVerification>,
     /// Explains why `is_valid` is `false`, if applicable.
+    pub error: Option<String>,
+}
+
+/// The result of validating an embedded RFC 3161 timestamp token (see
+/// [`super::timestamp::verify_token`]).
+#[derive(Debug, Clone)]
+pub struct TimestampVerification {
+    /// The TSA-asserted time the signature value existed
+    /// (`TSTInfo.genTime`).
+    pub gen_time: Option<String>,
+    /// The TSA's certificate, if present in the token.
+    pub tsa_certificate: Option<Certificate>,
+    /// Whether the token's signature validates and its message imprint
+    /// matches this signature's `SignatureValue`.
+    pub valid: bool,
+    /// Explains why `valid` is `false`, if applicable.
     pub error: Option<String>,
 }
 
@@ -270,7 +327,7 @@ fn trim_to_der_length(bytes: &[u8]) -> Option<&[u8]> {
     bytes.get(..total)
 }
 
-fn verify_one(pdf_bytes: &[u8], raw: RawSignature) -> VerifiedSignature {
+fn verify_one(pdf_bytes: &[u8], raw: RawSignature, trust_anchors: &[Certificate]) -> VerifiedSignature {
     let mut result = VerifiedSignature {
         signer_name: raw.name.clone(),
         reason: raw.reason.clone(),
@@ -280,14 +337,18 @@ fn verify_one(pdf_bytes: &[u8], raw: RawSignature) -> VerifiedSignature {
         certificate: None,
         is_valid: false,
         certificate_valid_now: None,
+        chain: None,
+        timestamp: None,
         error: None,
     };
 
-    match verify_cryptographically(pdf_bytes, &raw) {
+    match verify_cryptographically(pdf_bytes, &raw, trust_anchors) {
         Ok(outcome) => {
             result.certificate = outcome.certificate;
             result.certificate_valid_now = outcome.certificate_valid_now;
             result.is_valid = outcome.is_valid;
+            result.chain = outcome.chain;
+            result.timestamp = outcome.timestamp;
             result.error = outcome.error;
         }
         Err(e) => {
@@ -302,10 +363,16 @@ struct CryptoOutcome {
     certificate: Option<Certificate>,
     certificate_valid_now: Option<bool>,
     is_valid: bool,
+    chain: Option<ChainValidationResult>,
+    timestamp: Option<TimestampVerification>,
     error: Option<String>,
 }
 
-fn verify_cryptographically(pdf_bytes: &[u8], raw: &RawSignature) -> Result<CryptoOutcome, String> {
+fn verify_cryptographically(
+    pdf_bytes: &[u8],
+    raw: &RawSignature,
+    trust_anchors: &[Certificate],
+) -> Result<CryptoOutcome, String> {
     let der_bytes = trim_to_der_length(&raw.contents_hex)
         .ok_or_else(|| "Could not determine PKCS#7 signature length".to_string())?;
 
@@ -323,13 +390,23 @@ fn verify_cryptographically(pdf_bytes: &[u8], raw: &RawSignature) -> Result<Cryp
         .next()
         .ok_or_else(|| "CMS SignedData has no SignerInfo".to_string())?;
 
-    let algo = SignatureAlgorithm::from_oid(&signer_info.signature_algorithm.oid.to_string())
-        .ok_or_else(|| {
-            format!(
-                "Unsupported signature algorithm: {}",
-                signer_info.signature_algorithm.oid
-            )
-        })?;
+    // Some CMS producers (e.g. several RFC 3161 TSAs, and some CMS
+    // implementations in general) put the bare key-type OID (e.g.
+    // `rsaEncryption`) in `signatureAlgorithm` rather than the combined
+    // "hash-with-signature" OID, relying on the separate `digestAlgorithm`
+    // field for the hash (RFC 5652 §5.3 permits both). `from_oids` resolves
+    // either convention so we can verify externally-produced CMS, not just
+    // our own `Pkcs7Builder` output.
+    let algo = SignatureAlgorithm::from_oids(
+        &signer_info.signature_algorithm.oid.to_string(),
+        &signer_info.digest_alg.oid.to_string(),
+    )
+    .ok_or_else(|| {
+        format!(
+            "Unsupported signature algorithm: {} (digest {})",
+            signer_info.signature_algorithm.oid, signer_info.digest_alg.oid
+        )
+    })?;
 
     let signed_attrs = signer_info
         .signed_attrs
@@ -362,6 +439,7 @@ fn verify_cryptographically(pdf_bytes: &[u8], raw: &RawSignature) -> Result<Cryp
     let mut certificate_valid_now = None;
     let mut signature_valid = false;
     let mut crypto_error = None;
+    let mut chain = None;
 
     match find_matching_certificate(&signed_data, &signer_info.sid) {
         Some(x509_cert) => match x509_cert
@@ -382,12 +460,52 @@ fn verify_cryptographically(pdf_bytes: &[u8], raw: &RawSignature) -> Result<Cryp
                     Ok(valid) => signature_valid = valid,
                     Err(e) => crypto_error = Some(e),
                 }
+
+                // Chain validation: every other certificate embedded in
+                // the CMS `certificates` set (besides the leaf itself) is
+                // a candidate intermediate.
+                let intermediates: Vec<Certificate> = all_certificates(&signed_data)
+                    .into_iter()
+                    .filter(|c| c.der_bytes() != wrapped.der_bytes())
+                    .collect();
+                chain = Some(chain::validate_chain(
+                    &wrapped,
+                    &intermediates,
+                    trust_anchors,
+                    chain::now_unix(),
+                ));
+
                 certificate = Some(wrapped);
             }
             Err(e) => crypto_error = Some(e),
         },
         None => crypto_error = Some("No certificate found in CMS SignedData".to_string()),
     }
+
+    let timestamp = signer_info.unsigned_attrs.as_ref().and_then(|attrs| {
+        attrs.iter().find_map(|attr| {
+            if attr.oid.to_string() != OID_SIGNATURE_TIMESTAMP_TOKEN {
+                return None;
+            }
+            let value = attr.values.get(0)?;
+            let token_der = value.to_der().ok()?;
+            let expected_digest = digest_for_algorithm(algo, signer_info.signature.as_bytes());
+            Some(match timestamp::verify_token(&token_der, algo, &expected_digest) {
+                Ok(token) => TimestampVerification {
+                    gen_time: Some(token.gen_time),
+                    tsa_certificate: token.tsa_certificate,
+                    valid: true,
+                    error: None,
+                },
+                Err(e) => TimestampVerification {
+                    gen_time: None,
+                    tsa_certificate: None,
+                    valid: false,
+                    error: Some(e),
+                },
+            })
+        })
+    });
 
     let is_valid = digest_matches && signature_valid;
     let error = if is_valid {
@@ -405,8 +523,31 @@ fn verify_cryptographically(pdf_bytes: &[u8], raw: &RawSignature) -> Result<Cryp
         certificate,
         certificate_valid_now,
         is_valid,
+        chain,
+        timestamp,
         error,
     })
+}
+
+/// The `id-aa-signatureTimeStampToken` attribute OID as a string, for
+/// comparing against a decoded `Attribute.oid`'s `Display` output. Kept in
+/// sync with (but independent of) `timestamp.rs`'s copy since that one is
+/// private to that module and used for *building* the attribute, while this
+/// one is used for *recognizing* it.
+const OID_SIGNATURE_TIMESTAMP_TOKEN: &str = "1.2.840.113549.1.9.16.2.14";
+
+/// Returns every certificate embedded in the CMS `certificates` set.
+fn all_certificates(signed_data: &SignedData) -> Vec<Certificate> {
+    let Some(certs) = signed_data.certificates.as_ref() else { return Vec::new() };
+    certs
+        .0
+        .iter()
+        .filter_map(|c| match c {
+            CertificateChoices::Certificate(cert) => cert.to_der().ok(),
+            _ => None,
+        })
+        .filter_map(|der| Certificate::from_der(&der).ok())
+        .collect()
 }
 
 fn find_matching_certificate(
@@ -436,7 +577,12 @@ fn find_matching_certificate(
     candidates.into_iter().next()
 }
 
-fn verify_signature_bytes(
+/// Verifies a raw signature (`signature_bytes`) over `message` using the
+/// public key embedded in `cert`. Shared with the crate-internal `chain`
+/// module to verify that a candidate issuer's key validates a child certificate's
+/// `tbsCertificate` signature (RFC 5280 §4.1.1.3), and used here to verify
+/// a CMS `SignerInfo.signature` over its `signedAttrs`.
+pub(super) fn verify_signature_bytes(
     algo: SignatureAlgorithm,
     cert: &x509_cert::Certificate,
     message: &[u8],

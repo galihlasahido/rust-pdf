@@ -34,15 +34,24 @@
 //! ```
 
 mod certificate;
+mod chain;
 mod config;
+mod dss;
 mod pkcs7;
 mod signer;
+mod timestamp;
 mod verifier;
 
 pub use certificate::{Certificate, PrivateKey};
-pub use config::SignatureConfig;
+pub use chain::{validate_chain, ChainValidationResult};
+pub use config::{PadesLevel, SignatureConfig, VisibleSignature};
+pub use dss::{embed_document_security_store, DssEntry};
 pub use pkcs7::Pkcs7Builder;
 pub use signer::{ByteRange, DocumentSigner, IncrementalSigner, SignatureInfo};
+pub use timestamp::{
+    build_timestamp_request, parse_timestamp_response, TimestampAuthorityClient,
+    TimestampRequest, TimestampToken,
+};
 pub use verifier::{SignatureVerifier, VerifiedSignature};
 
 use crate::error::SignatureError;
@@ -98,6 +107,37 @@ impl SignatureAlgorithm {
             "1.2.840.10045.4.3.2" => Some(SignatureAlgorithm::EcdsaP256Sha256),
             _ => None,
         }
+    }
+
+    /// Resolves a `SignerInfo`'s algorithm from its `signatureAlgorithm` and
+    /// `digestAlgorithm` OIDs together.
+    ///
+    /// [`SignatureAlgorithm::oid`]/[`Pkcs7Builder`] always emit the combined
+    /// "hash-with-signature" OID (e.g. `sha256WithRSAEncryption`,
+    /// RFC 8017 §8.2) as `signatureAlgorithm`, which [`SignatureAlgorithm::from_oid`]
+    /// alone is enough to resolve. But RFC 5652 §5.3 also permits CMS
+    /// producers to put the *bare* key-type OID (e.g. `rsaEncryption`,
+    /// `1.2.840.113549.1.1.1`) in `signatureAlgorithm` and rely on the
+    /// separate `digestAlgorithm` field to convey the hash -- this is what
+    /// e.g. OpenSSL's `ts` (RFC 3161 timestamp authority) implementation
+    /// does. Verifying only real-world-produced CMS (not just our own
+    /// output) needs to accept both conventions.
+    pub(crate) fn from_oids(signature_algorithm_oid: &str, digest_algorithm_oid: &str) -> Option<Self> {
+        if let Some(algo) = Self::from_oid(signature_algorithm_oid) {
+            return Some(algo);
+        }
+
+        // Bare `rsaEncryption`: resolve via the separate digest OID.
+        if signature_algorithm_oid == "1.2.840.113549.1.1.1" {
+            return match digest_algorithm_oid {
+                "2.16.840.1.101.3.4.2.1" => Some(SignatureAlgorithm::RsaSha256), // SHA-256
+                "2.16.840.1.101.3.4.2.2" => Some(SignatureAlgorithm::RsaSha384), // SHA-384
+                "2.16.840.1.101.3.4.2.3" => Some(SignatureAlgorithm::RsaSha512), // SHA-512
+                _ => None,
+            };
+        }
+
+        None
     }
 }
 
