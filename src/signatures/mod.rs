@@ -41,7 +41,7 @@ mod signer;
 pub use certificate::{Certificate, PrivateKey};
 pub use config::SignatureConfig;
 pub use pkcs7::Pkcs7Builder;
-pub use signer::{ByteRange, DocumentSigner, SignatureInfo};
+pub use signer::{ByteRange, DocumentSigner, IncrementalSigner, SignatureInfo};
 
 use crate::error::SignatureError;
 

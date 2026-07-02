@@ -94,33 +94,11 @@ impl Pkcs7Builder {
         }
     }
 
-    /// Builds the signed attributes to be signed.
+    /// Builds the signed attributes to be signed (as SET for signing).
     fn build_signed_attributes(&self, digest: &[u8]) -> SignatureResult<Vec<u8>> {
-        // Build a DER-encoded SET of attributes:
-        // - Content type (OID for data)
-        // - Signing time
-        // - Message digest
-        let mut attrs = Vec::new();
-
-        // Content type attribute (OID 1.2.840.113549.1.9.3)
-        // Value: OID for data (1.2.840.113549.1.7.1)
-        let content_type_attr = build_attribute(
-            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03], // 1.2.840.113549.1.9.3
-            &build_oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01]), // data OID
-        );
-        attrs.extend_from_slice(&content_type_attr);
-
-        // Message digest attribute (OID 1.2.840.113549.1.9.4)
-        let digest_attr = build_attribute(
-            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04], // 1.2.840.113549.1.9.4
-            &build_octet_string(digest),
-        );
-        attrs.extend_from_slice(&digest_attr);
-
-        // Wrap as SET
-        let set = build_set(&attrs);
-
-        Ok(set)
+        // Build a DER-encoded SET of attributes for signing
+        let attrs = self.build_signed_attributes_content(digest)?;
+        Ok(build_set(&attrs))
     }
 
     /// Builds the CMS SignedData structure.
@@ -246,8 +224,10 @@ impl Pkcs7Builder {
         signer_info.extend_from_slice(&self.build_digest_algorithm_identifier());
 
         // SignedAttrs [0] IMPLICIT
-        let signed_attrs = self.build_signed_attributes(digest)?;
-        let signed_attrs_implicit = build_context_specific(0, &signed_attrs[1..], true); // Skip SET tag
+        // Build the attributes as raw content (not wrapped in SET yet)
+        let signed_attrs_content = self.build_signed_attributes_content(digest)?;
+        // Wrap with context-specific [0] tag
+        let signed_attrs_implicit = build_context_specific(0, &signed_attrs_content, true);
         signer_info.extend_from_slice(&signed_attrs_implicit);
 
         // SignatureAlgorithm
@@ -257,6 +237,31 @@ impl Pkcs7Builder {
         signer_info.extend_from_slice(&build_octet_string(signature));
 
         Ok(build_sequence(&signer_info))
+    }
+
+    /// Builds the raw content for signed attributes (without SET wrapper).
+    fn build_signed_attributes_content(&self, digest: &[u8]) -> SignatureResult<Vec<u8>> {
+        // Build attributes without SET wrapper:
+        // - Content type (OID for data)
+        // - Message digest
+        let mut attrs = Vec::new();
+
+        // Content type attribute (OID 1.2.840.113549.1.9.3)
+        // Value: OID for data (1.2.840.113549.1.7.1)
+        let content_type_attr = build_attribute(
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03], // 1.2.840.113549.1.9.3
+            &build_oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01]), // data OID
+        );
+        attrs.extend_from_slice(&content_type_attr);
+
+        // Message digest attribute (OID 1.2.840.113549.1.9.4)
+        let digest_attr = build_attribute(
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04], // 1.2.840.113549.1.9.4
+            &build_octet_string(digest),
+        );
+        attrs.extend_from_slice(&digest_attr);
+
+        Ok(attrs)
     }
 
     /// Builds the signature algorithm identifier.
