@@ -28,6 +28,13 @@ full = ["compression", "images", "parser", "encryption", "signatures", "html", "
 # shared library at application-packaging time (scripts/fetch_pdfium.sh),
 # which pure structural/generation consumers of this crate do not need.
 render = ["dep:pdfium-render", "images"]
+# Async Tauri desktop-app command layer (open_document, render_page,
+# extract_text, search_text, apply_edit, save_document, fill_form,
+# add_annotation, sign_document) plus a dedicated worker thread pool and
+# Tauri-event progress reporting. See src/tauri_commands/mod.rs. Requires
+# `parser` (structural editing), `render` (rasterization) and
+# `signatures` (digital signing), so pulls all three in.
+tauri = ["dep:tauri", "dep:tokio", "dep:serde", "parser", "render", "signatures"]
 
 [dependencies]
 thiserror = "2.0"
@@ -74,7 +81,20 @@ ttf-parser = { version = "0.25", optional = true }
 # which this crate does not need (embedded fonts are always instanced to a
 # single set of outlines).
 subsetter = { version = "0.2", optional = true, default-features = false }
+# Desktop-app command layer (feature `tauri`, see src/tauri_commands).
+tauri = { version = "2", optional = true }
+# Async runtime used only for the oneshot result channel between an async
+# Tauri command and this crate's own worker thread pool (src/tauri_commands/worker.rs),
+# and for `#[tokio::test]` in that module's own test suite. Tauri itself
+# already depends on tokio for its command dispatch, so this adds no new
+# runtime to an app that already uses Tauri.
+tokio = { version = "1", optional = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+serde = { version = "1", optional = true, features = ["derive"] }
 
 [dev-dependencies]
 lopdf = "0.43.0"
 tempfile = "3.0"
+# Only exercised by src/tauri_commands's own test suite (feature `tauri`),
+# to assert on the JSON shape of `CommandError`/DTOs and to drive
+# `#[tokio::test]`s against `tauri::test`'s `MockRuntime`.
+serde_json = "1"

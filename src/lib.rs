@@ -80,6 +80,8 @@ pub mod parser;
 pub mod render;
 #[cfg(feature = "signatures")]
 pub mod signatures;
+#[cfg(feature = "tauri")]
+pub mod tauri_commands;
 pub mod types;
 pub mod writer;
 
