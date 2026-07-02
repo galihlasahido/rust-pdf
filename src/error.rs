@@ -288,6 +288,37 @@ pub enum EditorError {
     /// multiple of 90 degrees, ISO 32000-1 Table 30).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// No AcroForm field (ISO 32000-1 12.7.3) with the given fully
+    /// qualified name (12.7.3.2) exists in the document.
+    #[error("no form field named {0:?}")]
+    FieldNotFound(String),
+
+    /// A form field exists but is not of the type the operation requires
+    /// (e.g. calling a checkbox setter on a text field).
+    #[error("form field {name:?} is not a {expected} field")]
+    WrongFieldType {
+        /// The fully qualified field name.
+        name: String,
+        /// The field type the operation required (e.g. "text", "checkbox").
+        expected: &'static str,
+    },
+
+    /// A new form field was requested with a name that already identifies
+    /// an existing field (ISO 32000-1 12.7.3.2 requires field names be
+    /// unique among siblings; this crate requires full-document
+    /// uniqueness, which is always sufficient and simpler to reason
+    /// about).
+    #[error("a form field named {0:?} already exists")]
+    DuplicateFieldName(String),
+
+    /// No outline (bookmark) item with the given object id exists.
+    #[error("no outline item {0} {1} R in the document")]
+    OutlineItemNotFound(u32, u16),
+
+    /// No annotation with the given object id exists on the expected page.
+    #[error("no annotation {0} {1} R found")]
+    AnnotationNotFound(u32, u16),
 }
 
 /// Errors related to PDF encryption.

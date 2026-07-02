@@ -229,6 +229,21 @@ impl EditableDocument {
         })
     }
 
+    /// Appends `annot_id` to `page_id`'s `/Annots` array (ISO 32000-1
+    /// 7.7.3.3, Table 30), creating the array if the page doesn't have
+    /// one yet. Shared by the AcroForm widget, annotation and outline
+    /// submodules, which all add entries to a page's annotation list.
+    pub(crate) fn add_annot_to_page(&mut self, page_id: ObjectId, annot_id: ObjectId) -> PdfResult<()> {
+        let mut page = self.get_dictionary(page_id)?;
+        let mut annots = match page.get("Annots") {
+            Some(Object::Array(a)) => a.clone(),
+            _ => crate::object::PdfArray::new(),
+        };
+        annots.push(Object::Reference(annot_id));
+        page.set("Annots", Object::Array(annots));
+        self.set_object(page_id, Object::Dictionary(page));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

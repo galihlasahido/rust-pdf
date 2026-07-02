@@ -91,7 +91,7 @@ pub use color::{CmykColor, Color, GrayColor, RgbColor};
 pub use content::{ContentBuilder, GraphicsBuilder, Operator, TextBuilder, TextElement};
 pub use document::{Document, DocumentBuilder, DocumentInfo, PdfVersion};
 #[cfg(feature = "parser")]
-pub use editor::EditableDocument;
+pub use editor::{AnnotationInfo, AnnotationKind, BookmarkNode, Destination, EditableDocument, StructNode, StructType};
 pub use error::{ContentError, DocumentError, FormError, ObjectError, PdfError, PdfResult, WriterError};
 #[cfg(feature = "compression")]
 pub use error::CompressionError;
@@ -141,7 +141,7 @@ pub mod prelude {
     };
     pub use crate::document::{Document, DocumentBuilder, DocumentInfo, PdfVersion};
     #[cfg(feature = "parser")]
-    pub use crate::editor::EditableDocument;
+    pub use crate::editor::{AnnotationInfo, AnnotationKind, BookmarkNode, Destination, EditableDocument, StructNode, StructType};
     pub use crate::error::{PdfError, PdfResult};
     #[cfg(feature = "compression")]
     pub use crate::error::CompressionError;

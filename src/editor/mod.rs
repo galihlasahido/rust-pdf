@@ -49,11 +49,19 @@
 //! scope here; see `ARCHITECTURE.md`/the task report for an effort
 //! estimate.
 
+mod annotations;
 mod content_ops;
 mod content_stream;
+mod forms;
 mod graph;
+mod outline;
 mod pages;
 mod save;
+mod structure;
 mod text_extract;
+mod util;
 
+pub use annotations::{AnnotationInfo, AnnotationKind};
 pub use graph::EditableDocument;
+pub use outline::{BookmarkNode, Destination};
+pub use structure::{StructNode, StructType};
