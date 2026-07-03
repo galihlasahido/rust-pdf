@@ -990,6 +990,24 @@ pub async fn add_annotation(
 // sign_document
 // ===================================================================
 
+/// Where to draw a visible signature widget, in default user-space points
+/// (origin at the page's lower-left corner). The underlying signer
+/// ([`crate::signatures::IncrementalSigner`]) only supports placing this on
+/// the document's first page, so this is not parameterized by page index.
+/// Omitting it entirely (the default) produces a normal invisible
+/// signature.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct VisibleSignatureRequest {
+    /// Left edge x-coordinate.
+    pub x: f32,
+    /// Bottom edge y-coordinate.
+    pub y: f32,
+    /// Width of the signature widget. Must be positive.
+    pub width: f32,
+    /// Height of the signature widget. Must be positive.
+    pub height: f32,
+}
+
 /// Arguments for [`sign_document`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct SignDocumentRequest {
@@ -1007,6 +1025,9 @@ pub struct SignDocumentRequest {
     pub reason: Option<String>,
     pub location: Option<String>,
     pub contact_info: Option<String>,
+    /// Optional visible signature widget placement; see
+    /// [`VisibleSignatureRequest`].
+    pub visible: Option<VisibleSignatureRequest>,
     /// Output path for the signed copy. Signing always writes a new
     /// file (never overwrites the still-editable in-memory document),
     /// mirroring how [`crate::signatures::IncrementalSigner`] works from
@@ -1039,6 +1060,13 @@ pub async fn sign_document_impl(
     }
     if request.private_key_pem.trim().is_empty() {
         return Err(CommandError::invalid_argument("private_key_pem must not be empty"));
+    }
+    if let Some(visible) = &request.visible {
+        if visible.width <= 0.0 || visible.height <= 0.0 {
+            return Err(CommandError::invalid_argument(
+                "visible signature width/height must be positive",
+            ));
+        }
     }
 
     let handle = DocumentHandle(request.handle);
@@ -1081,7 +1109,7 @@ fn sign_document_blocking(
     request: SignDocumentRequest,
     output_path: &Path,
 ) -> Result<usize, CommandError> {
-    use crate::signatures::{Certificate, IncrementalSigner, PrivateKey};
+    use crate::signatures::{Certificate, IncrementalSigner, PrivateKey, VisibleSignature};
 
     let doc = entry
         .doc
@@ -1115,6 +1143,9 @@ fn sign_document_blocking(
     if let Some(contact_info) = request.contact_info {
         signer = signer.contact_info(contact_info);
     }
+    if let Some(visible) = request.visible {
+        signer = signer.visible(VisibleSignature::new(visible.x, visible.y, visible.width, visible.height));
+    }
 
     let signed_bytes = signer.sign().map_err(CommandError::from)?;
     std::fs::write(output_path, &signed_bytes).map_err(CommandError::from)?;
@@ -1130,6 +1161,146 @@ pub async fn sign_document<R: tauri::Runtime>(
 ) -> Result<SignDocumentResult, CommandError> {
     let progress = emitting_progress_reporter(app);
     sign_document_impl(&state, request, progress).await
+}
+
+// ===================================================================
+// verify_signatures
+// ===================================================================
+
+/// Arguments for [`verify_signatures`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifySignaturesRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+    /// How to serialize the open document (including any pending,
+    /// unsigned structural edits) before scanning it for signatures; see
+    /// [`SaveMode`]. Existing signatures cover only the bytes present at
+    /// the time they were applied, so this does not retroactively
+    /// invalidate them -- it only determines what bytes are searched.
+    pub save_mode: SaveMode,
+    /// PEM-encoded trust anchors (root/intermediate CA certificates) used
+    /// for certificate chain validation; see
+    /// [`crate::signatures::SignatureVerifier::with_trust_anchors`].
+    /// Without these, `chain_trusted` in every result is always `false`
+    /// (or `None`, if the chain couldn't be built at all), but the raw
+    /// cryptographic validity check (`is_valid`) is unaffected.
+    #[serde(default)]
+    pub trust_anchor_pems: Vec<String>,
+}
+
+/// One signature found in a document, as reported by [`verify_signatures`].
+/// Mirrors [`crate::signatures::VerifiedSignature`], flattened to the
+/// summary fields a frontend needs rather than the full chain/timestamp
+/// detail.
+#[derive(Debug, Clone, Serialize)]
+pub struct VerifiedSignatureResult {
+    /// The signer's name, if present.
+    pub signer_name: Option<String>,
+    /// The stated reason for signing, if present.
+    pub reason: Option<String>,
+    /// The stated location of signing, if present.
+    pub location: Option<String>,
+    /// The signing time as embedded in the PDF (asserted by the signer's
+    /// own clock -- see [`crate::signatures::VerifiedSignature::timestamp`]
+    /// for the more trustworthy RFC 3161 alternative surfaced here as
+    /// `timestamp_valid`).
+    pub signing_time: Option<String>,
+    /// Whether the signature is cryptographically self-consistent: the
+    /// covered bytes match the embedded digest (so `false` here after a
+    /// document was modified post-signing) and the embedded certificate's
+    /// public key validates the signature. Does not imply the certificate
+    /// is trusted -- see `chain_trusted`.
+    pub is_valid: bool,
+    /// Whether the certificate's validity period covers the current time.
+    /// `None` if this could not be determined.
+    pub certificate_valid_now: Option<bool>,
+    /// Whether the certificate chain was validated up to one of the
+    /// supplied `trust_anchor_pems`. `None` if the chain couldn't be read
+    /// from the signature at all.
+    pub chain_trusted: bool,
+    /// Whether an embedded RFC 3161 timestamp token (PAdES "B-T"), if
+    /// present, validates. `None` if the signature carries no timestamp
+    /// token at all (not an error -- most signatures won't have one).
+    pub timestamp_valid: Option<bool>,
+    /// Explains why `is_valid` is `false`, if applicable.
+    pub error: Option<String>,
+}
+
+impl From<crate::signatures::VerifiedSignature> for VerifiedSignatureResult {
+    fn from(sig: crate::signatures::VerifiedSignature) -> Self {
+        Self {
+            signer_name: sig.signer_name,
+            reason: sig.reason,
+            location: sig.location,
+            signing_time: sig.signing_time,
+            is_valid: sig.is_valid,
+            certificate_valid_now: sig.certificate_valid_now,
+            chain_trusted: sig.chain.as_ref().is_some_and(|c| c.trusted),
+            timestamp_valid: sig.timestamp.as_ref().map(|t| t.valid),
+            error: sig.error,
+        }
+    }
+}
+
+/// Scans an open document for embedded digital signatures and reports
+/// each one's verification status -- used to show "already signed" state
+/// for a document that was opened after being signed previously (or
+/// signed earlier in this session). An unsigned document returns an
+/// empty vector, not an error.
+pub async fn verify_signatures_impl(
+    state: &AppState,
+    request: VerifySignaturesRequest,
+) -> Result<Vec<VerifiedSignatureResult>, CommandError> {
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+
+    let trust_anchors = request
+        .trust_anchor_pems
+        .iter()
+        .map(|pem| crate::signatures::Certificate::from_pem(pem).map_err(CommandError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let save_mode = request.save_mode;
+    state
+        .pool
+        .run(move || verify_signatures_blocking(&entry, save_mode, trust_anchors))
+        .await
+}
+
+/// The actual (blocking, CPU-bound) verification work, run on
+/// [`super::worker::WorkerPool`].
+fn verify_signatures_blocking(
+    entry: &super::state::DocumentEntryHandle,
+    save_mode: SaveMode,
+    trust_anchors: Vec<crate::signatures::Certificate>,
+) -> Result<Vec<VerifiedSignatureResult>, CommandError> {
+    use crate::signatures::SignatureVerifier;
+
+    let doc = entry
+        .doc
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bytes = match save_mode {
+        SaveMode::Incremental => doc.save_incremental_to_bytes(),
+        SaveMode::FullRewrite => doc.save_full_rewrite_to_bytes(),
+    }
+    .map_err(CommandError::from)?;
+    drop(doc);
+
+    let verified = SignatureVerifier::new(bytes)
+        .with_trust_anchors(trust_anchors)
+        .verify()
+        .map_err(CommandError::from)?;
+    Ok(verified.into_iter().map(VerifiedSignatureResult::from).collect())
+}
+
+/// Tauri command wrapper for [`verify_signatures_impl`].
+#[tauri::command]
+pub async fn verify_signatures(
+    state: tauri::State<'_, AppState>,
+    request: VerifySignaturesRequest,
+) -> Result<Vec<VerifiedSignatureResult>, CommandError> {
+    verify_signatures_impl(&state, request).await
 }
 
 // ===================================================================
@@ -2840,6 +3011,7 @@ mod tests {
                 reason: None,
                 location: None,
                 contact_info: None,
+                visible: None,
                 output_path: out_path.to_string_lossy().into_owned(),
                 save_mode: SaveMode::Incremental,
             },
@@ -2870,6 +3042,7 @@ mod tests {
                 reason: None,
                 location: None,
                 contact_info: None,
+                visible: None,
                 output_path: out_path.to_string_lossy().into_owned(),
                 save_mode: SaveMode::Incremental,
             },
@@ -2879,6 +3052,194 @@ mod tests {
         // Malformed PEM must surface as a structured `SignatureFailed`
         // error, not a panic.
         assert_eq!(result.unwrap_err().code, ErrorCode::SignatureFailed);
+    }
+
+    #[tokio::test]
+    async fn sign_document_rejects_non_positive_visible_size() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let out_path = std::env::temp_dir().join(format!(
+            "rust_pdf_tauri_commands_sign_test_visible_{}.pdf",
+            std::process::id()
+        ));
+        let result = sign_document_impl(
+            &state,
+            SignDocumentRequest {
+                handle: opened.handle,
+                certificate_pem: "irrelevant".to_string(),
+                chain_pem: Vec::new(),
+                private_key_pem: "irrelevant".to_string(),
+                name: None,
+                reason: None,
+                location: None,
+                contact_info: None,
+                visible: Some(VisibleSignatureRequest {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 0.0,
+                    height: 50.0,
+                }),
+                output_path: out_path.to_string_lossy().into_owned(),
+                save_mode: SaveMode::Incremental,
+            },
+            no_progress(),
+        )
+        .await;
+        // Caught by the request-shape check, before certificate/key
+        // parsing is ever attempted -- so this must be `InvalidArgument`,
+        // not `SignatureFailed`, even though the PEMs above are bogus.
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    // -- verify_signatures ----------------------------------------------------
+
+    /// Whether the system `openssl` binary is available, for tests that
+    /// need a real (self-signed) certificate/key pair to actually sign
+    /// something -- mirrors the pattern in
+    /// `tests/signature_verification_tests.rs`.
+    fn openssl_available() -> bool {
+        std::process::Command::new("openssl")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Generates a throwaway RSA key + self-signed certificate pair via
+    /// the system `openssl` binary, returning `(private_key_pem,
+    /// certificate_pem)`.
+    fn generate_rsa_cert(dir: &std::path::Path) -> (String, String) {
+        let key_path = dir.join("key.pem");
+        let cert_path = dir.join("cert.pem");
+
+        let status = std::process::Command::new("openssl")
+            .args(["genrsa", "-out", key_path.to_str().unwrap(), "2048"])
+            .status()
+            .expect("failed to run openssl genrsa");
+        assert!(status.success(), "openssl genrsa failed");
+
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-new",
+                "-x509",
+                "-key",
+                key_path.to_str().unwrap(),
+                "-out",
+                cert_path.to_str().unwrap(),
+                "-days",
+                "365",
+                "-subj",
+                "/CN=Test Signer/O=Test/C=US",
+            ])
+            .status()
+            .expect("failed to run openssl req");
+        assert!(status.success(), "openssl req failed");
+
+        (
+            std::fs::read_to_string(&key_path).expect("read generated key"),
+            std::fs::read_to_string(&cert_path).expect("read generated cert"),
+        )
+    }
+
+    #[tokio::test]
+    async fn verify_signatures_reports_none_for_unsigned_document() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let result = verify_signatures_impl(
+            &state,
+            VerifySignaturesRequest {
+                handle: opened.handle,
+                save_mode: SaveMode::Incremental,
+                trust_anchor_pems: Vec::new(),
+            },
+        )
+        .await
+        .expect("verifying an unsigned document must not fail");
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_signatures_rejects_unknown_handle() {
+        let state = test_state();
+        let result = verify_signatures_impl(
+            &state,
+            VerifySignaturesRequest {
+                handle: 999_999,
+                save_mode: SaveMode::Incremental,
+                trust_anchor_pems: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn sign_then_verify_signatures_round_trip() {
+        if !openssl_available() {
+            eprintln!("skipping sign_then_verify_signatures_round_trip: openssl not available");
+            return;
+        }
+
+        let state = test_state();
+        let opened = open_sample(&state).await;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let (private_key_pem, certificate_pem) = generate_rsa_cert(dir.path());
+
+        let signed_path = dir.path().join("signed.pdf");
+        sign_document_impl(
+            &state,
+            SignDocumentRequest {
+                handle: opened.handle,
+                certificate_pem: certificate_pem.clone(),
+                chain_pem: Vec::new(),
+                private_key_pem,
+                name: Some("Alice".to_string()),
+                reason: Some("Testing".to_string()),
+                location: None,
+                contact_info: None,
+                visible: Some(VisibleSignatureRequest {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 150.0,
+                    height: 50.0,
+                }),
+                output_path: signed_path.to_string_lossy().into_owned(),
+                save_mode: SaveMode::Incremental,
+            },
+            no_progress(),
+        )
+        .await
+        .expect("signing must succeed");
+
+        let reopened = open_document_impl(
+            &state,
+            OpenDocumentRequest {
+                path: signed_path.to_string_lossy().into_owned(),
+                password: None,
+            },
+        )
+        .await
+        .expect("reopening the signed PDF must succeed");
+
+        let results = verify_signatures_impl(
+            &state,
+            VerifySignaturesRequest {
+                handle: reopened.handle,
+                save_mode: SaveMode::Incremental,
+                trust_anchor_pems: vec![certificate_pem],
+            },
+        )
+        .await
+        .expect("verifying the signed document must not fail");
+
+        assert_eq!(results.len(), 1);
+        let sig = &results[0];
+        assert!(sig.is_valid, "signature should be cryptographically valid: {:?}", sig.error);
+        assert_eq!(sig.signer_name.as_deref(), Some("Alice"));
+        assert_eq!(sig.reason.as_deref(), Some("Testing"));
+        assert!(sig.chain_trusted, "chain should be trusted against its own self-signed cert as trust anchor");
     }
 
     // -- convert_to_pdfa -----------------------------------------------------

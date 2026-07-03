@@ -9,7 +9,7 @@ use crate::error::SignatureError;
 use super::config::PadesLevel;
 use super::{
     digest_for_algorithm, fields, timestamp, Certificate, Pkcs7Builder, PrivateKey,
-    SignatureAlgorithm, SignatureConfig, SignatureResult,
+    SignatureAlgorithm, SignatureConfig, SignatureResult, VisibleSignature,
 };
 
 /// Lower/upper bounds clamped around `SignatureConfig::signature_size` when
@@ -1119,6 +1119,14 @@ impl IncrementalSigner {
     /// Sets the signature algorithm.
     pub fn algorithm(mut self, algo: SignatureAlgorithm) -> Self {
         self.config = self.config.algorithm(algo);
+        self
+    }
+
+    /// Sets where to draw a visible signature widget on the document's
+    /// first page (see [`VisibleSignature`]). Not calling this (the
+    /// default) produces the historical invisible (zero-size) widget.
+    pub fn visible(mut self, visible: VisibleSignature) -> Self {
+        self.config.visible = Some(visible);
         self
     }
 
