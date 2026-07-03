@@ -337,6 +337,32 @@ mod tests {
     }
 
     #[test]
+    fn test_aes128_encrypted_output_has_valid_v4_r4_header_and_no_plaintext() {
+        // Regression test for a previously-shipped bug: the AES-128
+        // (V=4/R=4) path used to derive AES-256/R6 keys and write an
+        // R6-shaped dictionary (/OE, /UE, /Perms, AESV3 crypt filter)
+        // under a claimed `/V 4 /R 4` header -- a structurally invalid
+        // hybrid no real reader could open. This exercises the full
+        // `save_encrypted_to_bytes` pipeline (not just `EncryptionHandler`
+        // in isolation) with `EncryptionConfig::aes128()`.
+        let doc = EditableDocument::from_bytes(sample_pdf()).unwrap();
+        let config = EncryptionConfig::aes128().user_password("secret1").owner_password("secret2");
+        let bytes = doc.save_encrypted_to_bytes(config).unwrap();
+
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/Encrypt"));
+        assert!(text.contains("/Filter/Standard") || text.contains("/Filter /Standard"));
+        assert!(text.contains("/V 4"), "AES-128 must declare /V 4");
+        assert!(text.contains("/R 4"), "AES-128 must declare /R 4");
+        assert!(text.contains("/AESV2"), "AES-128 must use the AESV2 crypt filter method");
+        assert!(!text.contains("/AESV3"), "AES-128 must not use the R6-only AESV3 crypt filter");
+        assert!(!text.contains("/OE"), "R4 has no /OE entry (that's R5/6-only)");
+        assert!(!text.contains("/UE"), "R4 has no /UE entry (that's R5/6-only)");
+        assert!(!text.contains("/Perms"), "R4 has no /Perms entry (that's R5/6-only)");
+        assert!(!text.contains("Top Secret Payload"), "plaintext must not survive encryption");
+    }
+
+    #[test]
     fn test_two_encryptions_of_the_same_document_use_different_file_ids_and_keys() {
         // Each call must derive its own random file id / salts (matching
         // `generate_file_id`'s own "must be random" contract) rather than
