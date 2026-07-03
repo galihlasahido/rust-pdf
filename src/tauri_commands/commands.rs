@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
-use crate::editor::{AnnotationInfo, AnnotationKind, EditableDocument};
+use crate::editor::{AnnotationInfo, AnnotationKind, EditableDocument, FormFieldWidget};
 use crate::render::Viewport;
 use crate::types::Rectangle;
 
@@ -2016,6 +2016,177 @@ pub async fn list_annotations(
     list_annotations_impl(&state, request).await
 }
 
+// ===================================================================
+// list_form_fields
+// ===================================================================
+
+/// Arguments for [`list_form_fields`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListFormFieldsRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+    /// A single zero-based page to list, or `None` for every page.
+    pub page_index: Option<usize>,
+}
+
+/// One AcroForm field widget, as read back by [`list_form_fields`],
+/// plain-data mirror of [`FormFieldWidget`] for IPC. See that type's
+/// `rect` docs for how a frontend maps it onto a `render_page` raster
+/// to position its input overlay, and its other fields' docs for how to
+/// decide which overlay control (text box / checkbox / radio / dropdown)
+/// to draw for `field_type`/`is_radio`.
+#[derive(Debug, Clone, Serialize)]
+pub struct FormFieldWidgetResult {
+    pub widget_id: ObjectIdResult,
+    pub name: String,
+    /// PDF field-type name: `"Tx"` (text), `"Btn"` (checkbox or, if
+    /// `is_radio`, radio button), or `"Ch"` (choice/dropdown).
+    pub field_type: String,
+    pub is_radio: bool,
+    pub rect: RectangleResult,
+    pub value: Option<String>,
+    pub export_value: Option<String>,
+    pub options: Vec<String>,
+    pub read_only: bool,
+}
+
+impl From<FormFieldWidget> for FormFieldWidgetResult {
+    fn from(w: FormFieldWidget) -> Self {
+        Self {
+            widget_id: w.widget_id.into(),
+            name: w.name,
+            field_type: w.field_type,
+            is_radio: w.is_radio,
+            rect: w.rect.into(),
+            value: w.value,
+            export_value: w.export_value,
+            options: w.options,
+            read_only: w.read_only,
+        }
+    }
+}
+
+/// One page's form field widgets, as returned by [`list_form_fields`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PageFormFieldsResult {
+    pub page_index: usize,
+    pub fields: Vec<FormFieldWidgetResult>,
+}
+
+/// Lists every AcroForm field widget on one page, or every page, of an
+/// open document -- the data a form-filling frontend needs to draw an
+/// input overlay atop [`render_page`]'s raster output, via
+/// [`EditableDocument::list_form_fields`]. A page with no widgets at all
+/// (including every page of a document with no `/AcroForm`) reports an
+/// empty `fields` Vec for that page, not an error, so a caller can
+/// invoke this unconditionally for any opened document and simply skip
+/// rendering an overlay when every page comes back empty.
+pub async fn list_form_fields_impl(
+    state: &AppState,
+    request: ListFormFieldsRequest,
+) -> Result<Vec<PageFormFieldsResult>, CommandError> {
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+
+    state
+        .pool
+        .run(move || {
+            let doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let page_count = doc.page_count().map_err(CommandError::from)?;
+            let indices: Vec<usize> = match request.page_index {
+                Some(index) => {
+                    if index >= page_count {
+                        return Err(CommandError::invalid_argument(format!(
+                            "page index {index} out of range (document has {page_count} pages)"
+                        )));
+                    }
+                    vec![index]
+                }
+                None => (0..page_count).collect(),
+            };
+
+            let mut pages = Vec::with_capacity(indices.len());
+            for index in indices {
+                let fields = doc.list_form_fields(index).map_err(CommandError::from)?;
+                pages.push(PageFormFieldsResult {
+                    page_index: index,
+                    fields: fields.into_iter().map(FormFieldWidgetResult::from).collect(),
+                });
+            }
+            Ok(pages)
+        })
+        .await
+}
+
+/// Tauri command wrapper for [`list_form_fields_impl`].
+#[tauri::command]
+pub async fn list_form_fields(
+    state: tauri::State<'_, AppState>,
+    request: ListFormFieldsRequest,
+) -> Result<Vec<PageFormFieldsResult>, CommandError> {
+    list_form_fields_impl(&state, request).await
+}
+
+// ===================================================================
+// flatten_form
+// ===================================================================
+
+/// Arguments for [`flatten_form`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct FlattenFormRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+}
+
+/// Result of [`flatten_form`]. Carries no data beyond confirming
+/// success (kept as a struct, rather than a bare `()`, for a
+/// forward-compatible IPC result shape consistent with this crate's
+/// other commands).
+#[derive(Debug, Clone, Serialize)]
+pub struct FlattenFormResult {
+    pub flattened: bool,
+}
+
+/// "Bakes" every AcroForm field's current value into ordinary,
+/// non-interactive page content and removes the interactive form
+/// entirely, via [`EditableDocument::flatten_form`]. A frontend calls
+/// this once the user is done filling a form and wants to lock the
+/// values in as static content before [`save_document`] (e.g. before
+/// sending a filled form onward to a reader who should not be able to
+/// edit it further). Calling this on a document with no `/AcroForm`
+/// (nothing to flatten) succeeds as a no-op.
+pub async fn flatten_form_impl(
+    state: &AppState,
+    request: FlattenFormRequest,
+) -> Result<FlattenFormResult, CommandError> {
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+
+    state
+        .pool
+        .run(move || {
+            let mut doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            doc.flatten_form().map_err(CommandError::from)?;
+            Ok(FlattenFormResult { flattened: true })
+        })
+        .await
+}
+
+/// Tauri command wrapper for [`flatten_form_impl`].
+#[tauri::command]
+pub async fn flatten_form(
+    state: tauri::State<'_, AppState>,
+    request: FlattenFormRequest,
+) -> Result<FlattenFormResult, CommandError> {
+    flatten_form_impl(&state, request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3302,6 +3473,177 @@ mod tests {
             },
         )
         .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    /// Builds (as a fresh temp file per call) a single-page PDF with a
+    /// text field, a checkbox, and a 2-button radio group, and opens it
+    /// via [`open_document_impl`] -- the fixture [`list_form_fields`] and
+    /// [`flatten_form`] tests need, since [`open_sample`]'s fixture has
+    /// no AcroForm at all.
+    async fn open_form_sample(state: &AppState) -> (OpenDocumentResult, std::path::PathBuf) {
+        use crate::forms::{CheckBox, RadioButton, RadioGroup, TextField};
+        use crate::prelude::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let page = PageBuilder::a4()
+            .font("F1", Standard14Font::Helvetica)
+            .form_field(TextField::new("name").rect(100.0, 700.0, 200.0, 20.0))
+            .form_field(CheckBox::new("subscribe").rect(100.0, 650.0, 20.0, 20.0))
+            .form_field(
+                RadioGroup::new("plan")
+                    .add_button(RadioButton::new("basic").rect(100.0, 600.0, 20.0, 20.0))
+                    .add_button(RadioButton::new("pro").rect(140.0, 600.0, 20.0, 20.0)),
+            )
+            .content(ContentBuilder::new())
+            .build();
+        let bytes = DocumentBuilder::new().page(page).build().unwrap().save_to_bytes().unwrap();
+
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust_pdf_tauri_commands_form_test_{}_{unique}.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).expect("writing the form fixture must not fail");
+        let opened = open_document_impl(
+            state,
+            OpenDocumentRequest {
+                path: path.to_string_lossy().into_owned(),
+                password: None,
+            },
+        )
+        .await
+        .expect("opening the form fixture must succeed");
+        (opened, path)
+    }
+
+    #[tokio::test]
+    async fn list_form_fields_returns_empty_for_document_without_a_form() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let pages = list_form_fields_impl(
+            &state,
+            ListFormFieldsRequest {
+                handle: opened.handle,
+                page_index: None,
+            },
+        )
+        .await
+        .expect("listing form fields on a form-less document must succeed, not error");
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_form_fields_reports_every_widget_on_the_page() {
+        let state = test_state();
+        let (opened, _fixture_path) = open_form_sample(&state).await;
+        let pages = list_form_fields_impl(
+            &state,
+            ListFormFieldsRequest {
+                handle: opened.handle,
+                page_index: Some(0),
+            },
+        )
+        .await
+        .expect("listing form fields must succeed");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].page_index, 0);
+
+        let mut names: Vec<&str> = pages[0].fields.iter().map(|f| f.name.as_str()).collect();
+        names.sort();
+        // "plan" is a 2-button radio group -> 2 entries sharing the name.
+        assert_eq!(names, vec!["name", "plan", "plan", "subscribe"]);
+
+        let name_field = pages[0].fields.iter().find(|f| f.name == "name").unwrap();
+        assert_eq!(name_field.field_type, "Tx");
+        assert!(!name_field.is_radio);
+        assert!(name_field.rect.urx > name_field.rect.llx);
+    }
+
+    #[tokio::test]
+    async fn list_form_fields_reflects_a_fill_form_update() {
+        let state = test_state();
+        let (opened, _fixture_path) = open_form_sample(&state).await;
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "name".to_string(),
+            FormFieldValue::Text {
+                value: "Ada Lovelace".to_string(),
+            },
+        );
+        fill_form_impl(
+            &state,
+            FillFormRequest {
+                handle: opened.handle,
+                fields,
+            },
+        )
+        .await
+        .expect("fill_form must succeed");
+
+        let pages = list_form_fields_impl(
+            &state,
+            ListFormFieldsRequest {
+                handle: opened.handle,
+                page_index: Some(0),
+            },
+        )
+        .await
+        .expect("listing form fields must succeed");
+        let name_field = pages[0].fields.iter().find(|f| f.name == "name").unwrap();
+        assert_eq!(name_field.value.as_deref(), Some("Ada Lovelace"));
+    }
+
+    #[tokio::test]
+    async fn list_form_fields_rejects_unknown_handle() {
+        let state = test_state();
+        let result = list_form_fields_impl(
+            &state,
+            ListFormFieldsRequest {
+                handle: 999_999,
+                page_index: None,
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn flatten_form_removes_the_acroform_so_a_later_listing_is_empty() {
+        let state = test_state();
+        let (opened, _fixture_path) = open_form_sample(&state).await;
+
+        let result = flatten_form_impl(&state, FlattenFormRequest { handle: opened.handle })
+            .await
+            .expect("flatten_form must succeed");
+        assert!(result.flattened);
+
+        let pages = list_form_fields_impl(
+            &state,
+            ListFormFieldsRequest {
+                handle: opened.handle,
+                page_index: None,
+            },
+        )
+        .await
+        .expect("listing form fields after flattening must succeed");
+        assert!(pages.iter().all(|p| p.fields.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn flatten_form_on_document_without_a_form_is_a_no_op() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let result = flatten_form_impl(&state, FlattenFormRequest { handle: opened.handle }).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn flatten_form_rejects_unknown_handle() {
+        let state = test_state();
+        let result = flatten_form_impl(&state, FlattenFormRequest { handle: 999_999 }).await;
         assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
     }
 }

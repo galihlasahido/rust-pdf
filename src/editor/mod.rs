@@ -94,6 +94,7 @@ pub use watermark::WatermarkOptions;
 
 pub use annotations::{AnnotationInfo, AnnotationKind};
 pub use audit::RedactionAuditEntry;
+pub use forms::FormFieldWidget;
 pub use graph::EditableDocument;
 pub use icc::{IccColorSpace, IccError, OutputIntentInfo, OutputIntentSubtype};
 pub use outline::{BookmarkNode, Destination};

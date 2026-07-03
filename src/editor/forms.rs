@@ -49,6 +49,52 @@ const MAX_FIELD_NODES: usize = 200_000;
 /// more than a handful of levels deep).
 const MAX_PARENT_DEPTH: u32 = 64;
 
+/// One AcroForm field's on-page widget appearance, as read back by
+/// [`EditableDocument::list_form_fields`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormFieldWidget {
+    /// The widget annotation's own object id. Stable for the life of the
+    /// open document; useful as a frontend's per-overlay-element key, but
+    /// not needed to fill the field (use `name` with `fill_form`/the
+    /// `set_*_value` setters instead).
+    pub widget_id: ObjectId,
+    /// Fully qualified field name (see the module docs' "Field model"
+    /// section) - exactly the string `fill_form` and the `set_*_value`
+    /// setters expect.
+    pub name: String,
+    /// PDF field-type name (`Tx`, `Btn`, or `Ch`; ISO 32000-1 Table 220).
+    /// A `Sig` (signature) field is never returned - it isn't fillable
+    /// through this module's API.
+    pub field_type: String,
+    /// For a `Btn` field, whether it is a radio-group button (`true`) or
+    /// a checkbox (`false`); always `false` for other field types.
+    pub is_radio: bool,
+    /// This widget's position on its page, in unrotated PDF default user
+    /// space (origin bottom-left, y increasing upward - ISO 32000-1
+    /// 8.3.2.2). Same coordinate system as [`crate::editor::TextRun`]:
+    /// a frontend maps it onto a `render_page` raster the same way
+    /// (`scale = dpi / 72.0`, `pixel_x = rect.llx * scale`,
+    /// `pixel_y_from_top = (page_height - rect.ury) * scale`), assuming
+    /// the page's `/Rotate` is `0`.
+    pub rect: Rectangle,
+    /// The field's current value: the text string for `Tx`, the
+    /// selected-or-`Off` state name for `Btn`, or the selected string for
+    /// `Ch`. For a radio group this is the *group's* current selection
+    /// (shared by every button widget of that group), which may or may
+    /// not equal this particular widget's own `export_value` below.
+    pub value: Option<String>,
+    /// For a radio-button widget, the export value this specific button
+    /// selects when activated (its `/AP /N` appearance state other than
+    /// `/Off`). `None` for every other field type.
+    pub export_value: Option<String>,
+    /// For a `Ch` (choice) field, its `/Opt` list of selectable display
+    /// strings. Empty for every other field type.
+    pub options: Vec<String>,
+    /// Whether the field is read-only (`/Ff` bit 1, ISO 32000-1 Table
+    /// 221) and so should be displayed but not made editable.
+    pub read_only: bool,
+}
+
 impl EditableDocument {
     // -- Discovery ---------------------------------------------------
 
@@ -68,6 +114,101 @@ impl EditableDocument {
             Object::Name(n) => Some(n.as_str().to_string()),
             _ => None,
         }))
+    }
+
+    // -- Listing (overlay support) -----------------------------------------
+
+    /// Lists every AcroForm field widget on `page_index` - one entry per
+    /// on-page appearance (so an `N`-button radio group appearing on the
+    /// page yields `N` entries sharing the same `name`) - the data a
+    /// form-filling frontend needs to draw an input overlay atop a
+    /// rendered page, and the read counterpart to [`Self::set_text_value`]
+    /// & co. (each entry's `name` is exactly what those setters, and
+    /// `fill_form`, expect). A page with no widget annotations at all
+    /// returns an empty `Vec`, not an error - including a document with no
+    /// `/AcroForm`, so a frontend can call this unconditionally per page
+    /// and simply skip drawing an overlay when the result is empty. See
+    /// [`FormFieldWidget::rect`]'s docs for how to map its coordinates
+    /// onto a `render_page` raster.
+    pub fn list_form_fields(&self, page_index: usize) -> PdfResult<Vec<FormFieldWidget>> {
+        let page_id = self.page_id_at(page_index)?;
+        let page = self.get_dictionary(page_id)?;
+        let Some(Object::Array(annots)) = page.get("Annots") else { return Ok(Vec::new()) };
+
+        let field_names_by_id: std::collections::HashMap<ObjectId, String> =
+            self.walk_fields()?.into_iter().map(|(name, id)| (id, name)).collect();
+
+        let mut out = Vec::new();
+        for a in annots.iter().take(MAX_FIELD_NODES) {
+            let Object::Reference(widget_id) = a else { continue };
+            let Ok(widget) = self.get_dictionary(*widget_id) else { continue };
+            let is_widget = matches!(widget.get("Subtype"), Some(Object::Name(n)) if n.as_str() == "Widget");
+            if !is_widget {
+                continue;
+            }
+
+            // A merged field/widget (no separate `/Kids` level) has its
+            // own id in `field_names_by_id`; otherwise the immediate
+            // `/Parent` must be the terminal field (widget kids are
+            // always one level below their terminal field, per
+            // `walk_field_node`'s `kids_are_widgets` check).
+            let field_id = if field_names_by_id.contains_key(widget_id) {
+                *widget_id
+            } else {
+                match widget.get("Parent") {
+                    Some(Object::Reference(parent_id)) if field_names_by_id.contains_key(parent_id) => *parent_id,
+                    _ => continue, // Not a recognizable AcroForm field widget.
+                }
+            };
+            let Some(rect) = widget.get("Rect").and_then(rect_from_object) else { continue };
+
+            let ft = match self.effective(field_id, "FT") {
+                Some(Object::Name(n)) => n.as_str().to_string(),
+                _ => continue,
+            };
+            if ft == "Sig" {
+                continue; // Not fillable through this module's API.
+            }
+            let is_radio = ft == "Btn"
+                && matches!(self.effective(field_id, "Ff"), Some(Object::Integer(f)) if f & (1 << 15) != 0);
+            let read_only = matches!(self.effective(field_id, "Ff"), Some(Object::Integer(f)) if f & 1 != 0);
+
+            let field_dict = self.get_dictionary(field_id)?;
+            let value = match field_dict.get("V") {
+                Some(Object::Name(n)) => Some(n.as_str().to_string()),
+                Some(v) => text_of(v),
+                None => None,
+            };
+            let options = if ft == "Ch" {
+                match field_dict.get("Opt") {
+                    Some(Object::Array(opts)) => opts
+                        .iter()
+                        .filter_map(|o| match o {
+                            Object::String(s) => Some(super::util::from_pdf_text_string(s)),
+                            Object::Array(pair) => pair.get(1).or_else(|| pair.get(0)).and_then(text_of),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let export_value = if is_radio { self.on_state_name(*widget_id) } else { None };
+
+            out.push(FormFieldWidget {
+                widget_id: *widget_id,
+                name: field_names_by_id.get(&field_id).cloned().unwrap_or_default(),
+                field_type: ft,
+                is_radio,
+                rect,
+                value,
+                export_value,
+                options,
+                read_only,
+            });
+        }
+        Ok(out)
     }
 
     // -- Text fields ---------------------------------------------------
@@ -1002,6 +1143,70 @@ mod tests {
         assert_eq!(doc.field_type("subscribe").unwrap().as_deref(), Some("Btn"));
         assert_eq!(doc.field_type("country").unwrap().as_deref(), Some("Ch"));
         assert_eq!(doc.field_type("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn test_list_form_fields_returns_one_entry_per_widget() {
+        let doc = doc_with_form();
+        let mut fields = doc.list_form_fields(0).unwrap();
+        fields.sort_by(|a, b| a.name.cmp(&b.name).then(a.rect.llx.partial_cmp(&b.rect.llx).unwrap()));
+
+        // name, subscribe, country are single-widget fields; plan (a
+        // 2-button radio group) contributes 2 entries sharing one name.
+        assert_eq!(fields.len(), 5);
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["country", "name", "plan", "plan", "subscribe"]);
+    }
+
+    #[test]
+    fn test_list_form_fields_reports_type_and_geometry() {
+        let mut doc = doc_with_form();
+        doc.set_text_value("name", "Ada Lovelace").unwrap();
+        let fields = doc.list_form_fields(0).unwrap();
+
+        let name_field = fields.iter().find(|f| f.name == "name").unwrap();
+        assert_eq!(name_field.field_type, "Tx");
+        assert!(!name_field.is_radio);
+        assert_eq!(name_field.rect, Rectangle::new(100.0, 700.0, 300.0, 720.0));
+        assert_eq!(name_field.value.as_deref(), Some("Ada Lovelace"));
+
+        let country_field = fields.iter().find(|f| f.name == "country").unwrap();
+        assert_eq!(country_field.field_type, "Ch");
+        let mut options = country_field.options.clone();
+        options.sort();
+        assert_eq!(options, vec!["Canada", "UK", "USA"]);
+    }
+
+    #[test]
+    fn test_list_form_fields_reports_radio_export_values() {
+        let mut doc = doc_with_form();
+        doc.set_radio_value("plan", "pro").unwrap();
+        let fields = doc.list_form_fields(0).unwrap();
+
+        let radios: Vec<_> = fields.iter().filter(|f| f.name == "plan").collect();
+        assert_eq!(radios.len(), 2);
+        for r in &radios {
+            assert!(r.is_radio);
+            // Every button of the group reports the group's current
+            // selection as `value`...
+            assert_eq!(r.value.as_deref(), Some("pro"));
+        }
+        // ...but each button's own `export_value` is distinct.
+        let mut export_values: Vec<&str> = radios.iter().filter_map(|r| r.export_value.as_deref()).collect();
+        export_values.sort();
+        assert_eq!(export_values, vec!["basic", "pro"]);
+    }
+
+    #[test]
+    fn test_list_form_fields_on_page_without_widgets_is_empty() {
+        let bytes = DocumentBuilder::new()
+            .page(PageBuilder::a4().build())
+            .build()
+            .unwrap()
+            .save_to_bytes()
+            .unwrap();
+        let doc = EditableDocument::from_bytes(bytes).unwrap();
+        assert_eq!(doc.list_form_fields(0).unwrap(), Vec::new());
     }
 
     #[test]
