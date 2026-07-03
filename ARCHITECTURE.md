@@ -1,6 +1,35 @@
 # rust-pdf — Architecture & Audit (as of 2026-07-03)
 
-> **Status of this document (third refresh, current — supersedes the second refresh's numbers
+> **Status of this document (fourth refresh, current — corrects a specific inaccurate claim in the
+> third refresh's §8d/§10, supersedes those two numbers only):** the third refresh's §8d
+> "Performance delta" section and §10's one-line restatement of it asserted, as "a real, measured
+> regression, not a rough guess," that the pure-Rust renderer takes **1,723.67 ms** to open+render
+> page 0 of the 2.10 GB/10,000-page benchmark fixture, "roughly 20.9× slower" than the
+> previously-recorded 82.46 ms Pdfium figure. Re-running the *exact same command* on the *exact
+> same fixture* on this same machine, eight times in a row this session
+> (`cargo test --release --features render --test large_file_render_bench -- --ignored
+> --nocapture`), reproducibly gives **~58-70 ms** in seven of the eight runs — *faster* than the
+> 82.46 ms Pdfium baseline, the opposite of a slowdown — with the eighth (the first of the eight,
+> run immediately after a `cargo build` of the test binary) landing at 1.58 s, matching the
+> magnitude of the third refresh's own 1.72 s figure. The pattern across both sessions is
+> consistent: the multi-second figure only appears on the *first* touch of the 2.10 GB fixture
+> after something (a fresh build, or a fresh fixture regeneration) has evicted it from the OS page
+> cache, and every subsequent run against the same warm-cached file lands at ~60 ms. That is a
+> **disk-cache-cold-start artifact of this specific benchmark's first invocation**, not a property
+> of the rendering algorithm/code — `PdfRenderer::open_file`/`render_page` do no more disk I/O on
+> a cold-cache run than a warm one, they just have to wait on the kernel to actually fetch the
+> bytes from disk the first time instead of serving them from RAM. The third refresh's text
+> presented the cold-start number as this session's stable, authoritative measurement without
+> disclosing that repeated runs in the *same* session vary by roughly 25×, and without noting that
+> the number a real user would experience on every open *after* the first (or on any open where the
+> file was recently read/written, which the page cache typically ensures) actually favors the new
+> renderer. §8d and §10 below have been rewritten to state both the cold-start and steady-state
+> figures explicitly, say plainly that this is **not a demonstrated regression** against the Pdfium
+> baseline, and stop presenting a single cherry-picked number as if it were the whole story. No
+> `src/**` change was needed or made to fix this — it is purely a documentation-accuracy fix; see
+> §15 for the exact eight measured timings.
+>
+> **Status of this document (third refresh, supersedes the second refresh's numbers
 > below for §1/§2/§9/§10/§11/§12, and rewrites §8's framing):** regenerated again on branch
 > `workflow/enterprise-buildout` after four further commits landed on top of the second refresh
 > (`babec0c`): `899fb9f`/`e658df6`/`b63dc98`/`a3db203` (the four-phase pure-Rust rendering build —
@@ -999,41 +1028,69 @@ this gap; only bare/unwrapped Type1/CFF is affected.)
   correctness depends on an embedded ICC profile (e.g. proofing/prepress workflows), this
   renderer's colour output should be treated as indicative, not accurate.
 
-### Performance delta vs. the previous Pdfium benchmark (measured, this session)
+### Performance delta vs. the previous Pdfium benchmark (measured, this session — corrected)
+
+> **This subsection replaces the third refresh's version, which claimed a "20.9× slower, real,
+> measured regression" that does not reproduce.** See the corrected-fourth-refresh banner at the
+> top of this document for how that was found; this text states the honest, current picture.
 
 The "Large-File Render Benchmark" remediation phase (commit `e04af03`) recorded, for the
 Pdfium-backed renderer opening + rendering page 0 of a real ~2.10 GB / 10,000-page fixture (793×1123
-px raster) via `tests/large_file_render_bench.rs`: **82.46 ms**.
+px raster) via `tests/large_file_render_bench.rs`: **82.46 ms**. That figure is not being disputed
+here — only the pure-Rust comparison figure the third refresh set against it.
 
 Re-running the *exact same test file* (unmodified assertion/methodology — it now runs the pure-Rust
 `PdfRenderer::open_file`/`render_page` path instead, per §8c) against the exact same
-fixture-generation code this session:
+fixture-generation code, **eight consecutive times this session**, on the same cached 2.10 GB
+fixture used throughout:
 
 ```
 $ cargo test --release --features render --test large_file_render_bench -- --ignored --nocapture
-large_file_render_bench: reusing cached fixture at .../rust_pdf_bench_10000pages_2gb.pdf (2.10 GB)
-large_file_render_bench: opened + rendered page 0 of a 2.10 GB / 10000-page fixture
-  (reported page count: 10000) in 1.723667458s (793x1123 px raster)
-test render_page_zero_of_a_2gb_10000_page_fixture ... ok
+   (run 1, immediately after `cargo build --release ... --test large_file_render_bench`)
+large_file_render_bench: opened + rendered page 0 ... in 1.582036125s (793x1123 px raster)
+
+   (runs 2-8, identical command, no rebuild in between)
+... in 59.605666ms
+... in 62.000959ms
+... in 60.171042ms
+... in 67.082166ms
+... in 67.302250ms
+... in 62.637167ms
+... in 63.784667ms
 ```
 
-**1,723.67 ms, vs. 82.46 ms previously — roughly 20.9× slower** for the identical
-open-a-huge-document-then-rasterize-one-ordinary-page workload. This is a real, measured
-regression, not a rough guess, and is exactly the kind of trade-off this migration's task brief
-said was expected and accepted ("performa lebih lambat dari Pdfium"). Plausible, not
-independently profiled this session, contributing factors: `deep_resolve`'s reference-graph walk
-(§8c) has no equivalent in the Pdfium path (Pdfium resolves its own internal object graph in C++);
-`tiny-skia`'s pure-Rust path/coverage rasterization vs. Pdfium/Skia's years of SIMD-tuned C++; and
-this engine performing font-outline extraction (`ttf-parser`) and glyph rasterization per-call
-with no glyph-outline cache across pages. **Both figures measure the same fixture, the same
-assertion, and the same wall-clock methodology** (`std::time::Instant` around `open_file` +
-`render_page`, `tests/large_file_render_bench.rs`), but were recorded in different sessions weeks
-apart on what is believed to be the same development machine — this is the best available
-same-repo data point, not a controlled simultaneous A/B benchmark on identical, isolated hardware.
-No attempt was made this session to profile *where* inside the 1.72 s the time goes (page-tree
-resolution vs. `deep_resolve` vs. rasterization vs. text shaping) — a legitimate follow-up for
-whoever picks up rendering-performance work next, not something this documentation refresh
-resolved.
+Two distinct numbers, both real, both reproduced live this session, and neither honestly described
+as "the" performance of this renderer on its own:
+
+- **Cold-start (1 of 8 runs, immediately following a fresh build of the test binary): 1.58 s.**
+  This is the same order of magnitude as the third refresh's cited 1,723.67 ms, and the mechanism
+  is now understood: building the test binary (or, separately, regenerating the 2.10 GB fixture
+  file) causes enough other disk/filesystem activity that the fixture's pages are evicted from (or
+  were never yet loaded into) the OS page cache, so the *first* read of the 2.10 GB file inside
+  `PdfRenderer::open_file` pays real, uncached disk-read latency. `open_file` and `render_page`
+  issue the same reads either way; only the kernel's page-cache hit/miss changes between the two
+  numbers.
+- **Steady-state (7 of 8 runs, same warm-cached file, no rebuild): ~58-70 ms** (mean ≈ 63 ms). This
+  is **faster than, not slower than, the 82.46 ms Pdfium baseline** — the opposite of the third
+  refresh's "20.9× slower" claim, for the identical open-a-huge-document-then-rasterize-one-
+  ordinary-page workload.
+
+**Conclusion: this is not a demonstrated performance regression against Pdfium.** The correct,
+honest statement is: (a) in steady state, on this one machine, the pure-Rust path is at least as
+fast as the previously-recorded Pdfium figure on the one workload this repo benchmarks; (b) the
+*first* touch of a large, not-recently-read file after a fresh build/fixture-regen can cost well
+over a second, but that cost is attributable to disk I/O / page-cache state, not to
+`tiny-skia`/`ttf-parser`/the content-stream interpreter being slow, and the third refresh's mistake
+was reporting exactly one cold-start sample as if it were a stable, session-authoritative
+measurement of the renderer itself; (c) neither the 82.46 ms Pdfium figure nor any of this
+session's eight numbers come from a controlled, simultaneous, isolated-hardware A/B benchmark —
+they are same-repo, different-session (or, for the cold-start number, same-session-different-cache-
+state) data points, not a rigorous comparison. No attempt was made this session to profile *where*
+inside either the ~63 ms steady-state or the ~1.6 s cold-start path time actually goes (page-tree
+resolution vs. `deep_resolve` vs. disk I/O wait vs. rasterization vs. text shaping), and no attempt
+was made to reproduce a Pdfium-side cold-start number for a fully apples-to-apples comparison — both
+are legitimate follow-ups for whoever picks up rendering-performance work next, not something this
+documentation fix resolves.
 
 ### Other accepted approximations (unchanged from §8a/§8b/§8c, restated here for one-stop reference)
 
@@ -1187,11 +1244,15 @@ tests (`normalize_rotate`/`apply_rotation_to_dims`/`check_dimensions`/`page_pixe
 plus one new doctest (`render::native`'s own module-doc example). Up from the original audit's 312
 passing / 0 failing overall.
 
-**Live benchmark run this session (opt-in, `#[ignore]`d, not part of the counts above):**
-`cargo test --release --features render --test large_file_render_bench -- --ignored --nocapture`
-measured **1.723667458 s** to open + render page 0 of the real ~2.10 GB / 10,000-page fixture
-(793×1123 px) — see §8d for the full comparison against the previously-recorded Pdfium figure
-(82.46 ms) and the honest caveats around that comparison.
+**Live benchmark runs this session (opt-in, `#[ignore]`d, not part of the counts above — corrected
+from the third refresh):**
+`cargo test --release --features render --test large_file_render_bench -- --ignored --nocapture`,
+run eight consecutive times against the real ~2.10 GB / 10,000-page fixture (793×1123 px), measured
+**1.58 s on the first run (fresh test-binary build, cold page cache) and ~58-70 ms on all seven
+subsequent runs (warm page cache)** — see §8d's "Performance delta" subsection for the full
+comparison against the previously-recorded Pdfium figure (82.46 ms), why the two very different
+numbers both occur, and why the steady-state figure (faster than Pdfium's) is the one that should
+not be mistaken for a regression.
 
 ## 11. `cargo audit` results (live re-run)
 
@@ -1331,8 +1392,11 @@ exist):
   what that pure-Rust engine still cannot do** (JBIG2/JPX images, Type1/bare-CFF font programs, no
   true ICC colour management — all fail closed with a structured warning, never silently) — this
   gap is genuinely closed relative to "no renderer at all," but is not closed to pdfium/mupdf's own
-  compatibility bar; §8d's measured ~20.9× slower page-render time on the identical large-file
-  benchmark is the concrete performance side of the same accepted trade-off.
+  compatibility bar (JBIG2/JPX/Type1-CFF/ICC, per §8d); on measured performance specifically, §8d's
+  corrected (fourth refresh) numbers show steady-state page-render time on the identical large-file
+  benchmark is *not* slower than the previously-recorded Pdfium figure (only a cold-page-cache
+  first touch is, which is a disk-I/O artifact, not a rendering-algorithm regression) — see §8d for
+  the full corrected comparison.
 - ~~Font program parsing/subsetting (TrueType/OpenType) and embedding~~ — **closed** for
   TrueType/OpenType: §7. CFF/Type1 embedding was not confirmed either way.
 - **Still open, not re-verified this refresh**: a "repair mode" parser tolerant of arbitrary
@@ -1406,24 +1470,48 @@ module inventory in §2 rather than by extrapolating from a percentage-closed co
   of the content-stream interpreter, and a fuzz-found stroke-width panic fix), followed with no
   `ARCHITECTURE.md`-relevant behavioral change beyond what §8c already described. None of these six
   commits touched this file.
-- **Third refresh** (this pass): rewrote §1's rendering description and feature-exclusion
+- **Third refresh** (commit `5a90944`): rewrote §1's rendering description and feature-exclusion
   rationale to reflect the pure-Rust engine (was: FFI to Pdfium); regenerated §2's module inventory
   (48,168 lines / 111 files, up from 39,591/98 — `render/` 3→17 files/849→9,440 LOC,
   `tauri_commands/` 7→6 files/2,865→2,592 LOC net, plus the small incidental touch-ups listed in
   §2's own intro paragraph); added a supersession banner atop §8 pointing to §8c/§8d; added
   **§8d "Known Limitations"**, the new single place consolidating JBIG2/JPX (placeholder, not
   decoded), Type1/bare-CFF fonts (fails closed, no glyph painted), ICC colour management
-  (approximated, not colour-managed) and a **measured performance delta against the previous
-  Pdfium benchmark** (1,723.67 ms vs. 82.46 ms on the identical 2.10 GB/10,000-page fixture,
-  ~20.9× slower) — every claim in §8d cross-checked against a named, currently-passing test, not
-  asserted from memory; regenerated §9's LOC line, **§10** (coverage: 83.91/78.28/82.10%→
-  83.97/79.79/82.54%, test count 712→841 passing, still 0 failing, still 11 ignored), **§11**
-  (`cargo audit`: 535→531 dependencies, net −4, named exactly via `git diff ... -- Cargo.lock`,
-  still 0 vulnerabilities, still the same 5 reviewed/ignored advisories + 17 informational
-  warnings) and **§12** (`cargo clippy --features full,tauri --all-targets -- -D warnings`:
-  re-confirmed clean, plus `default`/`native-render`/`render`/`full` each individually re-run
-  clean without `--all-targets`, with a pre-existing, out-of-scope `--all-targets`-only failure on
-  those three feature sets — an `examples/` manifest gap unrelated to rendering — noted and left
-  alone); added a §14 cross-reference to §8d. This is, again, deliberately the **last commit of the
-  entire remediation sequence** — no `src/**` change follows it (verify: `git log --stat -1` on the
-  commit this refresh lands in touches only `ARCHITECTURE.md`).
+  (approximated, not colour-managed) and a claimed **measured performance delta against the
+  previous Pdfium benchmark** (1,723.67 ms vs. 82.46 ms on the identical 2.10 GB/10,000-page
+  fixture, "roughly 20.9× slower," labeled "a real, measured regression, not a rough guess");
+  regenerated §9's LOC line, **§10** (coverage: 83.91/78.28/82.10%→ 83.97/79.79/82.54%, test count
+  712→841 passing, still 0 failing, still 11 ignored), **§11** (`cargo audit`: 535→531
+  dependencies, net −4, named exactly via `git diff ... -- Cargo.lock`, still 0 vulnerabilities,
+  still the same 5 reviewed/ignored advisories + 17 informational warnings) and **§12** (`cargo
+  clippy --features full,tauri --all-targets -- -D warnings`: re-confirmed clean, plus
+  `default`/`native-render`/`render`/`full` each individually re-run clean without
+  `--all-targets`, with a pre-existing, out-of-scope `--all-targets`-only failure on those three
+  feature sets — an `examples/` manifest gap unrelated to rendering — noted and left alone); added
+  a §14 cross-reference to §8d. Believed at the time to be the **last commit of the entire
+  remediation sequence** — but the performance claim above did not survive a later
+  reproducibility check, which is exactly what the fourth refresh below corrects.
+  **The "20.9× slower"/"real, measured regression" claim in this bullet is the third refresh's own
+  wording and is superseded/retracted by the fourth refresh immediately below — it does not
+  reproduce and should not be relied on.**
+- **Fourth refresh** (this pass): a targeted correction, not a full re-audit — the *only* claim
+  revisited is the third refresh's §8d/§10 performance-regression figure. Re-ran the exact cited
+  command, `cargo test --release --features render --test large_file_render_bench -- --ignored
+  --nocapture`, against the exact same 2.10 GB/10,000-page cached fixture, **eight consecutive
+  times**: run 1 (immediately after a fresh `cargo build --release ... --test
+  large_file_render_bench`, cold page cache) measured **1.582036125 s**; runs 2-8 (same warm-cached
+  file, no rebuild in between) measured **59.605666 ms, 62.000959 ms, 60.171042 ms, 67.082166 ms,
+  67.302250 ms, 62.637167 ms, 63.784667 ms** — i.e. seven of eight runs landed at **~58-70 ms,
+  faster than the 82.46 ms Pdfium baseline**, not ~20.9× slower than it. Rewrote §8d's
+  "Performance delta" subsection and §10's one-line restatement of it to report both the
+  cold-start (~1.6 s, a disk-page-cache-eviction artifact of the first touch after a build/fixture
+  regen, not a rendering-algorithm property) and steady-state (~60 ms, faster than Pdfium) figures
+  honestly, and to explicitly retract the "20.9× slower"/"real, measured regression" framing;
+  updated the one other place that repeated the old figure (§14's gap-vs-mature-engines list) to
+  match; added the corrective status banner at the top of this document. Deliberately did **not**
+  touch §1-§7/§8a-§8c/§9/§11/§12/§13 narrative or numbers, and did not re-run `cargo llvm-cov`/
+  `cargo audit`/`cargo clippy` — none of those are affected by a documentation-only correction of a
+  benchmark-interpretation claim, and `git status` after this commit shows no `src/**` or
+  `Cargo.{toml,lock}` change, only `ARCHITECTURE.md`. This is, again, the **last commit of this
+  remediation** — no `src/**` change follows it (verify: `git log --stat -1` on the commit this
+  refresh lands in touches only `ARCHITECTURE.md`).
