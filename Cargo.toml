@@ -30,15 +30,18 @@ full = ["compression", "images", "parser", "encryption", "signatures", "html", "
 render = ["dep:pdfium-render", "images"]
 # Pure-Rust content-stream interpreter and 2D rasterizer (no native/FFI
 # dependency at all): graphics-state stack, path construction/painting,
-# clipping, basic ExtGState (alpha/line width/dash) and
-# DeviceGray/RGB/CMYK color. See `src/render/native/mod.rs` for the
-# current phase's scope and its explicitly-documented gaps (no text, no
-# images/XObjects, no non-Device color spaces, no JBIG2/JPX/Type1-CFF,
-# no ICC color management yet -- all fail closed with a structured
+# clipping, basic ExtGState (alpha/line width/dash),
+# DeviceGray/RGB/CMYK color, and text showing (TrueType/OpenType simple +
+# CID/Type0 fonts via `fonts`'s `ttf-parser`, plus Type3 glyph procedures).
+# See `src/render/native/mod.rs` for the current phase's scope and its
+# explicitly-documented gaps (no images/XObjects, no non-Device color
+# spaces, no JBIG2/JPX, no Type1/bare-CFF font programs, no ICC color
+# management yet -- all fail closed with a structured
 # `NativeRenderError`/`RenderWarning` rather than silently mis-rendering).
 # Coexists with the `render` (Pdfium/FFI) feature during the migration;
-# neither replaces the other in this phase.
-native-render = ["dep:tiny-skia", "parser"]
+# neither replaces the other in this phase. Pulls in `fonts` (ttf-parser)
+# for glyph outline extraction -- see `src/render/native/font.rs`.
+native-render = ["dep:tiny-skia", "parser", "fonts"]
 # Async Tauri desktop-app command layer (open_document, render_page,
 # extract_text, search_text, apply_edit, save_document, fill_form,
 # add_annotation, sign_document) plus a dedicated worker thread pool and

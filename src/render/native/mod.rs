@@ -6,28 +6,42 @@
 //! `ARCHITECTURE.md`; neither replaces the other yet, and both can be
 //! enabled at once. The 2D rasterizer backend is
 //! [`tiny-skia`](https://docs.rs/tiny-skia) (pure Rust, BSD-3-Clause);
-//! font outline extraction (a later phase, not present yet) will use
-//! `ttf-parser` (already a dependency of this crate's `fonts` feature).
+//! font outline extraction uses `ttf-parser` (this crate's `fonts`
+//! feature, pulled in automatically by `native-render`).
 //!
-//! # Current phase: "Content-Stream Interpreter Core"
+//! # Current phase: "Text Rendering"
 //!
-//! This phase implements just enough of ISO 32000-1:2008 Chapter 8 to
-//! actually *paint* vector graphics, not merely parse/round-trip a
-//! content stream structurally:
+//! Building on the prior "Content-Stream Interpreter Core" phase (vector
+//! graphics: graphics-state stack, path construction/painting, clipping,
+//! basic ExtGState, Device color spaces -- see `interpreter`'s docs for
+//! that operator table), this phase adds ISO 32000-1:2008 Chapter 9 text
+//! showing:
 //!
-//! - Graphics state stack: `q`/`Q` (8.4.2)
-//! - CTM: `cm` (8.3.4)
-//! - Path construction: `m l c v y h re` (8.5.2)
-//! - Path painting: `f F f* S s B B* b b* n` (8.5.3)
-//! - Clipping paths: `W`/`W*` (8.5.4), via an 8-bit alpha [`tiny_skia::Mask`]
-//! - A basic subset of ExtGState (8.4.5): `gs` only reads `ca`, `CA`, `LW`,
-//!   `D` from the referenced `/ExtGState` resource; other keys (`Font`,
-//!   `SMask`, `BM`, ...) are ignored.
-//! - Line style: `w J j M d` (8.4.3)
-//! - Basic color: `g G rg RG k K` -- **DeviceGray/DeviceRGB/DeviceCMYK
-//!   only** (8.6.3-8.6.5)
+//! - Text-positioning operators: `Tf Td TD Tm T*` (9.4.2), plus the text
+//!   state operators `Tc Tw Tz TL Tr Ts` (9.3) and `BT`/`ET` (9.4.1).
+//! - Text-showing operators: `Tj TJ '` `"` (9.4.3), including per-glyph
+//!   advance computation (9.4.4: `Tc`/`Tw`/`Tz` and `TJ` number
+//!   adjustments).
+//! - **Simple TrueType/OpenType fonts** (9.6.3): character code ->
+//!   Unicode (via [`crate::font::encoding`]'s WinAnsi-ish fallback, same
+//!   table [`crate::editor::text_extract`] already uses) -> glyph ID via
+//!   the embedded font's own `cmap`, outline extracted with `ttf-parser`
+//!   and converted to a `tiny-skia` path (see `glyph`).
+//! - **Composite (Type 0/CIDFontType2) fonts** (9.7), including CJK:
+//!   glyph selection reuses the code/CID/GID conventions established by
+//!   [`crate::font::cid::CompositeFont`] (this crate's own writer) --
+//!   2-byte `Identity-H` codes, honoring an explicit `/CIDToGIDMap` if
+//!   present (see `font::resolve_font`'s docs for exactly what "reuse"
+//!   means here, since the writer and this reader are necessarily
+//!   different code paths).
+//! - **Type 3 fonts** (9.6.5): each glyph's `CharProc` is itself a
+//!   content stream, run *recursively* through this same interpreter
+//!   (`interpreter::Interpreter::run_type3_glyph`), bounded by
+//!   [`font::MAX_TYPE3_DEPTH`] against a self-referential/infinite Type 3
+//!   font (untrusted input).
 //!
-//! See the `interpreter` submodule's docs for the operator dispatch table.
+//! See the `interpreter`/`font`/`glyph` submodules' docs for the exact
+//! operator dispatch table and font-resolution rules.
 //!
 //! # Explicit, honest gaps (not implemented, not silently faked)
 //!
@@ -36,11 +50,45 @@
 //! variant) rather than being silently mis-rendered, guessed at, or
 //! causing a panic:
 //!
-//! - **Text-showing operators** (`Tj TJ ' " BT ET Tf Td TD Tm T* Tc Tw Tz
-//!   Ts Tr TL`) -- no glyph rendering at all yet. A content stream that
-//!   only draws text will currently rasterize to a blank (background-only)
-//!   page plus one `UnsupportedOperator` warning per text operator
-//!   encountered.
+//! - **Type1 and bare/un-wrapped CFF embedded font programs are a
+//!   documented, structural gap: no mature pure-Rust Type1
+//!   (`eexec`-encrypted charstring) or bare-CFF interpreter exists in
+//!   this ecosystem today.** `ttf-parser` (this crate's only font-parsing
+//!   dependency) requires an `sfnt`/OpenType table directory; it cannot
+//!   parse a raw Type1 `PFA`/`PFB` program or a `FontFile3` `/Type1C`/
+//!   `/CIDFontType0C` stream that isn't wrapped in an OpenType container.
+//!   Text using such a font renders **nothing** for that font (but still
+//!   advances the pen using its declared `/Widths`/`/W`, so surrounding
+//!   text doesn't visually collapse), with
+//!   [`RenderWarning::UnsupportedFontProgram`] recorded once -- never a
+//!   panic, never a silently fabricated placeholder box mislabeled as
+//!   "rendered". OpenType fonts whose outlines merely *happen* to be
+//!   CFF-flavored (a proper `sfnt` container) are **not** part of this
+//!   gap -- `ttf-parser` genuinely parses those, so this really is
+//!   supported, not a fallback wearing a disguise. See `font`'s module
+//!   docs for the exact classification logic.
+//! - **Non-embedded fonts are also not rendered** -- this phase has no
+//!   standard/system-font substitution database at all (unlike Pdfium).
+//!   Any font (of *any* `/Subtype`, including TrueType) with no
+//!   `FontFile`/`FontFile2`/`FontFile3` fails the same way as the
+//!   Type1/CFF gap above. This is a distinct, separately-documented gap
+//!   from Type1/CFF -- do not conflate "we have no charstring
+//!   interpreter" with "we have no font substitution logic".
+//! - **Only horizontal writing mode** -- vertical CID fonts
+//!   (`Identity-V` and friends) are not detected; text is always
+//!   positioned as if horizontal.
+//! - **Only 2-byte codes are assumed for every composite (Type 0) font**
+//!   -- matches the same documented simplification already shipped in
+//!   [`crate::editor::text_extract`] (this crate's own writer only ever
+//!   emits `Identity-H`). A composite font genuinely using a different
+//!   CMap will be mis-chunked.
+//! - **`/Encoding` `/Differences` and symbolic (non-Unicode-`cmap`)
+//!   simple fonts** are not specially resolved -- same documented gap as
+//!   `text_extract` (needs the Adobe Glyph List, not implemented).
+//! - **Text clipping render modes** (`Tr` 4-7) paint the same as their
+//!   non-clipping counterpart (0-3) but do not add glyph outlines to the
+//!   clip path -- an intentional simplification (see
+//!   `state::TextState::render_mode`'s docs), not silent data loss.
 //! - **Images and Form XObjects** (`Do`, plus inline images `BI`/`ID`/`EI`)
 //!   -- not painted; recorded as warnings.
 //! - **Shadings** (`sh`) and **Patterns** -- not painted.
@@ -57,13 +105,6 @@
 //!   will remain a **hard, structural gap** even once image painting is
 //!   implemented in a later phase: such images must fail closed (a
 //!   placeholder/structured error), not silently blank or panic.
-//! - **Type1/CFF embedded font programs** -- likewise: no mature pure-Rust
-//!   Type1/CFF *charstring interpreter* exists in this ecosystem today
-//!   (`ttf-parser` parses CFF *tables* but this crate has not, as of this
-//!   phase, wired up glyph outline extraction at all, Type1/CFF or
-//!   otherwise). A future text-rendering phase must fail closed for
-//!   Type1/bare-CFF glyphs it cannot shape, rather than fabricating boxes
-//!   silently mislabeled as "rendered".
 //! - **ICC color management** -- the CMYK->RGB conversion this phase does
 //!   have (`color::device_cmyk`) is the naive, non-color-managed formula
 //!   ISO 32000-1 8.6.5.3 itself documents as the fallback conversion, not
@@ -84,6 +125,23 @@
 //! how to paint. Only structurally-impossible requests (zero-size output,
 //! a degenerate `/MediaBox`, a `q`-flood past
 //! [`interpreter::MAX_GRAPHICS_STATE_DEPTH`]) are hard errors.
+//!
+//! # Pre-resolved `/Resources` assumption
+//!
+//! Like the ExtGState lookups in the prior phase, font resolution here
+//! expects `resources` (and everything reachable from it: the `/Font`
+//! subdictionary, each font's `/FontDescriptor`, `/DescendantFonts`,
+//! `/CharProcs`, and any embedded `FontFile*`/`CIDToGIDMap` streams) to
+//! already be fully dereferenced -- `Object::Dictionary`/`Object::Stream`
+//! values, not dangling `Object::Reference`s. This module has no
+//! `PdfReader`/document access of its own to resolve indirect references;
+//! that is the caller's responsibility (a future phase wiring this up to
+//! whole-document rendering will need to walk the xref table once before
+//! calling [`render_content_stream`]). An indirect reference found where
+//! a dictionary/stream was expected is treated the same as "absent" --
+//! e.g. a font with no readable `/FontDescriptor` is
+//! [`font::UnsupportedFontReason::NotEmbedded`] -- rather than panicking
+//! or trying to guess at a document it cannot see.
 //!
 //! # Untrusted input handling
 //!
@@ -128,6 +186,8 @@
 
 mod color;
 mod error;
+mod font;
+mod glyph;
 mod interpreter;
 mod path;
 mod state;
@@ -146,6 +206,9 @@ pub use interpreter::{render_content_stream, NativeRenderOutput, MAX_GRAPHICS_ST
 /// PNG output should encode `.data()` with their own `image`/`png`
 /// dependency (e.g. this crate's own `images` feature, if enabled).
 pub use tiny_skia::Pixmap;
+
+#[cfg(test)]
+mod text_tests;
 
 #[cfg(test)]
 mod tests {
@@ -293,19 +356,35 @@ mod tests {
         assert_eq!(a, 255);
     }
 
-    /// Test 10: Unsupported operators (text-showing) are recorded as warnings
-    /// and skipped, without aborting the rest of the (graphics) content
-    /// stream.
+    /// Test 10: Unsupported operators (image XObjects, this phase's `Do`)
+    /// are recorded as warnings and skipped, without aborting the rest of
+    /// the (graphics) content stream.
     #[test]
-    fn unsupported_text_operator_is_a_warning_not_a_failure() {
-        let content = b"BT /F1 12 Tf (Hello) Tj ET 0 1 0 rg 0 0 200 200 re f";
+    fn unsupported_operator_is_a_warning_not_a_failure() {
+        let content = b"/Im1 Do 0 1 0 rg 0 0 200 200 re f";
         let out = render_content_stream(content, 200, 200, page(), None).unwrap();
         assert_eq!(pixel(&out, 100, 100), (0, 255, 0, 255));
         assert!(!out.warnings.is_empty());
         assert!(out
             .warnings
             .iter()
-            .any(|w| matches!(w, RenderWarning::UnsupportedOperator { operator } if operator == "BT")));
+            .any(|w| matches!(w, RenderWarning::UnsupportedOperator { operator } if operator == "Do")));
+    }
+
+    /// Text-showing operators (`BT`/`Tf`/`Tj`/`ET`) are now implemented
+    /// (this phase adds text rendering); a `Tf` naming a font resource
+    /// that doesn't exist (no `/Resources` supplied at all, here) is a
+    /// warning, not a hard failure or a panic -- the rest of the content
+    /// stream (the green fill) still renders.
+    #[test]
+    fn tf_with_missing_font_resource_is_a_warning_not_a_failure() {
+        let content = b"BT /F1 12 Tf (Hello) Tj ET 0 1 0 rg 0 0 200 200 re f";
+        let out = render_content_stream(content, 200, 200, page(), None).unwrap();
+        assert_eq!(pixel(&out, 100, 100), (0, 255, 0, 255));
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| matches!(w, RenderWarning::MissingFontResource { name } if name == "F1")));
     }
 
     /// Test 11: Adversarial input: zero/degenerate output dimensions and

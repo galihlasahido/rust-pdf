@@ -7,6 +7,84 @@ use tiny_skia::{Color, LineCap, LineJoin, Mask};
 
 use crate::types::Matrix;
 
+use super::font::ResolvedFont;
+
+/// The subset of ISO 32000-1 9.3 "Text State Parameters" this phase
+/// implements. Per 9.3 these *are* graphics-state parameters (saved/
+/// restored by `q`/`Q`, unlike the text object's `Tm`/`Tlm` matrices,
+/// which live only on the interpreter itself and reset at every `BT` --
+/// see `interpreter.rs`).
+///
+/// `Debug` is implemented by hand (rather than derived) so it doesn't
+/// need to recursively dump `font`'s embedded font-program bytes (which
+/// could be megabytes) just to debug-print an otherwise-small struct.
+#[derive(Clone)]
+pub(super) struct TextState {
+    /// `Tc` (9.3.2): additional spacing added after every glyph, in
+    /// unscaled text space units.
+    pub char_spacing: f64,
+    /// `Tw` (9.3.3): additional spacing added after single-byte code `32`
+    /// only (ISO 32000-1 9.3.3's explicit carve-out for multi-byte
+    /// codes), in unscaled text space units.
+    pub word_spacing: f64,
+    /// `Tz` (9.3.4), already converted from a percentage to a factor
+    /// (`100 Tz` -> `1.0`).
+    pub horizontal_scale: f64,
+    /// `TL` (9.3.5): used by `T*`/`'`/`"`/`TD`.
+    pub leading: f64,
+    /// `Tf`'s font operand, resolved once and cached for the lifetime of
+    /// this render (see `interpreter.rs`'s `font_cache`).
+    pub font: Option<Rc<ResolvedFont>>,
+    /// The resource name `Tf` selected `font` from, kept only so a
+    /// warning about an unrenderable font can name it.
+    pub font_resource_name: Option<String>,
+    /// `Tf`'s size operand (`Tfs`, 9.3.1).
+    pub font_size: f64,
+    /// `Tr` (9.3.6): fill (0), stroke (1), fill+stroke (2), invisible
+    /// (3), or one of the `+4` "also add to clip" variants (4-7). This
+    /// phase paints modes 4-7 identically to their 0-3 counterpart but
+    /// does **not** add the glyph outlines to the clipping path -- an
+    /// intentional simplification, not a silent correctness bug, since
+    /// clip-mode text is rare and the fallback (paint normally, clip
+    /// unaffected) is closer to "render more than asked" than to
+    /// "silently wrong".
+    pub render_mode: i64,
+    /// `Ts` (9.3.7): vertical displacement of the baseline.
+    pub rise: f64,
+}
+
+impl std::fmt::Debug for TextState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextState")
+            .field("char_spacing", &self.char_spacing)
+            .field("word_spacing", &self.word_spacing)
+            .field("horizontal_scale", &self.horizontal_scale)
+            .field("leading", &self.leading)
+            .field("font_resource_name", &self.font_resource_name)
+            .field("font_size", &self.font_size)
+            .field("render_mode", &self.render_mode)
+            .field("rise", &self.rise)
+            .field("font_is_set", &self.font.is_some())
+            .finish()
+    }
+}
+
+impl TextState {
+    pub(super) fn initial() -> Self {
+        Self {
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scale: 1.0,
+            leading: 0.0,
+            font: None,
+            font_resource_name: None,
+            font_size: 0.0,
+            render_mode: 0,
+            rise: 0.0,
+        }
+    }
+}
+
 /// One entry of the graphics-state stack.
 ///
 /// Only the subset of ISO 32000-1 Table 52 ("Device-Independent Graphics
@@ -44,6 +122,10 @@ pub(super) struct GraphicsState {
     /// (clone-on-push) is O(1) unless/until the clip is actually
     /// narrowed by a `W`/`W*` inside the saved state.
     pub clip: Option<Rc<Mask>>,
+    /// ISO 32000-1 9.3 "Text State Parameters" -- part of the graphics
+    /// state (see [`TextState`]'s own docs for why `Tm`/`Tlm` are *not*
+    /// here).
+    pub text: TextState,
 }
 
 impl GraphicsState {
@@ -69,6 +151,7 @@ impl GraphicsState {
             dash_array: Vec::new(),
             dash_phase: 0.0,
             clip: None,
+            text: TextState::initial(),
         }
     }
 }

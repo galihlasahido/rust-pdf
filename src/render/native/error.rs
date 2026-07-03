@@ -117,6 +117,39 @@ pub enum RenderWarning {
     /// (surprisingly common) real-world producer bug and not something
     /// that should block an otherwise-renderable page.
     UnbalancedRestore,
+    /// `Tf` named a resource not present in `/Resources /Font` (or no
+    /// `resources` dictionary was supplied at all, or the entry wasn't a
+    /// dereferenced dictionary -- see `native`'s module docs on the
+    /// pre-resolved-`Resources` assumption). Text shown before the next
+    /// (valid) `Tf` renders nothing.
+    MissingFontResource {
+        /// The resource name that could not be resolved.
+        name: String,
+    },
+    /// A text-showing operator ran with no active font at all (`Tf` was
+    /// never called, or only ever named a missing resource). The string
+    /// operand is discarded; no glyphs are painted.
+    MissingActiveFont,
+    /// `Tf` selected a font resource this phase cannot rasterize --
+    /// see `crate::render::native::font`'s module docs for the full list
+    /// of reasons (no embedded program, Type1/bare-CFF, or an otherwise
+    /// unparseable program) and which of those is the documented,
+    /// structural gap versus an unexpected/adversarial input. Recorded
+    /// once per resource name; subsequent text shown with it renders
+    /// nothing (but still advances the pen using its declared widths).
+    UnsupportedFontProgram {
+        /// The resource name (`/Resources /Font /<name>`) this applies to.
+        resource_name: String,
+        /// Human-readable reason (see
+        /// `font::UnsupportedFontReason`'s `Display` impl).
+        reason: String,
+    },
+    /// A Type 3 glyph procedure (ISO 32000-1:2008 9.6.5) recursed past
+    /// [`super::font::MAX_TYPE3_DEPTH`] -- a self-referential or
+    /// mutually-recursive set of Type 3 fonts (untrusted/adversarial
+    /// input). The glyph is skipped (nothing painted for it) rather than
+    /// recursing further.
+    Type3RecursionLimitExceeded,
 }
 
 impl std::fmt::Display for RenderWarning {
@@ -139,6 +172,18 @@ impl std::fmt::Display for RenderWarning {
             }
             RenderWarning::UnbalancedRestore => {
                 write!(f, "Q with no matching q, ignored")
+            }
+            RenderWarning::MissingFontResource { name } => {
+                write!(f, "Tf referenced a missing font resource: /{name}")
+            }
+            RenderWarning::MissingActiveFont => {
+                write!(f, "text shown with no active font (Tf never succeeded)")
+            }
+            RenderWarning::UnsupportedFontProgram { resource_name, reason } => {
+                write!(f, "font /{resource_name} cannot be rendered: {reason}")
+            }
+            RenderWarning::Type3RecursionLimitExceeded => {
+                write!(f, "Type 3 glyph procedure recursion limit exceeded, glyph skipped")
             }
         }
     }

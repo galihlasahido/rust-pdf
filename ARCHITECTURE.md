@@ -539,7 +539,11 @@ Per the task's explicit instruction, the following are **known, disclosed gaps**
 
 - **No text rendering at all yet** (`Tj TJ ' " BT ET Tf Td Tm ...`) — every text-showing operator
   is recorded as `RenderWarning::UnsupportedOperator` and skipped; a text-only page currently
-  rasterizes to a blank (background-only) page.
+  rasterizes to a blank (background-only) page. **Superseded by §8b below** ("Text Rendering",
+  phase 2): these operators are now implemented for TrueType/OpenType simple fonts, CID/Type0
+  (CJK) composite fonts, and Type 3 glyph procedures. Left as-written here for historical accuracy
+  about what phase 1 alone shipped; §8b documents the remaining (still real) text-related gaps
+  (Type1/bare-CFF font programs, non-embedded fonts, vertical writing mode, `/Differences`).
 - **No images or Form XObjects** (`Do`, inline images `BI`/`ID`/`EI`) — not painted.
 - **No shadings/patterns** (`sh`, Pattern color space).
 - **No non-Device color spaces** (`cs`/`CS`/`sc`/`SC`/`scn`/`SCN`: CalGray/CalRGB/Lab/ICCBased/
@@ -589,6 +593,128 @@ aborting the rest of the stream, and three adversarial-input cases (zero/degener
 `q`-flood, truncated trailing bytes) asserting structured errors/warnings rather than a panic.
 Plus unit tests in `color.rs` (7), `path.rs` (4), `state.rs` (4), `interpreter.rs` (4) for the
 individual building blocks. See §10-equivalent test run output in the task report for this phase.
+
+## 8b. Pure-Rust rendering migration, phase 2: "Text Rendering" (implemented)
+
+Builds directly on §8a's interpreter core. Same coexistence model (`render`/Pdfium and
+`native-render`/pure-Rust remain two independent, optional features; nothing in §8/§8a changed
+behaviorally). `native-render` now additionally pulls in the `fonts` feature (`dep:ttf-parser`,
+`dep:subsetter`) so glyph outline extraction has `ttf-parser` available.
+
+### What was built this phase
+
+- `src/render/native/font.rs` (new): resolves a `/Resources /Font /<name>` dictionary into
+  whatever the interpreter needs to paint text — a loaded `ttf-parser` font program (or,
+  honestly, the reason it couldn't load one), glyph-selection/width tables, and (for Type 3) the
+  glyph-name-to-`CharProc`-bytes map. Also parses `/W` (CID widths, both Table 118 forms, with a
+  bounded range-expansion guard against a crafted `0 4294967295 500`-style entry) and `/Widths`
+  (simple/Type 3, Table 111).
+- `src/render/native/glyph.rs` (new): adapts `ttf-parser`'s `OutlineBuilder` callback trait to a
+  `tiny_skia::PathBuilder`, transforming each point through the glyph-space-to-device-space
+  matrix (and sanitizing non-finite results, same rule as `path.rs`) on the way in.
+- `src/font/truetype.rs`: added `TrueTypeFont::outline_glyph()`, wrapped in the same
+  `catch_unwind` defense-in-depth this module already uses for `Face::parse` itself (embedded
+  font bytes are untrusted; `ttf-parser`'s outline extraction is documented panic-free but this
+  crate does not fully trust that guarantee for adversarial input either).
+- `src/render/native/state.rs`: added `TextState` (ISO 32000-1 9.3: `Tc Tw Tz TL Tf Tr Ts`) as a
+  field of `GraphicsState` — these genuinely are graphics-state parameters (saved/restored by
+  `q`/`Q`), unlike the text object's `Tm`/`Tlm` matrices, which the interpreter keeps as its own
+  fields, reset only at `BT`.
+- `src/render/native/interpreter.rs`: added the text-positioning (`Td TD Tm T*`), text-state
+  (`Tc Tw Tz TL Tr Ts`, `BT`/`ET`), and text-showing (`Tj TJ '` `"`) operators, plus the actual
+  per-glyph paint path for all three font kinds. This required a structural change: `Interpreter`
+  now borrows its `Pixmap`/warnings `Vec` (`&mut`, two lifetimes) instead of owning them, so a
+  Type 3 glyph's `CharProc` can be interpreted by a **recursively nested `Interpreter` instance**
+  sharing the same underlying raster/warning sink, bounded by `font::MAX_TYPE3_DEPTH` (6) against
+  a self-referential/mutually-recursive Type 3 font (untrusted input — a `CharProc` is itself a
+  content stream that can, in principle, `Tf` a different Type 3 font and show more text).
+
+### Scope implemented (ISO 32000-1 Chapter 9)
+
+Text state (`Tc Tw Tz TL Tf Tr Ts`, 9.3) and text objects (`BT`/`ET`, 9.4.1); text positioning
+(`Td TD Tm T*`, 9.4.2); text showing (`Tj TJ '` `"`, 9.4.3) with the full advance-width formula
+(9.4.4: `Tc`/`Tw`/`Tz` and `TJ` numeric adjustments; `Tw` correctly restricted to the single-byte
+code `32` case). Three font kinds:
+
+- **Simple TrueType/OpenType fonts** (9.6.3): code → Unicode via the same WinAnsi-ish fallback
+  table `crate::editor::text_extract` already uses for extraction (`crate::font::encoding`) →
+  glyph ID via the embedded font's own `cmap`.
+- **Composite (Type 0/CIDFontType2) fonts** (9.7), including CJK: glyph selection reuses
+  `crate::font::cid::CompositeFont`'s own `Identity-H`, 2-byte-code, code-is-CID-is-original-GID
+  conventions (honoring an explicit `/CIDToGIDMap` stream if present, else identity) — the writer
+  and this reader are different code paths (one authors PDFs, the other interprets arbitrary
+  ones) but agree on the same on-disk contract.
+- **Type 3 fonts** (9.6.5): each glyph's `CharProc` content stream is interpreted recursively
+  through the very same interpreter (see above), with the glyph-space-to-device-space transform
+  computed as `FontMatrix × [Tfs·Tz 0 0 Tfs 0 Ts] × Tm × CTM` per 9.4.4/9.6.5.2. `d0`/`d1` are
+  recognized (operands consumed, not flagged `UnsupportedOperator`) but not acted on — glyph
+  advance is sourced from `/Widths` instead, and `d1`'s optional glyph-bbox clip is skipped.
+
+### Explicit, honest gaps (recorded as structured warnings, not silently faked) — verifier: read this
+
+- **Type1 and bare/un-wrapped CFF embedded font programs remain a hard, structural gap** — the
+  exact one §8a called out in advance. `ttf-parser` (this crate's only font-parsing dependency)
+  requires an `sfnt`/OpenType table directory; it cannot parse a raw Type1 `PFA`/`PFB` program or
+  a `FontFile3` stream whose `/Subtype` is `/Type1C`/`/CIDFontType0C` (bare CFF, not
+  OpenType-wrapped). This phase attempts to load *every* embedded font program regardless of
+  which `FontFile*` key it came from (`font::load_font_program`) and only classifies the result
+  as this gap if the load genuinely fails — an OpenType-wrapped CFF program is **not** part of
+  this gap, since `ttf-parser` truly parses those. When it is the gap: no glyph is painted for
+  that font (but its declared `/Widths`/`/W` still advance the pen, so surrounding text doesn't
+  visually collapse), `RenderWarning::UnsupportedFontProgram` is recorded once per resource name,
+  and — this is the part the verifier is specifically asked to check — this is **not** claimed as
+  "supported": see `src/render/native/font.rs`'s and `mod.rs`'s module docs, plus the dedicated
+  regression test `text_tests::type1_bare_cff_font_fails_gracefully_not_panicking` (asserts *no*
+  ink painted in the glyph's would-be bounding box, a `RenderWarning::UnsupportedFontProgram`
+  naming the gap, and — critically — that the *rest* of the page still renders, i.e. this is a
+  graceful per-font failure, not a whole-render abort).
+- **Non-embedded fonts are also not rendered** — this phase has no standard/system-font
+  substitution database at all (unlike Pdfium). Any font (any `/Subtype`, including TrueType)
+  with no `FontFile`/`FontFile2`/`FontFile3` fails the same way as the Type1/CFF gap above. This
+  is a distinct, separately-tracked gap (`font::UnsupportedFontReason::NotEmbedded`) — "no
+  charstring interpreter" and "no font-substitution logic" are two different missing pieces, not
+  one.
+- **Only horizontal writing mode** — vertical CID fonts (`Identity-V` and similar) are not
+  detected; glyphs are always positioned as if horizontal.
+- **Only 2-byte codes are assumed for every composite (Type 0) font** — the same simplification
+  already shipped (and documented) in `crate::editor::text_extract`, since this crate's own
+  writer (`crate::font::cid`) only ever emits `Identity-H`.
+- **`/Encoding` `/Differences` and symbolic (non-Unicode-`cmap`) simple fonts** are not specially
+  resolved — same documented gap as `text_extract` (needs the Adobe Glyph List, not implemented).
+- **Text clipping render modes** (`Tr` 4-7) paint like their non-clipping counterpart (0-3) but do
+  not add glyph outlines to the clip path.
+- Every gap §8a already disclosed (images/XObjects, shadings/patterns, non-Device color spaces,
+  JBIG2/JPX, ICC color management, transparency groups/blend modes, skewed-CTM stroke
+  approximation) is unchanged by this phase.
+
+None of the above raise a hard `NativeRenderError` — the render still completes and paints every
+glyph/pixel this phase does know how to paint.
+
+### Untrusted input handling (additions this phase)
+
+Beyond everything §8a already covers: Type 3 recursion is bounded (`font::MAX_TYPE3_DEPTH` = 6,
+tested by `text_tests::type3_self_referential_charproc_is_bounded_not_infinite`, a font whose own
+`CharProc` shows text using itself); `/W` array range-form expansion is capped at 65,536 entries
+per range (`font::parse_w_array`, tested by
+`font::tests::w_array_range_form_is_bounded_against_a_huge_range`) against a crafted
+`0 4294967295 500`-style entry trying to force a multi-billion-entry `BTreeMap`; glyph outline
+extraction goes through the same `catch_unwind` defense-in-depth `TrueTypeFont::load` already
+uses, since embedded font bytes are attacker-controlled.
+
+### Tests
+
+`src/render/native/text_tests.rs` (5 tests) — the phase's Definition-of-Done tests, each
+rendering a real content stream through `render_content_stream` and asserting actual non-
+background ink pixels land inside the expected glyph bounding box (not just "didn't panic"):
+TrueType simple-font glyph (a hand-built font with a genuine, non-empty square `glyf` outline —
+deliberately *not* reusing `truetype.rs`'s zero-contour `build_test_font` fixture, since an empty
+outline can't prove ink actually landed anywhere), composite/CID CJK glyph (against the real,
+OFL-licensed `tests/fixtures/fonts/NotoSansSC-Subset.ttf` fixture, reusing
+`crate::font::cid::CompositeFont::encode` for the content-stream bytes), a Type 3 `CharProc`
+glyph, a bounded-self-recursion Type 3 font, and the Type1/bare-CFF graceful-failure test
+described above. Plus new unit tests in `font.rs` (10) and `glyph.rs` (2), and two updated tests
+in `mod.rs` (the old "text is unsupported" test was replaced with one showing `Do` is still
+unsupported, plus a new one for a `Tf` naming a missing font resource).
 
 ## 9. The Tauri command layer (`tauri_commands/`)
 

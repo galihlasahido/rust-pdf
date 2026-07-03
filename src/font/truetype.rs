@@ -410,6 +410,47 @@ impl TrueTypeFont {
     pub fn is_serif(&self) -> bool {
         self.is_serif
     }
+
+    /// Extracts glyph `gid`'s outline (ISO 32000-1:2008 9.6.5/9.7 glyph
+    /// shapes; the underlying `glyf` or `CFF` table, whichever this font
+    /// actually has -- see [`flavor`](Self::flavor)) into `builder`, in
+    /// unscaled font design units (divide by [`units_per_em`](Self::units_per_em)
+    /// to get text-space-relative glyph-space units, ISO 32000-1 9.2.4).
+    ///
+    /// Returns `None` if the font could not be re-parsed (see
+    /// [`face`](Self::face) -- not expected in practice, since `data` was
+    /// already successfully parsed once by [`load`](Self::load)), or if
+    /// `gid` has no outline (e.g. `.notdef`, a whitespace glyph, a
+    /// bitmap/color-only glyph this phase doesn't rasterize, or `gid`
+    /// beyond [`num_glyphs`](Self::num_glyphs)) -- callers should treat
+    /// `None` as "paint nothing for this glyph", not an error.
+    ///
+    /// # Untrusted input
+    ///
+    /// `gid`/the font bytes are attacker-controlled (an embedded
+    /// `FontFile2`/`FontFile3` from an untrusted PDF). `ttf-parser`'s
+    /// public API is documented as panic-free, but per
+    /// [`FontLoadError::Panicked`]'s doc comment this crate has already
+    /// found malformed inputs that trip an internal `debug_assert!`
+    /// instead of returning `Err`/`None`; the same defense-in-depth
+    /// `catch_unwind` wrapper used there is applied here too. As there,
+    /// `AssertUnwindSafe` is sound because the closure only reads `self`/
+    /// `gid` and writes to `builder` through the `OutlineBuilder` trait
+    /// object -- a panic mid-outline cannot leave any of those in an
+    /// observably-inconsistent state that could violate an invariant
+    /// elsewhere (the caller simply discards whatever partial path
+    /// `builder` accumulated, same as for a clean `None`).
+    pub fn outline_glyph(
+        &self,
+        gid: u16,
+        builder: &mut dyn ttf_parser::OutlineBuilder,
+    ) -> Option<ttf_parser::Rect> {
+        let face = self.face()?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            face.outline_glyph(ttf_parser::GlyphId(gid), builder)
+        }))
+        .unwrap_or(None)
+    }
 }
 
 fn find_name(face: &ttf_parser::Face<'_>, name_id: u16) -> Option<String> {
