@@ -1,17 +1,36 @@
-//! Page rasterization: renders PDF pages to RGBA raster buffers suitable
-//! for display in a desktop viewer (e.g. a Tauri `<canvas>`/GPU texture).
+//! Page rasterization: renders PDF pages to raster buffers suitable for
+//! display in a desktop viewer (e.g. a Tauri `<canvas>`/GPU texture).
 //!
-//! This module is gated behind the `render` Cargo feature and is a thin,
-//! safety-checked wrapper around Google's Pdfium engine via the
-//! [`pdfium-render`](https://docs.rs/pdfium-render) FFI binding. It does
-//! **not** contain a content-stream interpreter of its own: rasterization
-//! (path fill/stroke, glyph rendering, clipping, transparency groups/blend
-//! modes per ISO 32000-1 §11, and color space conversion per ISO 32000-1
-//! §8.6) is performed entirely inside the native `libpdfium` binary.
+//! As of this migration phase, this module offers **two independent,
+//! coexisting rendering backends** behind two separate Cargo features:
 //!
-//! # Native vs. FFI rendering decision
+//! - `render`: [`PdfRenderer`]/[`PdfiumLibrary`], a thin, safety-checked
+//!   FFI wrapper around Google's Pdfium engine (see "Native vs. FFI
+//!   rendering decision" below for why this exists and its trade-offs).
+//!   Rasterization happens entirely inside the native `libpdfium` binary;
+//!   this module contains no content-stream interpreter of its own for
+//!   this backend.
+//! - `native-render`: [`native`], a from-scratch, pure-Rust content-stream
+//!   interpreter and rasterizer (backed by `tiny-skia`) with **no native
+//!   binary or FFI dependency at all**. This is a currently-in-progress
+//!   migration away from the Pdfium/FFI decision below, explicitly
+//!   accepting the compatibility/performance trade-offs that decision was
+//!   written to avoid. See [`native`]'s module docs for exactly what is
+//!   (and, honestly, is not yet) implemented.
+//!
+//! Both features can be enabled at once; neither replaces the other yet.
+//! Callers should currently prefer `render` (Pdfium) for real-world PDF
+//! compatibility and use `native-render` only where a pure-Rust dependency
+//! chain is a hard requirement and the current phase's gaps (see
+//! [`native`]'s docs) are acceptable.
+//!
+//! # Native vs. FFI rendering decision (the *original* `render`/Pdfium choice)
 //!
 //! **Decision: FFI to Pdfium, not a from-scratch Rust rasterizer.**
+//!
+//! This section is kept as a historical record of that decision's
+//! reasoning; it is no longer the *only* option -- see `native-render`
+//! above for the pure-Rust alternative now being built out.
 //!
 //! `rust-pdf` already contains a full PDF *object model, parser, and
 //! writer*. Rendering, however, is a fundamentally different engineering
@@ -145,10 +164,20 @@
 //! # fn main() {}
 //! ```
 
+#[cfg(feature = "render")]
 mod cache;
+#[cfg(feature = "render")]
 mod renderer;
 
+#[cfg(feature = "render")]
 pub use renderer::{PdfRenderer, PdfiumLibrary};
+
+/// A pure-Rust content-stream interpreter and 2D rasterizer (no native
+/// binary/FFI dependency), gated behind the `native-render` Cargo feature.
+/// See its module docs for the current phase's scope and its explicitly
+/// documented gaps.
+#[cfg(feature = "native-render")]
+pub mod native;
 
 /// Rendered page/tile output.
 ///
@@ -159,6 +188,7 @@ pub use renderer::{PdfRenderer, PdfiumLibrary};
 /// upload. This is the *same* `image` crate version `pdfium-render` itself
 /// uses internally (both depend on `image = "0.25"`), so no extra
 /// conversion or copy is needed at the FFI boundary.
+#[cfg(feature = "render")]
 pub type RgbaImage = image::RgbaImage;
 
 /// The maximum number of pixels (`width * height`) a single
@@ -170,6 +200,7 @@ pub type RgbaImage = image::RgbaImage;
 /// worst-case memory use against a malicious `/MediaBox` combined with a
 /// large caller-requested DPI. See the "Untrusted input handling" section
 /// of the module documentation.
+#[cfg(feature = "render")]
 pub const MAX_RENDER_PIXELS: u64 = 64_000_000;
 
 /// A device-pixel sub-rectangle of a page rendered at a given DPI.
@@ -186,6 +217,7 @@ pub const MAX_RENDER_PIXELS: u64 = 64_000_000;
 /// own bitmap coordinate system, are conventionally addressed) — *not*
 /// PDF user-space points, whose origin is bottom-left (ISO 32000-1
 /// §8.3.2.3).
+#[cfg(feature = "render")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
     /// Left offset of the viewport, in device pixels from the page's
@@ -200,6 +232,7 @@ pub struct Viewport {
     pub height: u32,
 }
 
+#[cfg(feature = "render")]
 impl Viewport {
     /// Creates a new [`Viewport`] rectangle.
     pub fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
@@ -212,7 +245,7 @@ impl Viewport {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "render"))]
 mod tests {
     use super::*;
 

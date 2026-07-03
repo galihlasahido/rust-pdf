@@ -482,6 +482,114 @@ versioned copy — read that first; this is a summary for anyone auditing the re
   in a later "Large-File Render Benchmark" remediation phase, not present at the time this section
   was first written).
 
+## 8a. Pure-Rust rendering migration, phase 1: "Content-Stream Interpreter Core" (implemented)
+
+**This is a live migration in progress, not a completed replacement of §8.** The user has
+explicitly requested moving off Pdfium/FFI to a pure-Rust renderer, accepting the compatibility
+and performance trade-offs §8 documented as the reason Pdfium was originally chosen. `render`
+(Pdfium/FFI) and `native-render` (pure Rust) now **coexist** behind two separate, independently
+optional Cargo features; nothing in §8 was removed, and `PdfRenderer`/`PdfiumLibrary` are
+unchanged.
+
+**Decision for the pure-Rust path: `tiny-skia` (2D rasterizer, BSD-3-Clause — note: not
+MIT/Apache-2.0 as originally suggested when this migration was requested; still pure Rust, no
+native/FFI dependency, which is the actual hard requirement) for rasterization; `ttf-parser`
+(already a dependency, `fonts` feature) is reserved for a later font-outline phase — no text
+operators are implemented yet.**
+
+### What was built this phase
+
+- `src/render/native/` (new module, `native-render` feature = `dep:tiny-skia` + `parser`):
+  - `interpreter.rs`: the content-stream interpreter loop. Reuses the existing, already-tested
+    generic content-stream tokenizer (`src/editor/content_stream.rs`'s `parse_content_stream`/
+    `ContentItem`, widened from module-private to `pub(crate)` so `render::native` — a sibling of
+    `editor`, not a descendant — can reach it; no behavior change to that tokenizer).
+  - `state.rs`: `GraphicsState`/`GraphicsStateStack` (the `q`/`Q` save/restore stack, ISO 32000-1
+    8.4.2), bounded at `MAX_GRAPHICS_STATE_DEPTH` (4096) against a "q-flood" memory-exhaustion
+    attempt from a crafted content stream.
+  - `path.rs`: device-space path accumulation for `m l c v y h re`. Path coordinates are
+    transformed to device space via the CTM *at the time each construction operator executes*
+    (matching how most content-stream interpreters behave, and correctly handling the rare but
+    spec-legal case of `cm` appearing mid-path), so painting always hands `tiny-skia` an
+    already-device-space path with an identity transform.
+  - `color.rs`: DeviceGray/DeviceRGB/DeviceCMYK → `tiny_skia::Color` only. CMYK→RGB uses the
+    naive, non-ICC formula ISO 32000-1 8.6.5.3 itself gives as the default conversion
+    (`red = 1 - min(1, C+K)` etc.) — explicitly **not** ICC color management.
+  - `error.rs`: `NativeRenderError` (hard failures: invalid dimensions, degenerate `/MediaBox`,
+    graphics-state stack overflow) and `RenderWarning` (soft/recoverable: unsupported operator,
+    missing `ExtGState` resource, invalid dash pattern, truncated content stream, unbalanced `Q`)
+    — every one of these is a structured, non-panicking outcome; see the untrusted-input handling
+    below.
+  - `mod.rs`: `render_content_stream(content, width, height, media_box, resources) ->
+    Result<NativeRenderOutput { pixmap: tiny_skia::Pixmap, warnings: Vec<RenderWarning> },
+    NativeRenderError>`.
+
+### Scope implemented (ISO 32000-1 Chapter 8)
+
+Graphics-state stack (`q`/`Q`, 8.4.2) and CTM (`cm`, 8.3.4); path construction (`m l c v y h re`,
+8.5.2) and painting (`f F f* S s B B* b b* n`, 8.5.3); clipping (`W`/`W*`, 8.5.4, via an 8-bit
+`tiny_skia::Mask`); a basic `ExtGState` subset (`gs` reading only `ca`/`CA`/`LW`/`D`, 8.4.5); line
+style (`w J j M d`, 8.4.3); and DeviceGray/DeviceRGB/DeviceCMYK color only (`g G rg RG k K`,
+8.6.3-8.6.5).
+
+### Explicit, honest gaps (recorded as structured warnings, not silently faked) — verifier: read this
+
+Per the task's explicit instruction, the following are **known, disclosed gaps**, not claimed as
+"done":
+
+- **No text rendering at all yet** (`Tj TJ ' " BT ET Tf Td Tm ...`) — every text-showing operator
+  is recorded as `RenderWarning::UnsupportedOperator` and skipped; a text-only page currently
+  rasterizes to a blank (background-only) page.
+- **No images or Form XObjects** (`Do`, inline images `BI`/`ID`/`EI`) — not painted.
+- **No shadings/patterns** (`sh`, Pattern color space).
+- **No non-Device color spaces** (`cs`/`CS`/`sc`/`SC`/`scn`/`SCN`: CalGray/CalRGB/Lab/ICCBased/
+  Indexed/Separation/DeviceN) — selecting one leaves the current color unchanged and warns,
+  rather than guessing an approximate conversion.
+- **JBIG2 / JPX (JPEG2000)** — there is no mature pure-Rust decoder for either anywhere in the
+  ecosystem today. No image decoding of any kind happens yet this phase, so there is no code path
+  for this gap yet, but it is recorded here because it will remain a **hard, structural gap** in a
+  later image-painting phase: such images must fail closed (structured error/placeholder), never
+  silently blank or panic.
+- **Type1/CFF embedded font programs** — no mature pure-Rust Type1/CFF *charstring interpreter*
+  exists in the ecosystem today (`ttf-parser` parses CFF *tables*, not charstrings, and this
+  phase doesn't wire up any glyph outline extraction at all yet). A later text-rendering phase
+  must fail closed for glyphs it cannot shape.
+- **ICC color management** — not implemented; the CMYK conversion above is the spec's own naive
+  fallback formula, not profile-based color management.
+- **Transparency groups/blend modes** (Chapter 11) beyond flat constant alpha (`ca`/`CA`) — not
+  implemented.
+- **Non-uniform-scale/skewed CTM effect on stroke width and dash length** — approximated by the
+  CTM's uniform scale factor (`sqrt(|det(CTM)|)`); a heavily skewed CTM will not produce the
+  spec-exact elliptical stroke pen. Documented as an intentional phase-1 simplification, not
+  claimed as spec-exact.
+
+None of the above cause a hard error or a panic — the render completes and paints everything this
+phase does support; only structurally-impossible requests (zero-size output, degenerate
+`/MediaBox`, a `q`-flood past `MAX_GRAPHICS_STATE_DEPTH`) are hard `NativeRenderError`s.
+
+### Untrusted input handling
+
+Content-stream bytes are untrusted. No `unwrap()`/`expect()` on stream-derived data (malformed or
+non-finite numeric operands are rejected per-operator via `nums`/`as_f64` and that one operator
+invocation is skipped, not the whole render); `q`/`Q` stack depth is capped
+(`MAX_GRAPHICS_STATE_DEPTH`); the collected-warnings list is capped (`MAX_WARNINGS` = 1000)
+against a content stream consisting of millions of unsupported operators; non-finite
+(`NaN`/`Infinity`) coordinates are sanitized to a finite fallback before reaching the rasterizer,
+and `tiny-skia` itself additionally refuses (logs, does not panic) to rasterize path geometry
+whose magnitude would overflow its internal math.
+
+### Tests
+
+`src/render/native/mod.rs`'s `tests` module: 13 tests rendering real content-stream byte strings
+through the new interpreter and asserting actual pixel colors/positions (not just "didn't panic")
+— colored rectangle fill/position, DeviceGray, DeviceCMYK, `q`/`Q` color and CTM isolation, a
+stroked line, even-odd fill creating a hole, a clip rectangle restricting a full-canvas fill,
+`ExtGState` alpha blending, an unsupported (text) operator degrading to a warning without
+aborting the rest of the stream, and three adversarial-input cases (zero/degenerate dimensions, a
+`q`-flood, truncated trailing bytes) asserting structured errors/warnings rather than a panic.
+Plus unit tests in `color.rs` (7), `path.rs` (4), `state.rs` (4), `interpreter.rs` (4) for the
+individual building blocks. See §10-equivalent test run output in the task report for this phase.
+
 ## 9. The Tauri command layer (`tauri_commands/`)
 
 New top-level module since the original audit (7 files, 2,865 lines), gated by the `tauri`

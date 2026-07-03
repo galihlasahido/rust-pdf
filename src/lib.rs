@@ -76,7 +76,7 @@ pub mod object;
 pub mod page;
 #[cfg(feature = "parser")]
 pub mod parser;
-#[cfg(feature = "render")]
+#[cfg(any(feature = "render", feature = "native-render"))]
 pub mod render;
 #[cfg(feature = "signatures")]
 pub mod signatures;

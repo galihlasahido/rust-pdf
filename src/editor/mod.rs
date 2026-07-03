@@ -60,7 +60,12 @@
 mod annotations;
 mod audit;
 mod content_ops;
-mod content_stream;
+// `pub(crate)` (not private) so `crate::render::native` (feature
+// `native-render`) can reuse this generic content-stream tokenizer instead
+// of re-implementing its own ISO 32000-1 7.8.2 operand grammar. The
+// individual items were already `pub(crate)`; only the module path itself
+// needed widening. No behavior change.
+pub(crate) mod content_stream;
 mod forms;
 mod graph;
 pub mod icc;
