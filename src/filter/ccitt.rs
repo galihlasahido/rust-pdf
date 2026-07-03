@@ -402,6 +402,16 @@ fn coding_line_push_run(_coding_line: &mut [i32], _b2: i32, _a0_is_black: bool) 
 
 /// Renders one decoded row (list of changing-element positions, starting
 /// with a white run) into packed 1bpp bytes.
+///
+/// ISO 32000-1:2008 Table 11's `BlackIs1` (default `false`) means: `0` bits
+/// represent black pixels and `1` bits represent white pixels (the "normal"
+/// convention, matching plain `DeviceGray` sample semantics where `0` =
+/// black); `BlackIs1 = true` reverses that (`1` = black, `0` = white). The
+/// output buffer starts zero-initialised, so exactly one of "this run's
+/// colour" vs. "the other colour" needs its bits explicitly set to `1` --
+/// whichever colour maps to `1` under `black_is_1` (i.e. this run's bits
+/// are set exactly when `is_black == black_is_1`; the other colour's runs
+/// are left at the already-correct `0`).
 fn render_row(coding_line: &[i32], columns: i32, row_bytes: usize, black_is_1: bool) -> Vec<u8> {
     let mut row = vec![0u8; row_bytes];
     let mut pos = 0i32;
@@ -409,8 +419,8 @@ fn render_row(coding_line: &[i32], columns: i32, row_bytes: usize, black_is_1: b
 
     for &change in coding_line {
         let change = change.clamp(0, columns);
-        if is_black {
-            set_bits(&mut row, pos, change, black_is_1);
+        if is_black == black_is_1 {
+            set_bits(&mut row, pos, change);
         }
         pos = change;
         is_black = !is_black;
@@ -422,12 +432,7 @@ fn render_row(coding_line: &[i32], columns: i32, row_bytes: usize, black_is_1: b
     row
 }
 
-fn set_bits(row: &mut [u8], start: i32, end: i32, black_is_1: bool) {
-    if !black_is_1 {
-        // Default: 0 = black. Row is zero-initialised, so black pixels are
-        // already correct; we only need to set bits for BlackIs1 = true.
-        return;
-    }
+fn set_bits(row: &mut [u8], start: i32, end: i32) {
     for px in start.max(0)..end {
         let byte_idx = (px / 8) as usize;
         let bit_idx = 7 - (px % 8);
@@ -523,7 +528,41 @@ mod tests {
             encoded_byte_align: false,
         };
         let out = decode_ccitt(&data, params).unwrap();
-        assert_eq!(out, vec![0x00, 0x00]);
+        // BlackIs1 = false (default) is the "normal" convention: 0 = black,
+        // 1 = white (ISO 32000-1 Table 11) -- an all-white row is all 1
+        // bits, i.e. 0xFF per byte.
+        assert_eq!(out, vec![0xFF, 0xFF]);
+    }
+
+    /// Regression test for a real bug this phase fixed: the row renderer
+    /// used to only ever set bits for *black* runs and only when
+    /// `BlackIs1` was `true`, meaning a white run's pixels (which need bit
+    /// `1` under the default, far more common `BlackIs1 = false`) were
+    /// never actually set -- every row decoded as all-zero regardless of
+    /// its real black/white content whenever `BlackIs1` was left at its
+    /// default. A mixed white-then-black row makes that bug immediately
+    /// visible (both halves would come out identical/all-black instead of
+    /// visibly different).
+    #[test]
+    fn white_then_black_row_produces_distinguishable_halves_by_default() {
+        // 16 columns, Horizontal mode: white run of 8, then black run of 8.
+        let mut bits = String::new();
+        bits.push_str("001"); // Horizontal
+        bits.push_str("10011"); // white run length 8 (WHITE_TERMINATING)
+        bits.push_str("000101"); // black run length 8 (BLACK_TERMINATING)
+        let data = bits_to_bytes(&bits);
+
+        let params = CcittParams {
+            k: -1,
+            columns: 16,
+            rows: 1,
+            black_is_1: false,
+            encoded_byte_align: false,
+        };
+        let out = decode_ccitt(&data, params).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], 0xFF, "first 8 columns (white run) must be all 1 bits");
+        assert_eq!(out[1], 0x00, "last 8 columns (black run) must be all 0 bits");
     }
 
     #[test]

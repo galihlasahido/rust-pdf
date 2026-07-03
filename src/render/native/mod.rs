@@ -43,6 +43,34 @@
 //! See the `interpreter`/`font`/`glyph` submodules' docs for the exact
 //! operator dispatch table and font-resolution rules.
 //!
+//! # Current phase: "Color Spaces & Images"
+//!
+//! Building on the above, this phase adds:
+//!
+//! - **Indexed** and **Separation**/**DeviceN** colour spaces (ISO
+//!   32000-1:2008 §8.6.6.3-§8.6.6.5) via the `cs`/`CS`/`sc`/`SC`/`scn`/
+//!   `SCN` operators, including real evaluation (not a stub) of the
+//!   Separation/DeviceN tint-transform function -- Types 0 (Sampled), 2
+//!   (Exponential), 3 (Stitching) and 4 (PostScript calculator); see
+//!   [`function`]'s docs for the operator subset Type 4 implements.
+//! - **ICCBased** colour spaces -- **approximated**, not colour-managed:
+//!   resolved to `/Alternate` if present, else a heuristic guess from
+//!   `/N`. There is no mature pure-Rust ICC engine this crate could
+//!   adopt; see [`colorspace`]'s docs for exactly what "approximated"
+//!   means here and [`error::RenderWarning::IccColorApproximated`] for how
+//!   this is surfaced to callers (never silently claimed as accurate).
+//! - Image XObjects (`Do`) and inline images (`BI`/`ID`/`EI`), wired to
+//!   the filter decoders already implemented in [`crate::filter`] (reused,
+//!   not reimplemented) -- see [`image`]'s docs for the exact scope,
+//!   including the **explicit, hard gap**: `JBIG2Decode` and `JPXDecode`
+//!   have no mature pure-Rust decoder in this ecosystem, so those images
+//!   render as a documented, structured placeholder (never silently
+//!   blank, never a panic) -- see [`image`] and
+//!   [`error::RenderWarning::UnsupportedImageFilter`].
+//!
+//! See the `colorspace`/`function`/`image` submodules' docs for full
+//! detail.
+//!
 //! # Explicit, honest gaps (not implemented, not silently faked)
 //!
 //! The following are **out of scope for this phase** and are recorded as
@@ -89,28 +117,36 @@
 //!   non-clipping counterpart (0-3) but do not add glyph outlines to the
 //!   clip path -- an intentional simplification (see
 //!   `state::TextState::render_mode`'s docs), not silent data loss.
-//! - **Images and Form XObjects** (`Do`, plus inline images `BI`/`ID`/`EI`)
-//!   -- not painted; recorded as warnings.
-//! - **Shadings** (`sh`) and **Patterns** -- not painted.
-//! - **Non-Device color spaces** (`cs`/`CS`/`sc`/`SC`/`scn`/`SCN`):
-//!   CalGray, CalRGB, Lab, ICCBased, Indexed, Separation, DeviceN are not
-//!   implemented this phase. Selecting one leaves the current fill/stroke
-//!   color unchanged and records a warning -- it does **not** attempt an
-//!   approximate conversion, to avoid silently producing plausible-looking
-//!   but wrong colors.
-//! - **JBIG2 and JPX (JPEG2000)** image filters -- there is no mature
-//!   pure-Rust decoder for either in the ecosystem today. This phase
-//!   doesn't decode any images at all (see above), so this gap doesn't yet
-//!   have a code path to speak of, but it is called out here because it
-//!   will remain a **hard, structural gap** even once image painting is
-//!   implemented in a later phase: such images must fail closed (a
-//!   placeholder/structured error), not silently blank or panic.
-//! - **ICC color management** -- the CMYK->RGB conversion this phase does
-//!   have (`color::device_cmyk`) is the naive, non-color-managed formula
-//!   ISO 32000-1 8.6.5.3 itself documents as the fallback conversion, not
-//!   true ICC-profile-based color management. There is no mature pure-Rust
-//!   ICC engine this crate has adopted. Accurate/perceptual color
-//!   reproduction against a specific ICC profile remains unimplemented.
+//! - **Form XObjects** (`Do` naming a `/Subtype /Form` XObject) -- still
+//!   not painted this phase (only *image* XObjects are); recorded as
+//!   [`RenderWarning::FormXObjectUnsupported`].
+//! - **Shadings** (`sh`) and **Patterns** -- not painted. `scn`/`SCN`
+//!   naming a Pattern colour records
+//!   [`RenderWarning::PatternColorUnsupported`] and leaves the current
+//!   colour unchanged.
+//! - **Lab colour space** -- not implemented (would need CIE L\*a\*b\* ->
+//!   device-RGB conversion this phase doesn't have); resolves to
+//!   [`colorspace::ColorSpace::Unsupported`], recorded as
+//!   [`RenderWarning::UnsupportedColorSpace`]. CalGray/CalRGB, by
+//!   contrast, *are* handled -- approximated as their Device equivalent
+//!   with no gamma/white-point calibration applied (a minor, common
+//!   simplification, not separately warned about).
+//! - **No soft-mask (`/SMask`) or explicit-mask (`/Mask`) image
+//!   compositing** -- every image this phase paints is fully opaque (or,
+//!   for `/ImageMask`, binary transparent/opaque); a companion
+//!   soft-mask/alpha image is not applied. See [`image`]'s docs.
+//! - **ICC color management** -- ICCBased colour spaces are
+//!   *approximated* (resolved to `/Alternate` or an `/N`-based heuristic
+//!   guess -- see [`colorspace`]'s docs), not colour-managed; there is no
+//!   mature pure-Rust ICC engine this crate has adopted. Likewise, the
+//!   CMYK->RGB conversion this phase uses for DeviceCMYK
+//!   (`color::device_cmyk`) is the naive, non-color-managed formula ISO
+//!   32000-1 8.6.5.3 itself documents as the fallback conversion. Neither
+//!   is true ICC-profile-based color management; accurate/perceptual
+//!   color reproduction against a specific ICC profile remains
+//!   unimplemented, and is recorded once via
+//!   [`RenderWarning::IccColorApproximated`] whenever an ICCBased space is
+//!   actually used.
 //! - **Transparency groups and blend modes** (ISO 32000-1 Chapter 11)
 //!   beyond flat constant alpha (`ca`/`CA`) -- not implemented.
 //! - **Non-uniform-scale/skewed stroke width and dash length** -- this
@@ -184,10 +220,14 @@
 //! # fn main() {}
 //! ```
 
+mod bits;
 mod color;
+mod colorspace;
 mod error;
 mod font;
+mod function;
 mod glyph;
+mod image;
 mod interpreter;
 mod path;
 mod state;
@@ -207,6 +247,8 @@ pub use interpreter::{render_content_stream, NativeRenderOutput, MAX_GRAPHICS_ST
 /// dependency (e.g. this crate's own `images` feature, if enabled).
 pub use tiny_skia::Pixmap;
 
+#[cfg(test)]
+mod image_integration_tests;
 #[cfg(test)]
 mod text_tests;
 
@@ -356,9 +398,13 @@ mod tests {
         assert_eq!(a, 255);
     }
 
-    /// Test 10: Unsupported operators (image XObjects, this phase's `Do`)
-    /// are recorded as warnings and skipped, without aborting the rest of
-    /// the (graphics) content stream.
+    /// Test 10: `Do` naming an XObject resource that doesn't exist at all
+    /// (no `/Resources` supplied, here) is a warning, not a hard failure --
+    /// the rest of the (graphics) content stream still renders. (Image
+    /// XObjects that *do* resolve are now painted -- see the
+    /// `render::native::image` module's own tests -- this test now
+    /// exercises the "missing resource" gracefully-skipped path instead of
+    /// the old blanket "Do is unimplemented" gap it used to.)
     #[test]
     fn unsupported_operator_is_a_warning_not_a_failure() {
         let content = b"/Im1 Do 0 1 0 rg 0 0 200 200 re f";
@@ -368,7 +414,7 @@ mod tests {
         assert!(out
             .warnings
             .iter()
-            .any(|w| matches!(w, RenderWarning::UnsupportedOperator { operator } if operator == "Do")));
+            .any(|w| matches!(w, RenderWarning::MissingXObjectResource { name } if name == "Im1")));
     }
 
     /// Text-showing operators (`BT`/`Tf`/`Tj`/`ET`) are now implemented

@@ -91,10 +91,76 @@ pub enum RenderWarning {
         /// The operator keyword (e.g. `"Tj"`, `"Do"`, `"scn"`).
         operator: String,
     },
-    /// An inline image (`BI`...`ID`...`EI`, ISO 32000-1 8.9.7) was
-    /// encountered. Image/XObject painting is out of scope for this
-    /// phase; the inline image is skipped in its entirety.
-    InlineImageUnsupported,
+    /// A colour space named by `cs`/`CS`, or an image's `/ColorSpace`,
+    /// could not be resolved into something this phase can paint (an
+    /// unrecognised family such as `/Lab`, a malformed colour space
+    /// array/object, an unresolvable `/Resources /ColorSpace` name, or a
+    /// Separation/DeviceN whose tint-transform function
+    /// [`super::function`] could not parse -- see
+    /// [`super::colorspace::ColorSpace::Unsupported`]). The current
+    /// fill/stroke colour is left unchanged (for `cs`/`CS`/`sc`/`scn`) or
+    /// the image is skipped (for an image's `/ColorSpace`) rather than an
+    /// approximate/guessed colour being produced.
+    UnsupportedColorSpace {
+        /// Human-readable reason (see
+        /// `colorspace::ColorSpace::description`).
+        reason: String,
+    },
+    /// `scn`/`SCN` named a Pattern colour (ISO 32000-1 §8.7) -- Patterns
+    /// are out of scope this phase (see [`super`] module docs). The
+    /// current colour is left unchanged.
+    PatternColorUnsupported,
+    /// An `ICCBased` colour space (ISO 32000-1 §8.6.5.5) was resolved by
+    /// *approximation* (its `/Alternate` entry, or a heuristic guess from
+    /// `/N`) rather than true ICC colour management -- see
+    /// [`super::colorspace`]'s module docs for why. Recorded (at most
+    /// [`super::interpreter::MAX_WARNINGS`] times, like every other
+    /// warning) so callers can tell "accurate" from "approximated" colour
+    /// output rather than this being silently indistinguishable.
+    IccColorApproximated,
+    /// `Do` named an XObject resource not present in `/Resources
+    /// /XObject` (or no `resources` dictionary was supplied at all).
+    /// Nothing is painted for it.
+    MissingXObjectResource {
+        /// The resource name that could not be resolved.
+        name: String,
+    },
+    /// `Do` named an XObject resource whose `/Subtype` is `/Form` (or
+    /// anything other than `/Image`) -- Form XObjects are not painted this
+    /// phase (only image XObjects are; see [`super::image`]'s docs).
+    FormXObjectUnsupported {
+        /// The resource name this applies to.
+        name: String,
+    },
+    /// An image XObject or inline image's filter chain includes
+    /// `JBIG2Decode` or `JPXDecode` -- **there is no mature pure-Rust
+    /// decoder for either in the ecosystem today** (a hard, structural
+    /// gap, not a "didn't get to it yet" one; see [`super::image`]'s
+    /// module docs). The image area is left unpainted (a documented
+    /// placeholder, never silently blank without this warning, never a
+    /// panic).
+    UnsupportedImageFilter {
+        /// The resource name (or `"(inline)"` for an inline image) this
+        /// applies to.
+        name: String,
+        /// The unsupported filter name (`"JBIG2Decode"` or
+        /// `"JPXDecode"`).
+        filter: String,
+    },
+    /// An image XObject or inline image could not be decoded for a reason
+    /// *other* than the JBIG2/JPX gap above: a missing/invalid
+    /// `/Width`/`/Height`/`/BitsPerComponent`, a filter decode error (e.g.
+    /// corrupt JPEG data, or `CCITTFaxDecode` with the unimplemented
+    /// `K >= 0` variant -- see `crate::filter::ccitt`'s own documented
+    /// limitation), or decoded byte count that doesn't match the declared
+    /// geometry. The image area is left unpainted.
+    ImageDecodeFailed {
+        /// The resource name (or `"(inline)"` for an inline image) this
+        /// applies to.
+        name: String,
+        /// Human-readable failure reason.
+        reason: String,
+    },
     /// A `gs` operator named an `ExtGState` resource that was not found in
     /// `/Resources/ExtGState` (or no `resources` dictionary was supplied
     /// at all). Treated as a no-op: the graphics state is left unchanged.
@@ -158,8 +224,26 @@ impl std::fmt::Display for RenderWarning {
             RenderWarning::UnsupportedOperator { operator } => {
                 write!(f, "unsupported operator: {operator}")
             }
-            RenderWarning::InlineImageUnsupported => {
-                write!(f, "inline image (BI/ID/EI) unsupported this phase")
+            RenderWarning::UnsupportedColorSpace { reason } => {
+                write!(f, "unsupported colour space: {reason}")
+            }
+            RenderWarning::PatternColorUnsupported => {
+                write!(f, "Pattern colour space unsupported, colour left unchanged")
+            }
+            RenderWarning::IccColorApproximated => {
+                write!(f, "ICCBased colour space approximated (no ICC colour management), not colour-accurate")
+            }
+            RenderWarning::MissingXObjectResource { name } => {
+                write!(f, "Do referenced a missing XObject resource: /{name}")
+            }
+            RenderWarning::FormXObjectUnsupported { name } => {
+                write!(f, "Form XObject /{name} unsupported this phase, not painted")
+            }
+            RenderWarning::UnsupportedImageFilter { name, filter } => {
+                write!(f, "image /{name} uses unsupported filter {filter} (no pure-Rust decoder exists), painted as a placeholder")
+            }
+            RenderWarning::ImageDecodeFailed { name, reason } => {
+                write!(f, "image /{name} could not be decoded: {reason}")
             }
             RenderWarning::MissingExtGState { name } => {
                 write!(f, "ExtGState resource not found: /{name}")

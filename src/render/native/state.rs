@@ -7,6 +7,7 @@ use tiny_skia::{Color, LineCap, LineJoin, Mask};
 
 use crate::types::Matrix;
 
+use super::colorspace::ColorSpace;
 use super::font::ResolvedFont;
 
 /// The subset of ISO 32000-1 9.3 "Text State Parameters" this phase
@@ -101,6 +102,14 @@ pub(super) struct GraphicsState {
     pub ctm: Matrix,
     pub fill_color: Color,
     pub stroke_color: Color,
+    /// The colour space currently selected by `cs` (ISO 32000-1 §8.6.8),
+    /// consulted by `sc`/`scn` to interpret their raw numeric operands.
+    /// `Rc` so `q` (clone-on-push) stays O(1) regardless of how large the
+    /// resolved space is (e.g. an `Indexed` palette or a `Separation`'s
+    /// sampled tint-transform table).
+    pub fill_color_space: Rc<ColorSpace>,
+    /// As [`Self::fill_color_space`], but for `CS`/`SC`/`SCN` (stroking).
+    pub stroke_color_space: Rc<ColorSpace>,
     /// `ca` (ISO 32000-1 8.4.5 Table 58): constant, non-stroking alpha.
     pub fill_alpha: f32,
     /// `CA`: constant, stroking alpha.
@@ -138,6 +147,8 @@ impl GraphicsState {
             ctm: page_to_device,
             fill_color: Color::BLACK,
             stroke_color: Color::BLACK,
+            fill_color_space: Rc::new(ColorSpace::DeviceGray),
+            stroke_color_space: Rc::new(ColorSpace::DeviceGray),
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             // ISO 32000-1 Table 52 default: 1.0.

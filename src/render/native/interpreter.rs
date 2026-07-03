@@ -12,17 +12,23 @@
 //! - Clipping: `W W*` (8.5.4)
 //! - Basic ExtGState: `gs` for `ca`/`CA`/`LW`/`D` only (8.4.5)
 //! - Line style: `w J j M d` (8.4.3)
-//! - Basic color: `g G rg RG k K` (8.6.3-8.6.5, Device color spaces only)
+//! - Color: `g G rg RG k K` (Device spaces) plus `cs CS sc SC scn SCN`
+//!   (8.6.6-8.6.8: Indexed, Separation, DeviceN, ICCBased-approximated --
+//!   see [`super::colorspace`]). `scn`/`SCN` naming a Pattern colour is
+//!   recorded as a warning and leaves the colour unchanged (Patterns
+//!   remain out of scope).
 //! - Text state: `Tc Tw Tz TL Tf Tr Ts` (9.3), `BT ET` (9.4.1)
 //! - Text positioning: `Td TD Tm T*` (9.4.2)
 //! - Text showing: `Tj TJ '` `"` (9.4.3), including simple TrueType,
 //!   composite (Type 0/CID) and Type 3 glyph rendering -- see
 //!   [`super::font`] and [`super::glyph`].
+//! - Image XObjects (`Do`, §8.8) and inline images (`BI`/`ID`/`EI`, 8.9.7)
+//!   -- see [`super::image`], including the documented JBIG2/JPX gap.
 //!
-//! Everything else -- `Do` (XObjects/images), `sh` (shadings), `cs`/`CS`/
-//! `sc`/`SC`/`scn`/`SCN` (non-Device color spaces), marked content -- is
-//! recorded as [`RenderWarning::UnsupportedOperator`] and skipped as a
-//! no-op; it does **not** abort the render or panic.
+//! Everything else -- Form XObjects (`Do`), `sh` (shadings), Patterns,
+//! marked content -- is recorded as [`RenderWarning::UnsupportedOperator`]
+//! (or a dedicated variant) and skipped as a no-op; it does **not** abort
+//! the render or panic.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -31,12 +37,15 @@ use tiny_skia::{Color, FillRule, Mask, Paint, Pixmap, Stroke, StrokeDash, Transf
 
 use crate::editor::content_stream::{parse_content_stream, ContentItem};
 use crate::object::{Object, PdfDictionary};
+use crate::parser::InlineImage;
 use crate::types::{Matrix, Rectangle};
 
-use super::color as colorspace;
+use super::color as device_color;
+use super::colorspace::{self, ColorSpace};
 use super::error::{NativeRenderError, RenderWarning};
 use super::font::{self, FontProgram, ResolvedFont};
 use super::glyph::glyph_outline_path;
+use super::image::{self, ImageResult};
 use super::path::PathAccumulator;
 use super::state::{GraphicsState, GraphicsStateStack};
 
@@ -137,7 +146,7 @@ pub fn render_content_stream(
         for item in parse_content_stream(content) {
             match item {
                 ContentItem::Op { operator, operands } => interp.exec(&operator, &operands)?,
-                ContentItem::InlineImage(_) => interp.warn(RenderWarning::InlineImageUnsupported),
+                ContentItem::InlineImage(img) => interp.show_inline_image(&img),
                 ContentItem::Raw(_) => interp.warn(RenderWarning::TruncatedContentStream),
             }
         }
@@ -321,36 +330,76 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
                 }
             }
 
+            // `g`/`G`/`rg`/`RG`/`k`/`K` set *both* the current colour and
+            // the current colour space (ISO 32000-1 8.6.8: these operators
+            // implicitly select the corresponding Device colour space),
+            // so a later `sc`/`scn` with no intervening `cs` interprets
+            // its raw operands against the right space.
             "g" => {
                 if let Some(v) = nums(operands, 1) {
-                    self.gs.current_mut().fill_color = colorspace::device_gray(v[0], 1.0);
+                    let state = self.gs.current_mut();
+                    state.fill_color = device_color::device_gray(v[0], 1.0);
+                    state.fill_color_space = Rc::new(ColorSpace::DeviceGray);
                 }
             }
             "G" => {
                 if let Some(v) = nums(operands, 1) {
-                    self.gs.current_mut().stroke_color = colorspace::device_gray(v[0], 1.0);
+                    let state = self.gs.current_mut();
+                    state.stroke_color = device_color::device_gray(v[0], 1.0);
+                    state.stroke_color_space = Rc::new(ColorSpace::DeviceGray);
                 }
             }
             "rg" => {
                 if let Some(v) = nums(operands, 3) {
-                    self.gs.current_mut().fill_color = colorspace::device_rgb(v[0], v[1], v[2], 1.0);
+                    let state = self.gs.current_mut();
+                    state.fill_color = device_color::device_rgb(v[0], v[1], v[2], 1.0);
+                    state.fill_color_space = Rc::new(ColorSpace::DeviceRGB);
                 }
             }
             "RG" => {
                 if let Some(v) = nums(operands, 3) {
-                    self.gs.current_mut().stroke_color = colorspace::device_rgb(v[0], v[1], v[2], 1.0);
+                    let state = self.gs.current_mut();
+                    state.stroke_color = device_color::device_rgb(v[0], v[1], v[2], 1.0);
+                    state.stroke_color_space = Rc::new(ColorSpace::DeviceRGB);
                 }
             }
             "k" => {
                 if let Some(v) = nums(operands, 4) {
-                    self.gs.current_mut().fill_color = colorspace::device_cmyk(v[0], v[1], v[2], v[3], 1.0);
+                    let state = self.gs.current_mut();
+                    state.fill_color = device_color::device_cmyk(v[0], v[1], v[2], v[3], 1.0);
+                    state.fill_color_space = Rc::new(ColorSpace::DeviceCMYK);
                 }
             }
             "K" => {
                 if let Some(v) = nums(operands, 4) {
-                    self.gs.current_mut().stroke_color = colorspace::device_cmyk(v[0], v[1], v[2], v[3], 1.0);
+                    let state = self.gs.current_mut();
+                    state.stroke_color = device_color::device_cmyk(v[0], v[1], v[2], v[3], 1.0);
+                    state.stroke_color_space = Rc::new(ColorSpace::DeviceCMYK);
                 }
             }
+
+            "cs" => {
+                if let Some(Object::Name(name)) = operands.first() {
+                    self.set_color_space(name.as_str(), true);
+                } else {
+                    self.warn(RenderWarning::UnsupportedOperator {
+                        operator: "cs (malformed operand)".to_string(),
+                    });
+                }
+            }
+            "CS" => {
+                if let Some(Object::Name(name)) = operands.first() {
+                    self.set_color_space(name.as_str(), false);
+                } else {
+                    self.warn(RenderWarning::UnsupportedOperator {
+                        operator: "CS (malformed operand)".to_string(),
+                    });
+                }
+            }
+            "sc" => self.set_color_from_components(operands, true),
+            "SC" => self.set_color_from_components(operands, false),
+            "scn" => self.set_color_from_components_n(operands, true),
+            "SCN" => self.set_color_from_components_n(operands, false),
 
             "gs" => {
                 if let Some(Object::Name(name)) = operands.first() {
@@ -475,6 +524,17 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
                 }
             }
 
+            "Do" => {
+                if let Some(Object::Name(name)) = operands.first() {
+                    let name = name.as_str().to_string();
+                    self.do_xobject(&name)?;
+                } else {
+                    self.warn(RenderWarning::UnsupportedOperator {
+                        operator: "Do (malformed operand)".to_string(),
+                    });
+                }
+            }
+
             other => self.warn(RenderWarning::UnsupportedOperator {
                 operator: other.to_string(),
             }),
@@ -527,6 +587,219 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
                 }
             }
         }
+    }
+
+    /// `cs`/`CS` (ISO 32000-1 8.6.8): resolves `name` (a Device name or a
+    /// `/Resources /ColorSpace` entry) and resets the corresponding
+    /// current colour to that space's initial value.
+    fn set_color_space(&mut self, name: &str, fill: bool) {
+        let resolved = self.resolve_color_space_operand(name);
+        if resolved.is_unsupported() {
+            self.warn(RenderWarning::UnsupportedColorSpace {
+                reason: resolved.description(),
+            });
+        }
+        if matches!(resolved, ColorSpace::IccApproximated { .. }) {
+            self.warn(RenderWarning::IccColorApproximated);
+        }
+        let initial = resolved.initial_components();
+        let color = resolved.to_rgba(&initial, 1.0);
+        let rc = Rc::new(resolved);
+        let state = self.gs.current_mut();
+        if fill {
+            state.fill_color_space = rc;
+            if let Some(c) = color {
+                state.fill_color = c;
+            }
+        } else {
+            state.stroke_color_space = rc;
+            if let Some(c) = color {
+                state.stroke_color = c;
+            }
+        }
+    }
+
+    /// Resolves a `cs`/`CS` operand as either a bare Device name or a
+    /// `/Resources /ColorSpace /<name>` lookup, sharing
+    /// [`super::colorspace::resolve_color_space`]'s array/name grammar by
+    /// wrapping `name` as an [`Object::Name`] first.
+    fn resolve_color_space_operand(&self, name: &str) -> ColorSpace {
+        let obj = Object::Name(crate::object::PdfName::new_unchecked(name));
+        colorspace::resolve_color_space(&obj, self.resources)
+    }
+
+    /// `sc`/`SC` (ISO 32000-1 8.6.8): sets the current colour from raw
+    /// numeric operands, interpreted against the current colour space (set
+    /// by the most recent `cs`/`CS`, or a Device space's own operator).
+    fn set_color_from_components(&mut self, operands: &[Object], fill: bool) {
+        let comps: Vec<f64> = operands.iter().filter_map(as_f64).collect();
+        self.apply_color_components(&comps, fill);
+    }
+
+    /// `scn`/`SCN`: as `sc`/`SC`, but tolerates (and, since Patterns are
+    /// out of scope this phase, ignores-with-a-warning) a trailing Pattern
+    /// name operand (ISO 32000-1 8.6.8, Table 74).
+    fn set_color_from_components_n(&mut self, operands: &[Object], fill: bool) {
+        if matches!(operands.last(), Some(Object::Name(_))) {
+            self.warn(RenderWarning::PatternColorUnsupported);
+            return;
+        }
+        let comps: Vec<f64> = operands.iter().filter_map(as_f64).collect();
+        self.apply_color_components(&comps, fill);
+    }
+
+    fn apply_color_components(&mut self, comps: &[f64], fill: bool) {
+        let space = if fill {
+            self.gs.current().fill_color_space.clone()
+        } else {
+            self.gs.current().stroke_color_space.clone()
+        };
+        match space.to_rgba(comps, 1.0) {
+            Some(color) => {
+                let state = self.gs.current_mut();
+                if fill {
+                    state.fill_color = color;
+                } else {
+                    state.stroke_color = color;
+                }
+            }
+            None => self.warn(RenderWarning::UnsupportedColorSpace {
+                reason: space.description(),
+            }),
+        }
+    }
+
+    /// `Do` (ISO 32000-1 8.8): resolves `/Resources /XObject /<name>` and
+    /// paints it if it's an image (`/Subtype /Image`) -- Form XObjects
+    /// remain out of scope this phase (see [module docs](super)).
+    fn do_xobject(&mut self, name: &str) -> Result<(), NativeRenderError> {
+        let xobject = self
+            .resources
+            .and_then(|r| r.get("XObject"))
+            .and_then(|o| match o {
+                Object::Dictionary(d) => Some(d),
+                _ => None,
+            })
+            .and_then(|xo| xo.get(name));
+
+        let Some(Object::Stream(stream)) = xobject else {
+            self.warn(RenderWarning::MissingXObjectResource { name: name.to_string() });
+            return Ok(());
+        };
+
+        let is_image = matches!(
+            stream.dictionary.get("Subtype"),
+            Some(Object::Name(n)) if n.as_str() == "Image"
+        );
+        if !is_image {
+            self.warn(RenderWarning::FormXObjectUnsupported { name: name.to_string() });
+            return Ok(());
+        }
+
+        let fill_color = self.gs.current().fill_color;
+        let result = image::decode_image_xobject(stream, self.resources, fill_color);
+        self.paint_image_result(result, name);
+        Ok(())
+    }
+
+    /// `BI`/`ID`/`EI` (ISO 32000-1 8.9.7): decodes and paints an inline
+    /// image using the same pipeline as an image XObject.
+    fn show_inline_image(&mut self, img: &InlineImage) {
+        let fill_color = self.gs.current().fill_color;
+        let result = image::decode_inline_image(img, self.resources, fill_color);
+        self.paint_image_result(result, "(inline)");
+    }
+
+    /// Shared paint step for both `Do` (image XObjects) and inline images:
+    /// maps the decoded pixel grid's unit square into device space via the
+    /// current CTM (ISO 32000-1 8.9.5.2: image space has its origin at the
+    /// upper-left, `x` right, `y` *down*, mapped onto the CTM's unit
+    /// square) and draws it, honoring the current clip and non-stroking
+    /// constant alpha (`ca`). `JBIG2Decode`/`JPXDecode` (the documented
+    /// hard gap) paint a flat mid-grey placeholder rectangle instead of
+    /// the real image, so the render is never silently blank -- see
+    /// [`super::image`]'s module docs.
+    fn paint_image_result(&mut self, result: ImageResult, name: &str) {
+        match result {
+            ImageResult::Ok(decoded) => self.draw_image_pixels(decoded),
+            ImageResult::UnsupportedFilter(filter) => {
+                self.warn(RenderWarning::UnsupportedImageFilter {
+                    name: name.to_string(),
+                    filter,
+                });
+                self.paint_placeholder_rect();
+            }
+            ImageResult::Failed(reason) => {
+                self.warn(RenderWarning::ImageDecodeFailed {
+                    name: name.to_string(),
+                    reason,
+                });
+            }
+        }
+    }
+
+    /// Computes the pixel-space -> device-space transform (ISO 32000-1
+    /// 8.9.5.2's fixed `[1/w 0 0 -1/h 0 1]` image matrix composed with the
+    /// current CTM) and blits `decoded`'s RGBA buffer onto the canvas.
+    fn draw_image_pixels(&mut self, decoded: super::image::DecodedImage) {
+        let (width, height) = (decoded.width, decoded.height);
+        let Some(size) = tiny_skia::IntSize::from_wh(width, height) else {
+            return;
+        };
+        let Some(pixmap) = tiny_skia::Pixmap::from_vec(decoded.rgba, size) else {
+            return;
+        };
+
+        let state = self.gs.current();
+        let image_matrix = Matrix::new(1.0 / f64::from(width), 0.0, 0.0, -1.0 / f64::from(height), 0.0, 1.0);
+        let pixel_to_device = image_matrix.multiply(&state.ctm);
+        let transform = tiny_skia::Transform::from_row(
+            pixel_to_device.a as f32,
+            pixel_to_device.b as f32,
+            pixel_to_device.c as f32,
+            pixel_to_device.d as f32,
+            pixel_to_device.e as f32,
+            pixel_to_device.f as f32,
+        );
+
+        let paint = tiny_skia::PixmapPaint {
+            opacity: state.fill_alpha.clamp(0.0, 1.0),
+            ..Default::default()
+        };
+        let clip = state.clip.clone();
+        self.pixmap
+            .draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, clip.as_deref());
+    }
+
+    /// Paints a flat, clearly-artificial mid-grey placeholder over the
+    /// image's unit square -- used only for the documented JBIG2/JPX gap
+    /// (see [`super::image`]), never for a genuine decode failure (which
+    /// stays unpainted, matching this interpreter's general
+    /// "record-a-warning-and-skip" convention for gaps that don't have a
+    /// standard "broken image" visual convention).
+    fn paint_placeholder_rect(&mut self) {
+        let state = self.gs.current();
+        let corners = [
+            state.ctm.transform_point(0.0, 0.0),
+            state.ctm.transform_point(1.0, 0.0),
+            state.ctm.transform_point(1.0, 1.0),
+            state.ctm.transform_point(0.0, 1.0),
+        ]
+        .map(|(x, y)| super::path::sanitize_point(x, y));
+
+        let mut pb = PathAccumulator::new();
+        pb.rect(corners);
+        let Some(path) = pb.to_path() else { return };
+
+        let mut paint = Paint::default();
+        // A distinctive, unmistakably-artificial mid-grey: not white (the
+        // page background), not black (plausible real content), matching
+        // the "broken image" convention most browsers/viewers use.
+        paint.set_color(Color::from_rgba8(160, 160, 160, 255));
+        paint.anti_alias = false;
+        let clip = state.clip.clone();
+        self.pixmap
+            .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), clip.as_deref());
     }
 
     /// Resolves and caches (see [`Self::font_cache`]) the `/Resources
@@ -784,7 +1057,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
         for item in parse_content_stream(proc_bytes) {
             match item {
                 ContentItem::Op { operator, operands } => child.exec(&operator, &operands)?,
-                ContentItem::InlineImage(_) => child.warn(RenderWarning::InlineImageUnsupported),
+                ContentItem::InlineImage(img) => child.show_inline_image(&img),
                 ContentItem::Raw(_) => child.warn(RenderWarning::TruncatedContentStream),
             }
         }
