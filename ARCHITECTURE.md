@@ -1,6 +1,44 @@
 # rust-pdf — Architecture & Audit (as of 2026-07-03)
 
-> **Status of this document:** objective inventory of the codebase as it exists today on branch
+> **Status of this document (second refresh, current — supersedes the first refresh's numbers
+> below for §2/§10/§11/§12):** regenerated again at commit `babec0c` (branch
+> `workflow/enterprise-buildout`) to close a one-commit staleness window. The first refresh
+> (blockquote immediately below this one) landed at commit `e0ab506`, but two further
+> remediation-phase commits landed **immediately after** it and were therefore not reflected:
+> `ad35dcb` ("PDF/A CIDSet Fix" — added live `/CIDSet` stream generation on the
+> `FontDescriptor`, ISO 32000-1:2008 Table 122 / required for subset CIDFonts by ISO
+> 19005-1:2005 6.3.5, in `font/cid.rs` + `document/mod.rs` + `editor/pdfa.rs`) and `babec0c`
+> ("CID subset-tag fix" — made the `ABCDEF+FontName` subset-tag prefix on `BaseFont`
+> conditional on the same `will_subset()` predicate that gates `/CIDSet`, so an untagged
+> full-embed can no longer carry a tagged name and fail veraPDF's 6.3.5 test 3; see
+> `font/cid.rs`'s module docs and its three new unit tests). This second pass re-ran every live
+> command from §2/§10/§11/§12 against the tree *after* both fixes and updated only what actually
+> moved:
+>
+> - **§2 module inventory**: `font/cid.rs` 571→796 LOC (90.1%→92.23% line coverage),
+>   `editor/pdfa.rs` 926→977 LOC (79.1%→80.33%), `document/mod.rs` 1,387→1,403 LOC
+>   (77.8%→77.99%) — exactly the three files the two commits above touched, re-verified via a
+>   fresh `find src -name '*.rs' | xargs wc -l`. Crate total: **39,299→39,591 lines, still 98
+>   files** (no file added or removed, only grown).
+> - **§10 coverage**: live `cargo llvm-cov --release --features full,tauri --summary-only`
+>   re-run — aggregate moved from 83.76%/78.20%/81.99% (region/function/line) to
+>   **83.91%/78.28%/82.10%**. Unit-test count rose from 587 to 593 (the six tests
+>   `ad35dcb`/`babec0c` added to `font/cid.rs`/`editor/pdfa.rs`), bringing the crate-wide passing
+>   total from 706 to **712** (still 11 ignored, still 0 failing).
+> - **§11 `cargo audit`**: re-run, **unchanged** — 535 dependencies, exit code 0, 0
+>   vulnerabilities, the same 17 informational (`unmaintained`/`unsound`) warnings, the same 5
+>   individually-reviewed advisory IDs ignored in `.cargo/audit.toml`. Neither fix touched
+>   `Cargo.toml`/`Cargo.lock`, so this is an unsurprising confirmation, not new information.
+> - **§12 `cargo clippy --features full,tauri --all-targets -- -D warnings`**: re-run (forced
+>   recompile via `touch src/lib.rs` first) — still clean, 0 warnings, 0 errors.
+>
+> This is deliberately the **last commit of the entire remediation sequence** covered by this
+> document — no `src/**` change follows it. (If a future phase touches `src/**` again, this file
+> will again be exactly one commit stale until someone re-runs this same refresh.)
+>
+> **Status of this document (first refresh, superseded above for §2/§10/§11/§12 — narrative
+> §1/§3–§9/§13–§15 below are unaffected by the cid.rs fixes and still reflect that pass):**
+> objective inventory of the codebase as it exists today on branch
 > `workflow/enterprise-buildout` (commit `ce36ee9`). This is a **refresh** of the original
 > audit-phase document (which stopped at commit `4ed35fe`, the "Rendering Decision" phase) —
 > nine further phases (Content Editing, Fonts, Interactive Features, Redaction, Standards
@@ -67,10 +105,16 @@ desktop-app runtime that a pure structural/generation/signing consumer does not 
 
 ## 2. Module inventory (src/)
 
-**39,299 lines of Rust across 98 files** (live count, this refresh:
-`find src -name '*.rs' | xargs wc -l`), up from 16,427 lines / 51 files at the original audit —
-more than double the codebase. Grouped by directory below; `%Ln` is line coverage from the live
-`cargo llvm-cov --release --features full,tauri` re-run in §10 (not a stale carry-over).
+**39,591 lines of Rust across 98 files** (live count, re-verified for the second refresh at
+commit `babec0c`: `find src -name '*.rs' | xargs wc -l`; up from 39,299 lines / 98 files at the
+first refresh (`e0ab506`) — the `+292` lines are entirely `font/cid.rs` (+225),
+`editor/pdfa.rs` (+51) and `document/mod.rs` (+16), the three files touched by the
+`ad35dcb`/`babec0c` CIDSet/subset-tag fixes; no file was added or removed), up from 16,427
+lines / 51 files at the original audit — more than double the codebase. Grouped by directory
+below; `%Ln` is line coverage from the live `cargo llvm-cov --release --features full,tauri`
+re-run in §10 (not a stale carry-over) — three rows (`font/cid.rs`, `editor/pdfa.rs`,
+`document/mod.rs`) changed since the first refresh; every other row is identical to before,
+re-confirmed by this refresh's own re-run rather than assumed unchanged.
 
 | File | LOC | %Ln | Purpose |
 |---|---:|---:|---|
@@ -99,19 +143,19 @@ more than double the codebase. Grouped by directory below; `%Ln` is line coverag
 | `content/graphics.rs` | 343 | 60.1 | `GraphicsBuilder` |
 | `content/operator.rs` | 393 | 79.4 | `Operator` enum + serialization |
 | `content/text.rs` | 197 | 88.4 | `TextBuilder` |
-| **`font/`** (8 files, 2,550 LOC) | | | Font metadata, embedding and CID/subsetting — see §7 |
+| **`font/`** (8 files, 2,775 LOC) | | | Font metadata, embedding and CID/subsetting — see §7 |
 | `font/mod.rs` | 225 | 45.3 | `Font` trait/dispatch across Standard-14 and embedded fonts |
 | `font/standard14.rs` | 182 | 91.8 | The 14 standard PostScript font metrics/AFM data |
 | `font/metrics.rs` | 176 | 49.1 | Glyph-width lookup |
 | `font/encoding.rs` | 115 | 57.1 | WinAnsi/MacRoman/Standard text encodings |
 | `font/truetype.rs` | 795 | 96.5 | Embedded TrueType/OpenType font loading via `ttf-parser` (feature `fonts`) |
-| `font/cid.rs` | 571 | 90.1 | Type 0 / CIDFontType2 composite fonts for embedded + CJK text |
+| `font/cid.rs` | 796 | 92.2 | Type 0 / CIDFontType2 composite fonts for embedded + CJK text; +225 LOC since the first refresh — `ad35dcb` added `/CIDSet` generation (ISO 32000-1 Table 122 / ISO 19005-1 6.3.5, +2 unit tests) and `babec0c` made the subset-tag prefix conditional on the same `will_subset()` predicate (+3 unit tests) |
 | `font/subset.rs` | 95 | 96.9 | Font subsetting via the `subsetter` crate |
 | `font/tounicode.rs` | 391 | 92.0 | `/ToUnicode` CMap generation for text extraction/accessibility |
 | **`page/`** (1 file, 327 LOC) | | | |
 | `page/mod.rs` | 327 | 63.3 | `Page`/`PageBuilder` |
-| **`document/`** (3 files, 1,758 LOC) | | | |
-| `document/mod.rs` | 1,387 | 77.8 | `Document`/`DocumentBuilder`, orchestrates page tree + writer |
+| **`document/`** (3 files, 1,774 LOC) | | | |
+| `document/mod.rs` | 1,403 | 78.0 | `Document`/`DocumentBuilder`, orchestrates page tree + writer; +16 LOC since the first refresh (`ad35dcb`'s `cid_set_id`/`cid_set` plumbing into `CompositeFontIds`/the writer) |
 | `document/info.rs` | 238 | 77.9 | `/Info` dictionary |
 | `document/version.rs` | 133 | 61.2 | PDF version handling |
 | **`writer/`** (3 files, 673 LOC) | | | Serializes the object graph to PDF bytes |
@@ -157,7 +201,7 @@ more than double the codebase. Grouped by directory below; `%Ln` is line coverag
 | `parser/xref.rs` | 311 | 91.5 | Classic + xref-stream parsing |
 | `parser/inline_image.rs` | 209 | 97.3 | `BI...ID...EI` inline image operator parsing |
 | `parser/recovery.rs` | 367 | 77.2 | Repair-mode object scanning when the xref table is unusable; `MAX_RECOVERED_OBJECTS` |
-| **`editor/`** (19 files, 10,634 LOC) | | | **New since the original audit.** In-place editing of an existing PDF — see §6 |
+| **`editor/`** (19 files, 10,685 LOC) | | | **New since the original audit.** In-place editing of an existing PDF — see §6 |
 | `editor/mod.rs` | 88 | — | `EditableDocument` entry point |
 | `editor/graph.rs` | 481 | 91.8 | Core mutable object graph; `MAX_PAGE_TREE_NODES`, `MAX_REACHABLE_OBJECTS` |
 | `editor/pages.rs` | 710 | 82.9 | Insert/delete/reorder/rotate/split/merge page-tree editing |
@@ -167,7 +211,7 @@ more than double the codebase. Grouped by directory below; `%Ln` is line coverag
 | `editor/structure.rs` | 432 | 90.8 | Minimal Tagged PDF logical structure tree (headings/paragraphs/tables/figures) |
 | `editor/redact.rs` | 1,431 | 73.4 | Permanent content redaction (removes underlying content, not just a visual overlay) |
 | `editor/audit.rs` | 339 | 98.2 | Redaction audit trail (documented private extension — ISO 32000 has no native object for this) |
-| `editor/pdfa.rs` | 926 | 79.1 | PDF/A-1b/2b/3b validation + conversion |
+| `editor/pdfa.rs` | 977 | 80.3 | PDF/A-1b/2b/3b validation + conversion; +51 LOC since the first refresh (`ad35dcb` narrowed `check_cidset_present`'s doc comment now that the gap it guards against is fixed, and split its regression test into a positive end-to-end-conformant case plus a hand-built-missing-`/CIDSet` defense-in-depth case — net +1 unit test) |
 | `editor/pdfx.rs` | 261 | 88.6 | PDF/X colour-space constraint checking (ISO 15930) |
 | `editor/pdfua.rs` | 372 | 98.4 | PDF/UA (ISO 14289-1) Matterhorn-Protocol-style checklist validation |
 | `editor/icc.rs` | 385 | 95.4 | ICC output-intent embedding (used by PDF/A + PDF/X) |
@@ -316,7 +360,7 @@ the original finding as unconfirmed-but-plausible until someone re-checks it dir
 
 ## 6. Editing an existing PDF (`editor/`)
 
-New top-level module since the original audit (19 files, 10,634 lines — the single largest
+New top-level module since the original audit (19 files, 10,685 lines — the single largest
 directory in the crate). `EditableDocument` (`editor/mod.rs`/`graph.rs`) loads an existing PDF via
 `parser`, exposes a mutable in-memory object graph bounded by `MAX_PAGE_TREE_NODES`/
 `MAX_REACHABLE_OBJECTS` (see `docs/THREAT_MODEL.md` §6 for the full resource-limit inventory), and
@@ -476,34 +520,45 @@ $ RUST_PDF_PDFIUM_LIB_DIR=.pdfium/mac-arm64/lib cargo llvm-cov --release --featu
 render_tests.rs`, parts of `tests/tauri_commands_integration.rs`) are written to *skip* (report
 `ok`, not `FAILED`) rather than exercise any Pdfium-touching code at all when the native library
 can't be located (§8's "known limitation" — by design, so `cargo test --features render` still
-passes in a checkout without the native binary). This refresh's *first* `cargo llvm-cov` run did
-not set this variable, so all 11 `render_tests` silently skipped despite reporting `ok`, and
-`render/renderer.rs` measured 6.77%/7.93% region/line coverage as a direct result — not a
+passes in a checkout without the native binary). The first refresh's *initial* `cargo llvm-cov`
+run did not set this variable, so all 11 `render_tests` silently skipped despite reporting `ok`,
+and `render/renderer.rs` measured 6.77%/7.93% region/line coverage as a direct result — not a
 reflection of real coverage. Re-running with `RUST_PDF_PDFIUM_LIB_DIR=.pdfium/mac-arm64/lib`
 (after `scripts/fetch_pdfium.sh`, already present in this checkout) set, all 11 tests genuinely
-executed (confirmed via `--nocapture`: `rendered 51 pages across 9 documents`), and the numbers
-below are from that corrected, second run. This is called out at this length because it is
-exactly the kind of "tests report ok but didn't run the code" trap this refresh's own rule 3
-("jalankan sendiri... sertakan output aktual") exists to catch — and it nearly produced a wrong
-number in this very document.
+executed (confirmed via `--nocapture`: `rendered 51 pages across 9 documents`). This is called
+out at this length because it is exactly the kind of "tests report ok but didn't run the code"
+trap the "jalankan sendiri... sertakan output aktual" rule exists to catch.
 
-Aggregate (per-file breakdown folded into §2's module table above — every row's `%Ln` column is
-from this same, corrected run, not carried over from the original audit or from the first,
-Pdfium-less run):
+**Second refresh (this pass, commit `babec0c`, post-cid.rs-fix):** re-ran the same command with
+the same env var. Aggregate (per-file breakdown folded into §2's module table above — every
+row's `%Ln` column is from this run):
 
 | Metric | Covered / Total | % |
 |---|---|---|
-| Regions | 35,443 / 42,314 | **83.76%** |
-| Functions | 2,052 / 2,624 | **78.20%** |
-| Lines | 18,253 / 22,263 | **81.99%** |
+| Regions | 35,856 / 42,733 | **83.91%** |
+| Functions | 2,061 / 2,633 | **78.28%** |
+| Lines | 18,392 / 22,403 | **82.10%** |
 
-This is a large improvement over the original audit's 67.89% line coverage — expected, since most
-of the ~23,000 new lines landed with dedicated test suites (`tests/editor_tests.rs`,
-`tests/font_embedding_tests.rs`, `tests/interactive_features_tests.rs`, `tests/render_tests.rs`,
+(Ran three times back-to-back to check stability: missed-region/-line counts wobbled by ±1–2
+between runs — e.g. 6,876/6,877/6,878 missed regions, 4,010/4,011/4,012 missed lines — which
+rounds to the same 83.9x%/82.1x% either way; the region/function totals (42,733 / 2,633) and the
+percentages shown above were identical across all three runs. This is consistent with ordinary
+thread-scheduling nondeterminism in the concurrent `tauri_commands`/`render_actor` test suites,
+not a measurement error, and is well within the same ballpark the first refresh already reported
+for the (then-unfixed) `font/cid.rs`/`editor/pdfa.rs` region.)
+
+Up from the first refresh's 35,443/42,314 (83.76%) regions, 2,052/2,624 (78.20%) functions,
+18,253/22,263 (81.99%) lines — the increase tracks the `+292` new lines in `font/cid.rs`/
+`editor/pdfa.rs`/`document/mod.rs` (§2) plus their new tests, essentially all of it well-covered
+(`font/cid.rs` alone: 90.1%→92.2%). This remains a large improvement over the original audit's
+67.89% line coverage — most of the ~23,000 lines added across nine phases landed with dedicated
+test suites (`tests/editor_tests.rs`, `tests/font_embedding_tests.rs`,
+`tests/interactive_features_tests.rs`, `tests/render_tests.rs`,
 `tests/signature_verification_tests.rs`, `tests/tauri_commands_integration.rs`) as part of each
-phase's own DoD, not from this refresh.
+phase's own DoD.
 
-Notably low files (line coverage), from this corrected run:
+Notably low files (line coverage), from this run — unchanged from the first refresh (none of
+these files were touched by the cid.rs fixes):
 - `ffi.rs` — **0%** (unchanged from the original audit — no test exercises the C ABI layer).
 - `image/mod.rs` — **26.20%** line coverage (unchanged finding from the original audit).
 - `forms/field.rs` — **51.49%** line coverage (100+ public items, still the largest/least-tested
@@ -511,15 +566,15 @@ Notably low files (line coverage), from this corrected run:
 - `font/mod.rs` — **45.26%**, `font/metrics.rs` — **49.11%**, `filter/dct.rs` — **49.23%**: all
   three under 50%, none flagged in the original audit (they didn't exist, or `font/mod.rs` was
   differently shaped, at that time).
-- `document/mod.rs` — **77.75%** — no longer the crate's least-covered large file (that framing
-  in the original audit predates `editor/redact.rs` (73.4%), `signatures/signer.rs` (73.0%,
-  §2/§4.2) and several others now below it).
+- `document/mod.rs` — **78.0%** (was 77.75% at the first refresh, +16 LOC from `ad35dcb`'s
+  `cid_set_id` plumbing) — still not the crate's least-covered large file (`editor/redact.rs`
+  73.4%, `signatures/signer.rs` 73.0%, §2/§4.2, and several others remain below it).
 
-Test counts (`cargo test --features full,tauri`, same branch, same commit):
+Test counts (`cargo test --release --features full,tauri`, same branch, commit `babec0c`):
 
 | Suite | Passed | Ignored |
 |---|---:|---:|
-| `src/` unit tests | 587 | 0 |
+| `src/` unit tests | 593 | 0 |
 | `tests/editor_tests.rs` | 7 | 0 |
 | `tests/font_embedding_tests.rs` | 6 | 0 |
 | `tests/integration_tests.rs` | 68 | 0 |
@@ -530,12 +585,23 @@ Test counts (`cargo test --features full,tauri`, same branch, same commit):
 | `tests/signature_verification_tests.rs` | 15 | 0 |
 | `tests/tauri_commands_integration.rs` | 2 | 0 |
 | Doctests | 3 | 8 (`ignore`d) |
-| **Total** | **706** | **11** |
+| **Total** | **712** | **11** |
 
-0 failing. Up from the original audit's 312 passing / 0 failing — again, this reflects nine
-phases' worth of test suites, not new work in this refresh.
+0 failing. Up from 706/11 at the first refresh — the +6 unit tests are exactly the ones
+`ad35dcb` (+2, `build_subset_cid_set_has_correct_bit_layout`/
+`build_subset_cid_set_marks_unused_gaps_within_the_used_range`, plus splitting one
+`editor/pdfa.rs` test into two, net +1) and `babec0c` (+3,
+`build_full_embed_uses_untagged_base_font_name`/
+`build_with_no_glyphs_used_falls_back_to_untagged_full_embed`/
+`build_subset_uses_tagged_base_font_name`) added — see §2's `font/cid.rs`/`editor/pdfa.rs` rows.
+Up from the original audit's 312 passing / 0 failing overall.
 
 ## 11. `cargo audit` results (live re-run)
+
+Re-run again for this second refresh at commit `babec0c` (cargo-audit `0.22.1`; no `--features`
+flag exists for this tool/version, and none is needed — `Cargo.lock` is already fully resolved
+against `full,tauri`, exactly as it was for the first refresh's run below, since neither
+`ad35dcb` nor `babec0c` touched `Cargo.toml`/`Cargo.lock`):
 
 ```
 $ cargo audit
@@ -547,10 +613,10 @@ $ cargo audit
 warning: 17 allowed warnings found
 ```
 
-Exit code `0`. **0 vulnerabilities.** 535 total crate dependencies scanned — more than 5× the
-original audit's 102, because that number was measured on a build with no `render`/`tauri`
-feature (hence no `pdfium-render`, no `tauri`/`wry`/`webkit2gtk`/GTK3-binding transitive tree at
-all) compiled in.
+Exit code `0`. **0 vulnerabilities.** 535 total crate dependencies scanned — identical to the
+first refresh's number, and more than 5× the original audit's 102, because that number was
+measured on a build with no `render`/`tauri` feature (hence no `pdfium-render`, no
+`tauri`/`wry`/`webkit2gtk`/GTK3-binding transitive tree at all) compiled in.
 
 A `.cargo/audit.toml` (added by a later "Dependency Audit Triage" remediation phase, not present
 at the original audit) explicitly ignores 5 specific, individually-reviewed advisory IDs with
@@ -586,18 +652,30 @@ phase. Out of scope for this documentation-refresh session.
 
 ## 12. `cargo clippy` (live re-run)
 
+Re-run again for this second refresh at commit `babec0c` (i.e. against `font/cid.rs`,
+`editor/pdfa.rs`, `document/mod.rs` as changed by `ad35dcb`/`babec0c`):
+
+```
+$ touch src/lib.rs && cargo clippy --features full,tauri --all-targets -- -D warnings
+    Checking rust-pdf v0.1.0 (/Users/galihlasahido/RustroverProjects/rust-pdf)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.26s
+```
+
+**Clean — 0 warnings, 0 errors**, `touch src/lib.rs` run immediately beforehand (both this run
+and the first refresh's below) to force a real recompile rather than reporting a stale cached
+pass. Same result as the first refresh's run (reproduced verbatim below for provenance):
+
 ```
 $ cargo clippy --features full,tauri --all-targets -- -D warnings
     Checking rust-pdf v0.1.0 (/Users/galihlasahido/RustroverProjects/rust-pdf)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.70s
 ```
 
-**Clean — 0 warnings, 0 errors**, re-run with `touch src/lib.rs` immediately beforehand to force
-a real recompile rather than reporting a stale cached pass. This supersedes the original audit's
-finding of "13 distinct lint categories" under `-D warnings` — every one of those (the
-`approx_constant`/`derivable_impls`/`manual_is_multiple_of`/`dead_code` items etc.) has since been
-fixed by an intervening phase; this refresh did not identify which specific phase, only confirmed
-the current clean state.
+This supersedes the original audit's finding of "13 distinct lint categories" under
+`-D warnings` — every one of those (the `approx_constant`/`derivable_impls`/
+`manual_is_multiple_of`/`dead_code` items etc.) has since been fixed by an intervening phase; the
+first refresh did not identify which specific phase, only confirmed the current clean state, and
+this second refresh only re-confirms it stayed clean after the cid.rs fixes.
 
 ## 13. Untrusted-input risk register
 
@@ -666,12 +744,31 @@ module inventory in §2 rather than by extrapolating from a percentage-closed co
   RenderActor Panic Resilience, Visual Verification, Large-File Render Benchmark) built
   everything in §2's `editor/`, `filter/`, `render/`, `tauri_commands/` rows and the new `font/`
   files, added `docs/THREAT_MODEL.md` and `.cargo/audit.toml`, but never updated this file.
-- **This refresh** (2026-07-03, remediation session "ARCHITECTURE.md Refresh"): regenerated §2
-  (module inventory, live LOC), §10 (coverage, live re-run against `--features full,tauri`), §11
-  (`cargo audit`, live re-run), §12 (`cargo clippy`, live re-run); fixed the largest-file claim
-  (`signatures/signer.rs`, not `document/mod.rs`); added §6/§7/§9 for modules that previously had
-  no entry at all; added spot-checked status callouts to §4/§5/§13/§14 where opportunistic
-  verification found a specific old claim superseded. Did **not** perform a full re-audit of every
-  claim in the inherited narrative sections — see the callouts throughout for exactly what was and
-  wasn't re-verified, and consult `docs/THREAT_MODEL.md` for anything security/risk-related that
-  this document doesn't fully resolve.
+- **First refresh** (2026-07-03, remediation session "ARCHITECTURE.md Refresh", commit
+  `e0ab506`): regenerated §2 (module inventory, live LOC), §10 (coverage, live re-run against
+  `--features full,tauri`), §11 (`cargo audit`, live re-run), §12 (`cargo clippy`, live re-run);
+  fixed the largest-file claim (`signatures/signer.rs`, not `document/mod.rs`); added §6/§7/§9 for
+  modules that previously had no entry at all; added spot-checked status callouts to
+  §4/§5/§13/§14 where opportunistic verification found a specific old claim superseded. Did
+  **not** perform a full re-audit of every claim in the inherited narrative sections — see the
+  callouts throughout for exactly what was and wasn't re-verified, and consult
+  `docs/THREAT_MODEL.md` for anything security/risk-related that this document doesn't fully
+  resolve.
+- Two further remediation-phase commits landed **immediately after** the first refresh, making it
+  one commit stale: `ad35dcb` ("PDF/A CIDSet Fix" — `font/cid.rs` now generates a live `/CIDSet`
+  stream, ISO 32000-1:2008 Table 122 / ISO 19005-1:2005 6.3.5, for subset CIDFonts; also touched
+  `document/mod.rs` and `editor/pdfa.rs`) and `babec0c` ("CID subset-tag fix" — made the
+  `ABCDEF+FontName` subset-tag prefix on `BaseFont` conditional on `will_subset()`, the same
+  predicate that gates `/CIDSet`, fixing a veraPDF 6.3.5-test-3 failure on an untagged full embed
+  that previously still got a tagged name).
+- **Second refresh** (2026-07-03, remediation session "ARCHITECTURE.md Final Refresh", commit
+  `babec0c`, this pass): re-ran every live command from §2/§10/§11/§12 against the tree *after*
+  both of the commits above and updated exactly the numbers that moved — §2's `font/cid.rs`/
+  `editor/pdfa.rs`/`document/mod.rs` rows and the crate LOC total (39,299→39,591, still 98
+  files), §10's coverage aggregate (83.76/78.20/81.99%→83.91/78.28/82.10%) and test count
+  (706→712 passing, still 11 ignored, still 0 failing), and re-confirmed §11 (`cargo audit`) and
+  §12 (`cargo clippy -D warnings`) are unchanged (neither fix touched `Cargo.toml`/`Cargo.lock`
+  or introduced a new lint). Did not touch §1/§3–§9 (narrative)/§13/§14 beyond what the top
+  callout block already documents, since none of their claims depend on `font/cid.rs`'s exact
+  line count or the coverage percentage of a single file. This refresh is the deliberately-last
+  commit of the whole remediation sequence — no `src/**` change follows it.
