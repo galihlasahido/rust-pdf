@@ -1,6 +1,51 @@
 # rust-pdf — Architecture & Audit (as of 2026-07-03)
 
-> **Status of this document (fourth refresh, current — corrects a specific inaccurate claim in the
+> **Status of this document (fifth refresh, current — corrects §2's per-file `%Ln` column, which
+> did not actually match a live `cargo llvm-cov` re-run for 16 of the 105 covered rows despite the
+> third refresh's explicit claim, quoted verbatim from this file at the time, that "every row below
+> was re-verified by this refresh's own re-run, not assumed unchanged"):** that claim was false for
+> those 16 rows — the values had in fact been carried over unchanged from the *original* audit (or,
+> for a few, the second refresh) without being re-measured, and by this pass had drifted from a
+> fresh `cargo-llvm-cov 0.8.7` run (same tool version the third refresh cited) far enough to matter.
+> Ran `cargo llvm-cov --release --features full,tauri --summary-only` twice back-to-back this
+> session; both runs agree on every file except `parser/recovery.rs` (see its own row/footnote for
+> why that one specifically is unstable run-to-run). Corrected, with the precise
+> covered-lines/total-lines fraction computed directly from each run's raw counts (not by
+> re-rounding the tool's own already-rounded 2-decimal display, which can itself introduce a
+> spurious ±0.1-point error):
+>
+> | File | Doc claimed (stale) | Live (this refresh) |
+> |---|---:|---:|
+> | `filter/mod.rs` | 72.9% | **90.7%** |
+> | `filter/dct.rs` | 49.2% | **72.3%** |
+> | `object/mod.rs` | 63.0% | **68.9%** |
+> | `object/array.rs` | 81.6% | **85.5%** |
+> | `object/string.rs` | 85.9% | **89.1%** |
+> | `page/mod.rs` | 63.3% | **66.7%** |
+> | `types/rectangle.rs` | 91.9% | **87.8%** |
+> | `image/mod.rs` | 26.2% | **24.6%** |
+> | `encryption/permissions.rs` | 75.5% | **70.6%** |
+> | `editor/content_stream.rs` | 69.8% | **72.4%** |
+> | `signatures/signer.rs` | 73.0% | **73.4%** |
+> | `parser/mod.rs` | 93.4% | **93.5%** |
+> | `filter/lzw.rs` | 89.3% | **89.2%** |
+> | `editor/icc.rs` | 95.4% | **95.3%** |
+> | `editor/structure.rs` | 90.8% | **90.7%** |
+> | `parser/recovery.rs` | 77.2% | **77.2–77.6%** (genuinely unstable — see its row) |
+>
+> None of these are new coverage regressions or improvements from any code change — `git diff
+> 7258c5b HEAD -- src/` is empty; this refresh touches only `ARCHITECTURE.md`, and no test was
+> added, removed, or modified. The crate-wide aggregate in §10 (Regions 83.97%/Functions
+> 79.79%/Lines 82.54%) was already exactly reproduced by a live re-run before this refresh and is
+> **unchanged** — this was a per-file granularity bug in the document, not an aggregate one: with
+> 105 rows and figures this granular, region-weighted rounding lets several individual rows drift
+> while the crate-wide sum stays put. Also re-verified (unchanged, no drift): §2's LOC/file-count
+> totals (48,168 lines / 111 files — identical `find src -name '*.rs' | xargs wc -l` output to the
+> third refresh's), and §10/§11/§12's own headline numbers. Fixed the three restatements of the
+> corrected values in §10's "Notably low files" bullets (`image/mod.rs`, `filter/dct.rs`,
+> `signatures/signer.rs`) to match. See §15 for what was and wasn't re-verified in this pass.
+>
+> **Status of this document (fourth refresh — corrects a specific inaccurate claim in the
 > third refresh's §8d/§10, supersedes those two numbers only):** the third refresh's §8d
 > "Performance delta" section and §10's one-line restatement of it asserted, as "a real, measured
 > regression, not a rough guess," that the pure-Rust renderer takes **1,723.67 ms** to open+render
@@ -204,9 +249,14 @@ several other files touched incidentally along the way: `font/truetype.rs` (+41,
 `editor/text_extract.rs`, `editor/icc.rs`, `editor/redact.rs`, `filter/ccitt.rs`, `parser/
 recovery.rs`, `error.rs` (+9, new `RenderError`/`RenderWarning`-adjacent variants) and `lib.rs`
 (prelude re-exports, net LOC unchanged). Up from 16,427 lines / 51 files at the original audit.
-Grouped by directory below; `%Ln` is line coverage from the live `cargo llvm-cov --release
---features full,tauri` re-run in §10 (not a stale carry-over) — every row below was re-verified by
-this refresh's own re-run, not assumed unchanged from the second refresh.
+LOC/file-count re-confirmed unchanged by the fifth refresh's own re-run of the same `find` command.
+Grouped by directory below; `%Ln` is line coverage from `cargo llvm-cov --release --features
+full,tauri` in §10. **The third refresh claimed every row here had been "re-verified by this
+refresh's own re-run, not assumed unchanged" — that claim was false for 16 rows, which had in fact
+been carried over unchanged (mostly from the original audit) without being re-measured; the fifth
+refresh (see the status banner at the top of this document and §15) is the one that actually ran
+`cargo llvm-cov` fresh, diffed every one of the 105 covered rows against the output, and corrected
+the ones that had drifted.** Every `%Ln` value below is now current as of the fifth refresh.
 
 | File | LOC | %Ln | Purpose |
 |---|---:|---:|---|
@@ -217,18 +267,18 @@ this refresh's own re-run, not assumed unchanged from the second refresh.
 | `types/mod.rs` | 9 | — | Re-exports |
 | `types/matrix.rs` | 189 | 86.8 | 2D affine transform matrix |
 | `types/object_id.rs` | 101 | 100.0 | `ObjectId` (object number + generation) |
-| `types/rectangle.rs` | 142 | 91.9 | `/MediaBox`-style rectangles |
+| `types/rectangle.rs` | 142 | 87.8 | `/MediaBox`-style rectangles |
 | **`color/`** (4 files, 533 LOC) | | | Device color spaces |
 | `color/mod.rs` | 173 | 85.2 | `Color` enum, conversions |
 | `color/rgb.rs` | 159 | 89.7 | DeviceRGB |
 | `color/cmyk.rs` | 119 | 81.8 | DeviceCMYK |
 | `color/gray.rs` | 82 | 78.6 | DeviceGray |
 | **`object/`** (6 files, 1,572 LOC) | | | The PDF object model, used by write + (partial) read paths |
-| `object/mod.rs` | 282 | 63.0 | `Object` enum, top-level dispatch |
+| `object/mod.rs` | 282 | 68.9 | `Object` enum, top-level dispatch |
 | `object/dictionary.rs` | 190 | 91.1 | `PdfDictionary` |
-| `object/array.rs` | 141 | 81.6 | `PdfArray` |
+| `object/array.rs` | 141 | 85.5 | `PdfArray` |
 | `object/name.rs` | 199 | 67.2 | `PdfName` |
-| `object/string.rs` | 160 | 85.9 | `PdfString` (literal/hex, escaping) |
+| `object/string.rs` | 160 | 89.1 | `PdfString` (literal/hex, escaping) |
 | `object/stream.rs` | 600 | 93.2 | `PdfStream`; legacy `decompress()` (FlateDecode-only, silently passes through other filters — see §13) plus the newer, full-filter-set `decode_all()` |
 | **`content/`** (4 files, 1,310 LOC) | | | Content-stream *builders* (write path) |
 | `content/mod.rs` | 377 | 90.8 | `ContentBuilder` |
@@ -245,7 +295,7 @@ this refresh's own re-run, not assumed unchanged from the second refresh.
 | `font/subset.rs` | 95 | 96.9 | Font subsetting via the `subsetter` crate |
 | `font/tounicode.rs` | 391 | 92.0 | `/ToUnicode` CMap generation for text extraction/accessibility |
 | **`page/`** (1 file, 327 LOC) | | | |
-| `page/mod.rs` | 327 | 63.3 | `Page`/`PageBuilder` |
+| `page/mod.rs` | 327 | 66.7 | `Page`/`PageBuilder` |
 | **`document/`** (3 files, 1,774 LOC) | | | |
 | `document/mod.rs` | 1,403 | 78.0 | `Document`/`DocumentBuilder`, orchestrates page tree + writer; +16 LOC since the first refresh (`ad35dcb`'s `cid_set_id`/`cid_set` plumbing into `CompositeFontIds`/the writer) |
 | `document/info.rs` | 238 | 77.9 | `/Info` dictionary |
@@ -259,40 +309,40 @@ this refresh's own re-run, not assumed unchanged from the second refresh.
 | `forms/field.rs` | 1,404 | 51.5 | Text/checkbox/radio/combo/list/push-button field construction (largest single file in this group; 100+ public items, worst-covered) |
 | `forms/widget.rs` | 600 | 83.9 | Widget annotation appearance construction |
 | **`image/`** (2 files, 478 LOC) | | | |
-| `image/mod.rs` | 319 | 26.2 | JPEG/PNG embedding via the `image` crate (worst-covered non-FFI file) |
+| `image/mod.rs` | 319 | 24.6 | JPEG/PNG embedding via the `image` crate (worst-covered non-FFI file) |
 | `image/xobject.rs` | 159 | 87.0 | `/XObject /Image` construction |
 | **`filter/`** (8 files, 2,050 LOC) | | | Stream filter codecs (ISO 32000-1 §7.4) — new top-level module since the original audit |
-| `filter/mod.rs` | 221 | 72.9 | `decode_filter`/dispatch, `MAX_DECODED_SIZE` |
+| `filter/mod.rs` | 221 | 90.7 | `decode_filter`/dispatch, `MAX_DECODED_SIZE` |
 | `filter/ascii_hex.rs` | 88 | 97.8 | `ASCIIHexDecode` |
 | `filter/ascii85.rs` | 147 | 95.6 | `ASCII85Decode` |
 | `filter/run_length.rs` | 115 | 90.3 | `RunLengthDecode` |
-| `filter/lzw.rs` | 278 | 89.3 | `LZWDecode` |
+| `filter/lzw.rs` | 278 | 89.2 | `LZWDecode` |
 | `filter/predictor.rs` | 474 | 88.2 | PNG/TIFF predictors (used by Flate/LZW) |
-| `filter/dct.rs` | 125 | 49.2 | `DCTDecode` (baseline/progressive JPEG passthrough for image XObjects) |
+| `filter/dct.rs` | 125 | 72.3 | `DCTDecode` (baseline/progressive JPEG passthrough for image XObjects) |
 | `filter/ccitt.rs` | 641 | 82.6 | `CCITTFaxDecode` (Group 3/4); +39 LOC since the second refresh (incidental touch-up alongside the rendering build, which reuses this decoder for CCITT image XObjects — see `render/native/image.rs`) |
 | **`encryption/`** (4 files, 1,288 LOC) | | | Builds `/Encrypt` dictionaries; write-only (§1) |
 | `encryption/mod.rs` | 296 | 90.6 | Orchestration |
 | `encryption/config.rs` | 174 | 96.6 | `EncryptionConfig` |
 | `encryption/key_derivation.rs` | 589 | 91.3 | RC4/AES-128/AES-256 key derivation (rev 2–6) |
-| `encryption/permissions.rs` | 229 | 75.5 | `/P` permission bits |
+| `encryption/permissions.rs` | 229 | 70.6 | `/P` permission bits |
 | **`signatures/`** (9 files, 5,285 LOC) | | | Detached PKCS#7/CMS signing + verification + PAdES LTV — see §5 |
 | `signatures/mod.rs` | 230 | 84.9 | Orchestration |
 | `signatures/config.rs` | 240 | 93.4 | `SignatureConfig` |
 | `signatures/certificate.rs` | 442 | 62.1 | X.509 cert parsing/build |
 | `signatures/chain.rs` | 253 | 80.2 | Certificate chain (path) validation, `MAX_CHAIN_DEPTH` |
 | `signatures/pkcs7.rs` | 619 | 86.0 | Hand-rolled minimal DER/PKCS#7 encoder |
-| `signatures/signer.rs` | **1,825** | 73.0 | **Largest file in the crate.** `DocumentSigner` (fresh `Document`) + `IncrementalSigner` (ad-hoc plain-text scan of an existing PDF buffer — see original §4.3 finding, not re-verified this refresh) |
+| `signatures/signer.rs` | **1,825** | 73.4 | **Largest file in the crate.** `DocumentSigner` (fresh `Document`) + `IncrementalSigner` (ad-hoc plain-text scan of an existing PDF buffer — see original §4.3 finding, not re-verified this refresh) |
 | `signatures/timestamp.rs` | 631 | 70.7 | RFC 3161 TSP client — PAdES "B-T" |
 | `signatures/dss.rs` | 342 | 77.5 | `/DSS` Document Security Store embedding — PAdES "B-LT" |
 | `signatures/verifier.rs` | 703 | 87.9 | `SignatureVerifier`, `/ByteRange` handling |
 | **`parser/`** (7 files, 3,506 LOC) | | | nom-based structural PDF reader — see §4 |
-| `parser/mod.rs` | 1,687 | 93.4 | `PdfReader` orchestrator; `MAX_XREF_SECTIONS`, `MAX_PAGE_TREE_WALK_*` |
+| `parser/mod.rs` | 1,687 | 93.5 | `PdfReader` orchestrator; `MAX_XREF_SECTIONS`, `MAX_PAGE_TREE_WALK_*` |
 | `parser/lexer.rs` | 404 | 85.5 | Tokenizer |
 | `parser/objects.rs` | 381 | 88.2 | Object grammar; `MAX_NESTING_DEPTH` |
 | `parser/trailer.rs` | 147 | 84.9 | Trailer + `/XRefStm` hybrid-reference handling |
 | `parser/xref.rs` | 311 | 91.5 | Classic + xref-stream parsing |
 | `parser/inline_image.rs` | 209 | 97.3 | `BI...ID...EI` inline image operator parsing |
-| `parser/recovery.rs` | 367 | 77.2 | Repair-mode object scanning when the xref table is unusable; `MAX_RECOVERED_OBJECTS` |
+| `parser/recovery.rs` | 367 | 77.2–77.6 | Repair-mode object scanning when the xref table is unusable; `MAX_RECOVERED_OBJECTS`; this file's coverage genuinely flips between back-to-back re-runs of the identical command (77.22% one run, 77.64% the next, both observed live this refresh) — one line's execution depends on which thread wins a race in a concurrent test, same root cause as §10's documented aggregate ±1-line wobble, just large enough here (out of only 237 executable lines) to move the rounded percentage instead of disappearing into it |
 | **`editor/`** (19 files, 10,852 LOC) | | | **New since the original audit.** In-place editing of an existing PDF — see §6 |
 | `editor/mod.rs` | 93 | — | `EditableDocument` entry point; +5 LOC since the second refresh (incidental, part of wiring `EditableDocument` up as `render::PdfRenderer`'s backing store, §8c) |
 | `editor/graph.rs` | 481 | 91.8 | Core mutable object graph; `MAX_PAGE_TREE_NODES`, `MAX_REACHABLE_OBJECTS` |
@@ -300,16 +350,16 @@ this refresh's own re-run, not assumed unchanged from the second refresh.
 | `editor/forms.rs` | 1,202 | 91.4 | Read/fill/create/flatten AcroForm fields on a loaded document |
 | `editor/annotations.rs` | 779 | 95.2 | Markup annotations (highlight/underline/strikeout/free-text/stamp/ink/note) with generated appearance streams |
 | `editor/outline.rs` | 646 | 91.9 | Document outline (bookmarks) + named destinations |
-| `editor/structure.rs` | 432 | 90.8 | Minimal Tagged PDF logical structure tree (headings/paragraphs/tables/figures) |
+| `editor/structure.rs` | 432 | 90.7 | Minimal Tagged PDF logical structure tree (headings/paragraphs/tables/figures) |
 | `editor/redact.rs` | 1,431 | 73.4 | Permanent content redaction (removes underlying content, not just a visual overlay); incidental touch-up alongside the rendering build (LOC unchanged, coverage unchanged to one decimal) |
 | `editor/audit.rs` | 339 | 98.2 | Redaction audit trail (documented private extension — ISO 32000 has no native object for this) |
 | `editor/pdfa.rs` | 977 | 80.3 | PDF/A-1b/2b/3b validation + conversion; +51 LOC since the first refresh (`ad35dcb` narrowed `check_cidset_present`'s doc comment now that the gap it guards against is fixed, and split its regression test into a positive end-to-end-conformant case plus a hand-built-missing-`/CIDSet` defense-in-depth case — net +1 unit test) |
 | `editor/pdfx.rs` | 261 | 88.6 | PDF/X colour-space constraint checking (ISO 15930) |
 | `editor/pdfua.rs` | 372 | 98.4 | PDF/UA (ISO 14289-1) Matterhorn-Protocol-style checklist validation |
-| `editor/icc.rs` | 386 | 95.4 | ICC output-intent embedding (used by PDF/A + PDF/X); note this is **write-path** ICC-profile *embedding*, unrelated to §8d's rendering-side ICC-color-management gap (this file never *interprets* a profile's colorimetric transform either — it just embeds the caller-supplied bytes as an `/OutputIntent`) |
+| `editor/icc.rs` | 386 | 95.3 | ICC output-intent embedding (used by PDF/A + PDF/X); note this is **write-path** ICC-profile *embedding*, unrelated to §8d's rendering-side ICC-color-management gap (this file never *interprets* a profile's colorimetric transform either — it just embeds the caller-supplied bytes as an `/OutputIntent`) |
 | `editor/xmp.rs` | 366 | 94.0 | XMP metadata packet generation/embedding |
 | `editor/content_ops.rs` | 331 | 78.0 | Insert/replace text/shapes/images on an existing page; `MAX_CONTENT_STREAM_BYTES` |
-| `editor/content_stream.rs` | 615 | 69.8 | Round-trippable content-stream operator parser (used by content_ops/redact/text_extract) |
+| `editor/content_stream.rs` | 615 | 72.4 | Round-trippable content-stream operator parser (used by content_ops/redact/text_extract) |
 | `editor/text_extract.rs` | 307 | 85.7 | Text extraction from an existing page's content stream |
 | `editor/save.rs` | 726 | 89.6 | Incremental update *or* full compacted rewrite (object streams + xref stream) |
 | `editor/util.rs` | 239 | 94.3 | Shared helpers |
@@ -1210,13 +1260,17 @@ Notably low files (line coverage), from this run:
   enum literal the compiler attributes to the *calling* file's coverage, not this one; every
   variant is genuinely constructed and returned by some other file's test, per §8d).
 - `ffi.rs` — **0%** (unchanged from the original audit — no test exercises the C ABI layer).
-- `image/mod.rs` — **26.20%** line coverage (unchanged finding from the original audit).
+- `image/mod.rs` — **24.60%** line coverage (worst-covered non-FFI file; this refresh corrects a
+  stale **26.20%** figure carried over from the original audit and repeated, unverified, through
+  the second and third refreshes — see this refresh's provenance entry in §15).
 - `forms/field.rs` — **51.49%** line coverage (100+ public items, still the largest/least-tested
   file in `forms/`).
-- `font/mod.rs` — **45.26%**, `font/metrics.rs` — **49.11%**, `filter/dct.rs` — **49.23%**: all
-  three under 50%, unchanged from prior refreshes.
-- `document/mod.rs` — **78.0%**, `editor/redact.rs` — **73.4%**, `signatures/signer.rs` — **73.0%**
-  — all unchanged from the second refresh, still among the least-covered large files.
+- `font/mod.rs` — **45.26%**, `font/metrics.rs` — **49.11%**: both still under 50%. `filter/dct.rs`
+  is **not** in this bucket any more — this refresh corrects a stale **49.23%** figure (inherited,
+  unverified, since the original audit) to its live-measured **72.31%**.
+- `document/mod.rs` — **78.0%**, `editor/redact.rs` — **73.4%**, `signatures/signer.rs` —
+  **73.39%** (this refresh corrects a stale **73.0%** figure for `signatures/signer.rs`) — all
+  still among the least-covered large files.
 
 Test counts (`cargo test --release --features full,tauri`, third refresh, this pass):
 
@@ -1494,7 +1548,7 @@ module inventory in §2 rather than by extrapolating from a percentage-closed co
   **The "20.9× slower"/"real, measured regression" claim in this bullet is the third refresh's own
   wording and is superseded/retracted by the fourth refresh immediately below — it does not
   reproduce and should not be relied on.**
-- **Fourth refresh** (this pass): a targeted correction, not a full re-audit — the *only* claim
+- **Fourth refresh** (commit `7258c5b`): a targeted correction, not a full re-audit — the *only* claim
   revisited is the third refresh's §8d/§10 performance-regression figure. Re-ran the exact cited
   command, `cargo test --release --features render --test large_file_render_bench -- --ignored
   --nocapture`, against the exact same 2.10 GB/10,000-page cached fixture, **eight consecutive
@@ -1515,3 +1569,38 @@ module inventory in §2 rather than by extrapolating from a percentage-closed co
   `Cargo.{toml,lock}` change, only `ARCHITECTURE.md`. This is, again, the **last commit of this
   remediation** — no `src/**` change follows it (verify: `git log --stat -1` on the commit this
   refresh lands in touches only `ARCHITECTURE.md`).
+- **Fifth refresh** (this pass): a targeted correction, not a full re-audit — the *only* thing
+  revisited is §2's per-file `%Ln` column (line coverage), which a prior remediation review found
+  did not match a live re-run for at least 12 of 105 covered rows despite the third refresh's
+  explicit claim that every row had been. Ran `cargo llvm-cov --release --features full,tauri
+  --summary-only` (cargo-llvm-cov `0.8.7`, the same tool version the third refresh cited) twice
+  back-to-back to check stability, per the same practice as prior refreshes; both runs agreed on
+  every one of the 105 covered files except `parser/recovery.rs` (77.22% one run, 77.64% the
+  next — a genuine, reproduced-live run-to-run flip, not a measurement mistake, documented inline
+  on that file's row instead of picking one number and hiding the other). Computed each file's
+  precise line-coverage percentage directly from the tool's raw covered/total line counts (not by
+  re-rounding its already-2-decimal-rounded display, which independently introduced at least one
+  spurious ±0.1-point error — `filter/lzw.rs` — during this refresh's own first-pass arithmetic,
+  caught and corrected before landing). Found and corrected **16** stale rows in §2 (full list, doc
+  value → live value, in this document's top status banner): most were large, multi-refresh-old
+  errors traceable to the *original* audit's numbers never actually having been re-measured despite
+  being carried forward, relabeled, and asserted as "re-verified" by name through three subsequent
+  refreshes (`filter/mod.rs` 72.9%→90.7%, `filter/dct.rs` 49.2%→72.3%, `object/mod.rs`
+  63.0%→68.9%, `object/array.rs` 81.6%→85.5%, `object/string.rs` 85.9%→89.1%, `page/mod.rs`
+  63.3%→66.7%, `types/rectangle.rs` 91.9%→87.8%, `image/mod.rs` 26.2%→24.6%,
+  `encryption/permissions.rs` 75.5%→70.6%, `editor/content_stream.rs` 69.8%→72.4%,
+  `signatures/signer.rs` 73.0%→73.4%); a few were smaller, genuine drift or rounding-precision
+  fixes (`parser/mod.rs` 93.4%→93.5%, `filter/lzw.rs` 89.3%→89.2%, `editor/icc.rs` 95.4%→95.3%,
+  `editor/structure.rs` 90.8%→90.7%); and `parser/recovery.rs` was changed from a single stale
+  77.2% figure to an explicit 77.2–77.6% range with an inline explanation of the observed
+  instability. Also re-confirmed, unchanged: §2's LOC/file-count totals (48,168 lines / 111 files,
+  same `find` output as the third refresh), and §10/§11/§12's headline aggregate numbers — the
+  crate-wide coverage totals were already exactly reproduced by a live re-run before this refresh
+  (confirmed again this pass), so this was purely a per-file granularity fix, not an aggregate one.
+  Fixed the three places in §10's "Notably low files" prose that restated now-corrected figures
+  (`image/mod.rs`, `filter/dct.rs`, `signatures/signer.rs`). Deliberately did **not** touch
+  §1/§3-§9/§11/§12/§13/§14 narrative or numbers, and did not re-run `cargo audit`/`cargo clippy` —
+  neither is affected by a line-coverage-column correction, and `git diff 7258c5b HEAD -- src/
+  Cargo.toml Cargo.lock` is empty for this commit: only `ARCHITECTURE.md` changed. This is,
+  deliberately, the **last commit of this remediation** — no `src/**` change follows it (verify:
+  `git log --stat -1` on the commit this refresh lands in touches only `ARCHITECTURE.md`).
