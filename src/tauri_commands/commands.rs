@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
-use crate::editor::EditableDocument;
+use crate::editor::{AnnotationInfo, AnnotationKind, EditableDocument};
 use crate::render::Viewport;
 use crate::types::Rectangle;
 
@@ -1874,6 +1874,148 @@ pub async fn get_text_layout(
     get_text_layout_impl(&state, request).await
 }
 
+// ===================================================================
+// list_annotations
+// ===================================================================
+
+/// Arguments for [`list_annotations`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListAnnotationsRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+    /// A single zero-based page to list, or `None` for every page.
+    pub page_index: Option<usize>,
+}
+
+/// Plain-data mirror of [`crate::types::Rectangle`] for IPC results (see
+/// [`RectangleRequest`], its `Deserialize`-only counterpart used for
+/// *incoming* [`add_annotation`] requests).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RectangleResult {
+    pub llx: f64,
+    pub lly: f64,
+    pub urx: f64,
+    pub ury: f64,
+}
+
+impl From<Rectangle> for RectangleResult {
+    fn from(r: Rectangle) -> Self {
+        Self {
+            llx: r.llx,
+            lly: r.lly,
+            urx: r.urx,
+            ury: r.ury,
+        }
+    }
+}
+
+/// A markup/comment annotation's `/Subtype`, as a stable lowercase
+/// `snake_case` string a frontend can match on (mirroring the `type` tag
+/// [`AnnotationRequest`] itself uses on the way in) rather than exposing
+/// [`AnnotationKind`]'s Rust variant names directly across the IPC
+/// boundary.
+fn annotation_kind_str(kind: AnnotationKind) -> &'static str {
+    match kind {
+        AnnotationKind::Highlight => "highlight",
+        AnnotationKind::Underline => "underline",
+        AnnotationKind::StrikeOut => "strike_out",
+        AnnotationKind::FreeText => "free_text",
+        AnnotationKind::Stamp => "stamp",
+        AnnotationKind::Ink => "ink",
+        AnnotationKind::Text => "text",
+        AnnotationKind::Popup => "popup",
+        AnnotationKind::Other => "other",
+    }
+}
+
+/// One annotation as read back by [`list_annotations`], plain-data mirror
+/// of [`AnnotationInfo`] for IPC.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnnotationInfoResult {
+    pub id: ObjectIdResult,
+    /// See [`annotation_kind_str`]; `"other"` covers any `/Subtype` this
+    /// crate doesn't specifically model (e.g. `/Link`, `/Widget`).
+    pub kind: &'static str,
+    pub rect: RectangleResult,
+    /// `/Contents` (comment text / free text body), if any.
+    pub contents: Option<String>,
+    /// `/T` (author/title), if any.
+    pub author: Option<String>,
+}
+
+impl From<AnnotationInfo> for AnnotationInfoResult {
+    fn from(info: AnnotationInfo) -> Self {
+        Self {
+            id: info.id.into(),
+            kind: annotation_kind_str(info.kind),
+            rect: info.rect.into(),
+            contents: info.contents,
+            author: info.author,
+        }
+    }
+}
+
+/// One page's annotations, as returned by [`list_annotations`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PageAnnotationsResult {
+    pub page_index: usize,
+    pub annotations: Vec<AnnotationInfoResult>,
+}
+
+/// Lists every markup/comment annotation on one page, or every page, of
+/// an open document -- the read-back counterpart to [`add_annotation`],
+/// via [`EditableDocument::list_annotations`]. A page with no `/Annots`
+/// array (or an empty one) reports an empty `annotations` Vec for that
+/// page, not an error.
+pub async fn list_annotations_impl(
+    state: &AppState,
+    request: ListAnnotationsRequest,
+) -> Result<Vec<PageAnnotationsResult>, CommandError> {
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+
+    state
+        .pool
+        .run(move || {
+            let doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let page_count = doc.page_count().map_err(CommandError::from)?;
+            let indices: Vec<usize> = match request.page_index {
+                Some(index) => {
+                    if index >= page_count {
+                        return Err(CommandError::invalid_argument(format!(
+                            "page index {index} out of range (document has {page_count} pages)"
+                        )));
+                    }
+                    vec![index]
+                }
+                None => (0..page_count).collect(),
+            };
+
+            let mut pages = Vec::with_capacity(indices.len());
+            for index in indices {
+                let annotations = doc.list_annotations(index).map_err(CommandError::from)?;
+                pages.push(PageAnnotationsResult {
+                    page_index: index,
+                    annotations: annotations.into_iter().map(AnnotationInfoResult::from).collect(),
+                });
+            }
+            Ok(pages)
+        })
+        .await
+}
+
+/// Tauri command wrapper for [`list_annotations_impl`].
+#[tauri::command]
+pub async fn list_annotations(
+    state: tauri::State<'_, AppState>,
+    request: ListAnnotationsRequest,
+) -> Result<Vec<PageAnnotationsResult>, CommandError> {
+    list_annotations_impl(&state, request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3019,6 +3161,142 @@ mod tests {
         let result = get_text_layout_impl(
             &state,
             GetTextLayoutRequest {
+                handle: 999_999,
+                page_index: None,
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn list_annotations_returns_empty_for_document_without_annotations() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let pages = list_annotations_impl(
+            &state,
+            ListAnnotationsRequest {
+                handle: opened.handle,
+                page_index: Some(0),
+            },
+        )
+        .await
+        .expect("listing annotations on a fresh document must succeed");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].page_index, 0);
+        assert!(pages[0].annotations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_annotations_finds_a_just_added_highlight() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        add_annotation_impl(
+            &state,
+            AddAnnotationRequest {
+                handle: opened.handle,
+                annotation: AnnotationRequest::Highlight {
+                    page_index: 0,
+                    quads: vec![(72.0, 690.0, 300.0, 710.0)],
+                    color: ColorRequest { r: 1.0, g: 1.0, b: 0.0 },
+                },
+            },
+        )
+        .await
+        .expect("adding a highlight annotation must succeed");
+
+        let pages = list_annotations_impl(
+            &state,
+            ListAnnotationsRequest {
+                handle: opened.handle,
+                page_index: Some(0),
+            },
+        )
+        .await
+        .expect("listing annotations must succeed");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].annotations.len(), 1);
+        assert_eq!(pages[0].annotations[0].kind, "highlight");
+        assert!(pages[0].annotations[0].id.number > 0);
+    }
+
+    #[tokio::test]
+    async fn list_annotations_reports_comment_contents_and_author() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        add_annotation_impl(
+            &state,
+            AddAnnotationRequest {
+                handle: opened.handle,
+                annotation: AnnotationRequest::Comment {
+                    page_index: 0,
+                    at: (100.0, 100.0),
+                    contents: "a note".to_string(),
+                    author: Some("tester".to_string()),
+                },
+            },
+        )
+        .await
+        .expect("adding a comment must succeed");
+
+        let pages = list_annotations_impl(
+            &state,
+            ListAnnotationsRequest {
+                handle: opened.handle,
+                page_index: Some(0),
+            },
+        )
+        .await
+        .expect("listing annotations must succeed");
+        // The comment creates both a Text (note) and a Popup annotation.
+        assert_eq!(pages[0].annotations.len(), 2);
+        let note = pages[0]
+            .annotations
+            .iter()
+            .find(|a| a.kind == "text")
+            .expect("a Text annotation must be present");
+        assert_eq!(note.contents.as_deref(), Some("a note"));
+        assert_eq!(note.author.as_deref(), Some("tester"));
+    }
+
+    #[tokio::test]
+    async fn list_annotations_scans_every_page_when_page_index_is_none() {
+        let state = test_state();
+        let (opened, _fixture_path) = open_multi_page_sample(&state, 3).await;
+        let pages = list_annotations_impl(
+            &state,
+            ListAnnotationsRequest {
+                handle: opened.handle,
+                page_index: None,
+            },
+        )
+        .await
+        .expect("listing annotations across every page must succeed");
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages.iter().map(|p| p.page_index).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn list_annotations_rejects_out_of_range_page() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let result = list_annotations_impl(
+            &state,
+            ListAnnotationsRequest {
+                handle: opened.handle,
+                page_index: Some(5),
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_annotations_rejects_unknown_handle() {
+        let state = test_state();
+        let result = list_annotations_impl(
+            &state,
+            ListAnnotationsRequest {
                 handle: 999_999,
                 page_index: None,
             },
