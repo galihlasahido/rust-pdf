@@ -60,6 +60,8 @@
 mod annotations;
 mod audit;
 mod content_ops;
+#[cfg(feature = "encryption")]
+mod encrypt;
 // `pub(crate)` (not private) so `crate::render::native` (feature
 // `native-render`) can reuse this generic content-stream tokenizer instead
 // of re-implementing its own ISO 32000-1 7.8.2 operand grammar. The
@@ -79,7 +81,10 @@ mod save;
 mod structure;
 mod text_extract;
 mod util;
+mod watermark;
 pub mod xmp;
+
+pub use watermark::WatermarkOptions;
 
 pub use annotations::{AnnotationInfo, AnnotationKind};
 pub use audit::RedactionAuditEntry;

@@ -1,4 +1,4 @@
-//! The nine Tauri commands for this phase.
+//! The Tauri commands for this crate's Tauri Integration phases.
 //!
 //! Every command follows the same shape: a plain `..._impl` async
 //! function containing the real logic (no Tauri types, so it is directly
@@ -6,6 +6,13 @@
 //! `#[tauri::command]` wrapper that extracts Tauri's `State`/`AppHandle`
 //! and forwards to it. See the [module docs](super) for the overall
 //! architecture and error/progress-reporting conventions.
+//!
+//! The original nine commands ([`open_document`], [`render_page`],
+//! [`extract_text`], [`search_text`], [`apply_edit`], [`save_document`],
+//! [`fill_form`], [`add_annotation`], [`sign_document`]) were joined by a
+//! second batch adding PDF/A conversion, password encryption,
+//! merge/split, and watermarking: [`convert_to_pdfa`], [`set_password`],
+//! [`merge_documents`], [`split_document`], [`add_watermark`].
 
 use std::path::{Path, PathBuf};
 
@@ -1125,6 +1132,546 @@ pub async fn sign_document<R: tauri::Runtime>(
     sign_document_impl(&state, request, progress).await
 }
 
+// ===================================================================
+// convert_to_pdfa
+// ===================================================================
+
+/// Which PDF/A "b" (basic) conformance level to target; see
+/// [`crate::editor::PdfAFlavor`] for the underlying flavor and its
+/// documented (partial, explicitly-scoped) rule coverage.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PdfAFlavorRequest {
+    #[serde(rename = "1b")]
+    Part1B,
+    #[serde(rename = "2b")]
+    Part2B,
+    #[serde(rename = "3b")]
+    Part3B,
+}
+
+impl From<PdfAFlavorRequest> for crate::editor::PdfAFlavor {
+    fn from(flavor: PdfAFlavorRequest) -> Self {
+        match flavor {
+            PdfAFlavorRequest::Part1B => crate::editor::PdfAFlavor::Part1B,
+            PdfAFlavorRequest::Part2B => crate::editor::PdfAFlavor::Part2B,
+            PdfAFlavorRequest::Part3B => crate::editor::PdfAFlavor::Part3B,
+        }
+    }
+}
+
+/// Arguments for [`convert_to_pdfa`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConvertToPdfaRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+    pub flavor: PdfAFlavorRequest,
+    /// ICC profile bytes for the mandatory `/OutputIntent` (ISO 19005-1
+    /// 6.2.2). This crate never bundles one itself (see
+    /// [`crate::editor::icc`]'s module docs) - the caller (typically a
+    /// desktop app vendoring e.g. `sRGB2014.icc`) must supply real
+    /// profile bytes.
+    pub icc_profile: Vec<u8>,
+    /// `/OutputConditionIdentifier` (e.g. `"sRGB IEC61966-2.1"`).
+    pub icc_identifier: String,
+    /// `/OutputCondition` (free text).
+    pub icc_condition: String,
+    /// `dc:title` written into the XMP packet.
+    pub title: Option<String>,
+    /// `pdf:Producer` / `xmp:CreatorTool`.
+    pub producer: Option<String>,
+}
+
+/// What [`convert_to_pdfa`] actually changed, mirroring
+/// [`crate::editor::PdfAConversionSummary`] as plain IPC-`Serialize`able
+/// data.
+#[derive(Debug, Clone, Serialize)]
+pub struct PdfAConversionSummaryResult {
+    pub lzw_streams_reencoded: usize,
+    pub extgstates_disabled: usize,
+    pub transparency_groups_removed: usize,
+    pub output_intent_added: bool,
+    pub catalog_entries_removed: Vec<String>,
+}
+
+impl From<crate::editor::PdfAConversionSummary> for PdfAConversionSummaryResult {
+    fn from(summary: crate::editor::PdfAConversionSummary) -> Self {
+        Self {
+            lzw_streams_reencoded: summary.lzw_streams_reencoded,
+            extgstates_disabled: summary.extgstates_disabled,
+            transparency_groups_removed: summary.transparency_groups_removed,
+            output_intent_added: summary.output_intent_added,
+            catalog_entries_removed: summary.catalog_entries_removed.into_iter().map(str::to_string).collect(),
+        }
+    }
+}
+
+/// Result of [`convert_to_pdfa`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ConvertToPdfaResult {
+    /// Whether the document validates as fully conformant (within this
+    /// crate's [documented rule coverage](crate::editor::pdfa)) *after*
+    /// conversion.
+    ///
+    /// **Important caveat, not hidden**: this reflects validating bytes
+    /// produced by [`crate::editor::EditableDocument::save_pdfa_compatible_to_bytes`]
+    /// (the classic-xref, no-`ObjStm` writer PDF/A-1b in particular
+    /// requires) - it does **not** reflect what [`save_document`] will
+    /// actually write. `convert_to_pdfa` only mutates the open
+    /// document's in-memory object graph (exactly like `apply_edit`);
+    /// if the caller's next step is a plain `save_document` with
+    /// `SaveMode::FullRewrite`, that path uses
+    /// [`crate::editor::EditableDocument::save_full_rewrite_to_bytes`],
+    /// which prefers compressed object streams/cross-reference streams
+    /// that PDF/A-1b (defined against the pre-1.5 PDF 1.4 Reference)
+    /// forbids - so the file actually saved to disk may not match this
+    /// report for that flavor. A caller that needs genuinely conformant
+    /// bytes on disk must serialize via that PDF/A-specific writer
+    /// directly (not currently exposed as a `save_document` `SaveMode`
+    /// variant - a known gap, called out here rather than papered over).
+    pub conformant: bool,
+    pub summary: PdfAConversionSummaryResult,
+    /// Human-readable `"{rule}: {message}"` for every violation still
+    /// present after conversion (empty if `conformant`).
+    pub remaining_violations: Vec<String>,
+}
+
+/// Converts an already-open document towards PDF/A conformance (ISO
+/// 19005-1/2/3, "b" levels only - see [`crate::editor::pdfa`] for exactly
+/// what is/isn't checked and fixed), mutating its in-memory object graph
+/// exactly like [`apply_edit`] does. See [`ConvertToPdfaResult::conformant`]'s
+/// doc comment for an important caveat about what a later plain
+/// `save_document` call will (and won't) preserve.
+pub async fn convert_to_pdfa_impl(
+    state: &AppState,
+    request: ConvertToPdfaRequest,
+) -> Result<ConvertToPdfaResult, CommandError> {
+    if request.icc_profile.is_empty() {
+        return Err(CommandError::invalid_argument("icc_profile must not be empty"));
+    }
+    if request.icc_identifier.trim().is_empty() {
+        return Err(CommandError::invalid_argument("icc_identifier must not be empty"));
+    }
+
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+    let flavor: crate::editor::PdfAFlavor = request.flavor.into();
+
+    state
+        .pool
+        .run(move || {
+            let mut doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let options = crate::editor::PdfAConversionOptions {
+                icc_profile: &request.icc_profile,
+                icc_identifier: &request.icc_identifier,
+                icc_condition: &request.icc_condition,
+                title: request.title.as_deref(),
+                producer: request.producer.as_deref(),
+            };
+            let summary = doc.convert_to_pdfa(flavor, &options).map_err(CommandError::from)?;
+
+            // Validate against what a PDF/A-aware save would actually
+            // produce -- see `ConvertToPdfaResult::conformant`'s doc
+            // comment for why this does not necessarily match what
+            // `save_document` itself will write.
+            let pdfa_bytes = doc
+                .save_pdfa_compatible_to_bytes(flavor.min_pdf_version())
+                .map_err(CommandError::from)?;
+            drop(doc);
+            let reopened = EditableDocument::from_bytes(pdfa_bytes).map_err(CommandError::from)?;
+            let report = reopened.validate_pdfa(flavor).map_err(CommandError::from)?;
+
+            Ok(ConvertToPdfaResult {
+                conformant: report.is_conformant(),
+                summary: summary.into(),
+                remaining_violations: report
+                    .violations
+                    .iter()
+                    .map(|v| format!("{}: {}", v.rule, v.message))
+                    .collect(),
+            })
+        })
+        .await
+}
+
+/// Tauri command wrapper for [`convert_to_pdfa_impl`].
+#[tauri::command]
+pub async fn convert_to_pdfa(
+    state: tauri::State<'_, AppState>,
+    request: ConvertToPdfaRequest,
+) -> Result<ConvertToPdfaResult, CommandError> {
+    convert_to_pdfa_impl(&state, request).await
+}
+
+// ===================================================================
+// set_password
+// ===================================================================
+
+/// Which encryption algorithm to apply; see
+/// [`crate::encryption::EncryptionAlgorithm`].
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptionAlgorithmRequest {
+    Aes128,
+    Aes256,
+}
+
+/// Arguments for [`set_password`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetPasswordRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+    /// Password required to open the document. Empty means "no open
+    /// password" (permissions from `owner_password` still apply).
+    #[serde(default)]
+    pub user_password: String,
+    /// Password required to bypass permission restrictions. Empty means
+    /// this crate generates the encryption without a distinct owner
+    /// secret (see [`crate::encryption::EncryptionConfig::owner_password`]).
+    #[serde(default)]
+    pub owner_password: String,
+    pub algorithm: EncryptionAlgorithmRequest,
+    /// Output path for the encrypted copy. Like [`sign_document`],
+    /// encrypting always writes a **new** file rather than mutating the
+    /// still-open, still-unencrypted in-memory document -- see this
+    /// command's own doc comment for why that isn't optional here.
+    pub output_path: String,
+}
+
+/// Result of [`set_password`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SetPasswordResult {
+    /// Path the encrypted PDF was written to.
+    pub path: String,
+    /// Number of bytes written.
+    pub bytes_written: usize,
+}
+
+/// Applies password/permission encryption (ISO 32000-2 Section 7.6,
+/// AES-128 or AES-256) to an already-open document, writing the
+/// encrypted result to `output_path`.
+///
+/// **A real, disclosed gap, not papered over**: unlike every other
+/// command in this module, this is **not** an in-place edit you can
+/// later persist via a plain `save_document` -
+/// [`crate::editor::EditableDocument`] (an arbitrary already-open,
+/// already-parsed document) has no incremental "encrypt on next save"
+/// facility - only [`crate::document::DocumentBuilder::encrypt`] can
+/// encrypt, and only for a document built entirely from scratch via
+/// [`crate::document::DocumentBuilder`]/[`crate::page::PageBuilder`],
+/// never for an arbitrary already-open source PDF. This command instead
+/// calls [`crate::editor::EditableDocument::save_encrypted_to_bytes`],
+/// which does a dedicated one-shot full-graph rewrite with encryption
+/// baked in (see that method's module docs for the full rationale) and
+/// returns brand-new bytes; the original open document handle is left
+/// completely untouched and still editable/re-saveable afterwards.
+///
+/// **Bigger caveat, also not hidden**: this crate's own parser cannot
+/// reopen its own encrypted output at all (no decryption filter is
+/// implemented anywhere in this crate - see
+/// [`OpenDocumentRequest::password`]'s doc comment for the same gap on
+/// the reading side). The file this command produces is genuinely,
+/// correctly encrypted per ISO 32000-2 and opens fine in any real
+/// conformant reader (Acrobat, etc.) with the configured password, but
+/// **cannot be reopened via `open_document`** by this same application.
+pub async fn set_password_impl(
+    state: &AppState,
+    request: SetPasswordRequest,
+) -> Result<SetPasswordResult, CommandError> {
+    validate_path_argument(&request.output_path)?;
+    if request.user_password.is_empty() && request.owner_password.is_empty() {
+        return Err(CommandError::invalid_argument(
+            "at least one of user_password/owner_password must be non-empty",
+        ));
+    }
+
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+    let output_path = PathBuf::from(&request.output_path);
+    let write_path = output_path.clone();
+
+    let bytes_written = state
+        .pool
+        .run(move || {
+            let doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            let mut config = match request.algorithm {
+                EncryptionAlgorithmRequest::Aes128 => crate::encryption::EncryptionConfig::aes128(),
+                EncryptionAlgorithmRequest::Aes256 => crate::encryption::EncryptionConfig::aes256(),
+            };
+            if !request.user_password.is_empty() {
+                config = config.user_password(request.user_password.clone());
+            }
+            if !request.owner_password.is_empty() {
+                config = config.owner_password(request.owner_password.clone());
+            }
+
+            let bytes = doc.save_encrypted_to_bytes(config).map_err(CommandError::from)?;
+            std::fs::write(&write_path, &bytes).map_err(CommandError::from)?;
+            Ok(bytes.len())
+        })
+        .await?;
+
+    Ok(SetPasswordResult {
+        path: output_path.to_string_lossy().into_owned(),
+        bytes_written,
+    })
+}
+
+/// Tauri command wrapper for [`set_password_impl`].
+#[tauri::command]
+pub async fn set_password(
+    state: tauri::State<'_, AppState>,
+    request: SetPasswordRequest,
+) -> Result<SetPasswordResult, CommandError> {
+    set_password_impl(&state, request).await
+}
+
+// ===================================================================
+// merge_documents
+// ===================================================================
+
+/// One document to fold into a [`merge_documents`] call: either an
+/// already-open handle, or a filesystem path opened fresh just for the
+/// merge (not registered in [`AppState`], and not kept open afterwards).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MergeSource {
+    Handle { handle: u64 },
+    Path { path: String },
+}
+
+/// Arguments for [`merge_documents`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct MergeDocumentsRequest {
+    /// At least 2 sources, appended in order.
+    pub sources: Vec<MergeSource>,
+}
+
+enum ResolvedMergeSource {
+    Handle(super::state::DocumentEntryHandle),
+    Path(PathBuf),
+}
+
+/// Merges 2+ documents (each either an already-open handle or a
+/// filesystem path) into one brand-new document, registered in
+/// [`AppState`] under a fresh handle exactly like [`open_document`] -
+/// every other command (`render_page`, `apply_edit`, `save_document`,
+/// ...) works on that returned handle immediately.
+///
+/// The merged document has no source file of its own (see
+/// [`crate::editor::EditableDocument::new_empty`]), so
+/// [`save_document`]'s `path: None` (default to the handle's open path)
+/// has nothing to default to - a caller must pass an explicit `path`
+/// when first saving a document produced by this command.
+pub async fn merge_documents_impl(
+    state: &AppState,
+    request: MergeDocumentsRequest,
+) -> Result<OpenDocumentResult, CommandError> {
+    if request.sources.len() < 2 {
+        return Err(CommandError::invalid_argument(
+            "merge_documents requires at least 2 sources",
+        ));
+    }
+
+    let mut resolved = Vec::with_capacity(request.sources.len());
+    for source in &request.sources {
+        match source {
+            MergeSource::Handle { handle } => {
+                let entry = state.get_document(DocumentHandle(*handle))?;
+                resolved.push(ResolvedMergeSource::Handle(entry));
+            }
+            MergeSource::Path { path } => {
+                validate_path_argument(path)?;
+                resolved.push(ResolvedMergeSource::Path(PathBuf::from(path)));
+            }
+        }
+    }
+
+    let merged = state
+        .pool
+        .run(move || {
+            let mut merged = EditableDocument::new_empty().map_err(CommandError::from)?;
+            for source in resolved {
+                match source {
+                    ResolvedMergeSource::Handle(entry) => {
+                        let doc = entry
+                            .doc
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        merged.append_document(&doc).map_err(CommandError::from)?;
+                    }
+                    ResolvedMergeSource::Path(path) => {
+                        let doc = EditableDocument::open(&path).map_err(CommandError::from)?;
+                        merged.append_document(&doc).map_err(CommandError::from)?;
+                    }
+                }
+            }
+            Ok(merged)
+        })
+        .await?;
+
+    let page_count = merged.page_count().map_err(CommandError::from)?;
+    let handle = state.insert_document(PathBuf::new(), merged);
+    Ok(OpenDocumentResult {
+        handle: handle.0,
+        page_count,
+    })
+}
+
+/// Tauri command wrapper for [`merge_documents_impl`].
+#[tauri::command]
+pub async fn merge_documents(
+    state: tauri::State<'_, AppState>,
+    request: MergeDocumentsRequest,
+) -> Result<OpenDocumentResult, CommandError> {
+    merge_documents_impl(&state, request).await
+}
+
+// ===================================================================
+// split_document
+// ===================================================================
+
+/// Arguments for [`split_document`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct SplitDocumentRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+    /// Zero-based page indices to extract into the new document, in the
+    /// given order (may reorder/duplicate pages from the source).
+    pub page_indices: Vec<usize>,
+}
+
+/// Extracts the given page indices of an already-open document into a
+/// brand-new, standalone document (the source document is not modified),
+/// registered in [`AppState`] under a fresh handle exactly like
+/// [`open_document`]/[`merge_documents`]. See
+/// [`merge_documents_impl`]'s doc comment for the same "no default save
+/// path" note, which applies here too.
+pub async fn split_document_impl(
+    state: &AppState,
+    request: SplitDocumentRequest,
+) -> Result<OpenDocumentResult, CommandError> {
+    if request.page_indices.is_empty() {
+        return Err(CommandError::invalid_argument(
+            "split_document requires at least one page index",
+        ));
+    }
+
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+
+    let split = state
+        .pool
+        .run(move || {
+            let doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let page_count = doc.page_count().map_err(CommandError::from)?;
+            for &index in &request.page_indices {
+                if index >= page_count {
+                    return Err(CommandError::invalid_argument(format!(
+                        "page index {index} out of range (document has {page_count} pages)"
+                    )));
+                }
+            }
+            doc.extract_pages(&request.page_indices).map_err(CommandError::from)
+        })
+        .await?;
+
+    let page_count = split.page_count().map_err(CommandError::from)?;
+    let handle = state.insert_document(PathBuf::new(), split);
+    Ok(OpenDocumentResult {
+        handle: handle.0,
+        page_count,
+    })
+}
+
+/// Tauri command wrapper for [`split_document_impl`].
+#[tauri::command]
+pub async fn split_document(
+    state: tauri::State<'_, AppState>,
+    request: SplitDocumentRequest,
+) -> Result<OpenDocumentResult, CommandError> {
+    split_document_impl(&state, request).await
+}
+
+// ===================================================================
+// add_watermark
+// ===================================================================
+
+/// Arguments for [`add_watermark`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddWatermarkRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+    pub text: String,
+    pub font_size: f64,
+    /// `0.0` (invisible) ..= `1.0` (fully opaque); out-of-range values
+    /// are clamped, not rejected (see
+    /// [`crate::editor::WatermarkOptions::opacity`]).
+    pub opacity: f64,
+    /// Counter-clockwise rotation in degrees (`45.0` for a classic
+    /// diagonal watermark).
+    pub rotation_degrees: f64,
+    pub color: ColorRequest,
+}
+
+/// Result of [`add_watermark`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AddWatermarkResult {
+    /// Number of pages watermarked (this document's page count).
+    pub pages_watermarked: usize,
+}
+
+/// Stamps a text watermark across every page of an open document via
+/// content-stream injection (see [`crate::editor::WatermarkOptions`] for
+/// exactly how). Mutates the in-memory object graph exactly like
+/// [`apply_edit`]/[`add_annotation`] - persisted only once
+/// [`save_document`] is called.
+pub async fn add_watermark_impl(
+    state: &AppState,
+    request: AddWatermarkRequest,
+) -> Result<AddWatermarkResult, CommandError> {
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+
+    state
+        .pool
+        .run(move || {
+            let mut doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let options = crate::editor::WatermarkOptions {
+                text: &request.text,
+                font_size: request.font_size,
+                opacity: request.opacity,
+                rotation_degrees: request.rotation_degrees,
+                color: request.color.into(),
+            };
+            let pages_watermarked = doc.add_text_watermark(&options).map_err(CommandError::from)?;
+            Ok(AddWatermarkResult { pages_watermarked })
+        })
+        .await
+}
+
+/// Tauri command wrapper for [`add_watermark_impl`].
+#[tauri::command]
+pub async fn add_watermark(
+    state: tauri::State<'_, AppState>,
+    request: AddWatermarkRequest,
+) -> Result<AddWatermarkResult, CommandError> {
+    add_watermark_impl(&state, request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1680,5 +2227,452 @@ mod tests {
         // Malformed PEM must surface as a structured `SignatureFailed`
         // error, not a panic.
         assert_eq!(result.unwrap_err().code, ErrorCode::SignatureFailed);
+    }
+
+    // -- convert_to_pdfa -----------------------------------------------------
+
+    #[tokio::test]
+    async fn convert_to_pdfa_reports_conformant_for_a_simple_vector_document() {
+        use crate::prelude::*;
+
+        let state = test_state();
+        // A vector-only, font-free, PDF-1.4, no-`/Info /Title` fixture:
+        // `sample_pdf_path`'s fixture (used by every other test in this
+        // module) has a Standard-14 font (never embeddable, ISO 19005-1
+        // 6.3) and its own `/Info /Title`, both of which would (rightly)
+        // still show up as PDF/A violations after conversion since
+        // neither is auto-fixable -- see `crate::editor::pdfa`'s module
+        // docs. This dedicated fixture isolates just the
+        // `convert_to_pdfa` plumbing this test wants to check.
+        let content = ContentBuilder::new().fill_color(Color::rgb(0.2, 0.4, 0.8)).rect(50.0, 50.0, 100.0, 100.0).fill();
+        let page = PageBuilder::a4().content(content).build();
+        let bytes = DocumentBuilder::new().version(PdfVersion::V1_4).page(page).build().unwrap().save_to_bytes().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "rust_pdf_tauri_commands_pdfa_test_{}.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let opened = open_document_impl(
+            &state,
+            OpenDocumentRequest {
+                path: path.to_string_lossy().into_owned(),
+                password: None,
+            },
+        )
+        .await
+        .expect("opening the vector-only fixture must succeed");
+
+        let icc = crate::editor::icc::test_support::fake_icc_profile(crate::editor::icc::IccColorSpace::Rgb);
+        let result = convert_to_pdfa_impl(
+            &state,
+            ConvertToPdfaRequest {
+                handle: opened.handle,
+                flavor: PdfAFlavorRequest::Part1B,
+                icc_profile: icc,
+                icc_identifier: "sRGB IEC61966-2.1".to_string(),
+                icc_condition: "sRGB".to_string(),
+                title: Some("Test".to_string()),
+                producer: Some("rust-pdf tests".to_string()),
+            },
+        )
+        .await
+        .expect("convert_to_pdfa must succeed");
+        assert!(result.summary.output_intent_added);
+        assert!(result.conformant, "violations: {:?}", result.remaining_violations);
+        assert!(result.remaining_violations.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn convert_to_pdfa_rejects_empty_icc_profile() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let result = convert_to_pdfa_impl(
+            &state,
+            ConvertToPdfaRequest {
+                handle: opened.handle,
+                flavor: PdfAFlavorRequest::Part1B,
+                icc_profile: Vec::new(),
+                icc_identifier: "sRGB IEC61966-2.1".to_string(),
+                icc_condition: "sRGB".to_string(),
+                title: None,
+                producer: None,
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn convert_to_pdfa_rejects_unknown_handle() {
+        let state = test_state();
+        let icc = crate::editor::icc::test_support::fake_icc_profile(crate::editor::icc::IccColorSpace::Rgb);
+        let result = convert_to_pdfa_impl(
+            &state,
+            ConvertToPdfaRequest {
+                handle: 12345,
+                flavor: PdfAFlavorRequest::Part2B,
+                icc_profile: icc,
+                icc_identifier: "sRGB IEC61966-2.1".to_string(),
+                icc_condition: "sRGB".to_string(),
+                title: None,
+                producer: None,
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    // -- set_password ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_password_writes_a_structurally_encrypted_file() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let out_path = std::env::temp_dir().join(format!(
+            "rust_pdf_tauri_commands_set_password_test_{}.pdf",
+            std::process::id()
+        ));
+        let result = set_password_impl(
+            &state,
+            SetPasswordRequest {
+                handle: opened.handle,
+                user_password: "user-secret".to_string(),
+                owner_password: "owner-secret".to_string(),
+                algorithm: EncryptionAlgorithmRequest::Aes256,
+                output_path: out_path.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .expect("set_password must succeed");
+        assert!(result.bytes_written > 0);
+
+        let saved = std::fs::read(&out_path).expect("encrypted file must exist");
+        assert!(saved.starts_with(b"%PDF-"));
+        let text = String::from_utf8_lossy(&saved);
+        assert!(text.contains("/Encrypt"));
+
+        // The original, still-open document must remain usable
+        // (unencrypted) after exporting an encrypted copy -- see
+        // `set_password_impl`'s own doc comment.
+        let extracted = extract_text_impl(
+            &state,
+            ExtractTextRequest {
+                handle: opened.handle,
+                page_index: Some(0),
+            },
+            no_progress(),
+        )
+        .await
+        .expect("the original open document must still be usable after set_password");
+        assert!(extracted[0].text.contains("Hello"));
+
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[tokio::test]
+    async fn set_password_rejects_empty_passwords() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let out_path = std::env::temp_dir().join(format!(
+            "rust_pdf_tauri_commands_set_password_test2_{}.pdf",
+            std::process::id()
+        ));
+        let result = set_password_impl(
+            &state,
+            SetPasswordRequest {
+                handle: opened.handle,
+                user_password: String::new(),
+                owner_password: String::new(),
+                algorithm: EncryptionAlgorithmRequest::Aes256,
+                output_path: out_path.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    // -- merge_documents --------------------------------------------------------
+
+    #[tokio::test]
+    async fn merge_documents_combines_an_open_handle_and_a_path() {
+        let state = test_state();
+        let opened = open_sample(&state).await; // 1 page ("Hello, rust-pdf tests!")
+
+        // A second, independent fixture file on disk to merge in by path.
+        let second_path = {
+            use crate::prelude::*;
+            let content = ContentBuilder::new().text("F1", 12.0, 72.0, 700.0, "Second document page");
+            let page = PageBuilder::a4().font("F1", Standard14Font::Helvetica).content(content).build();
+            let bytes = DocumentBuilder::new().page(page).build().unwrap().save_to_bytes().unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "rust_pdf_tauri_commands_merge_test_{}.pdf",
+                std::process::id()
+            ));
+            std::fs::write(&path, &bytes).unwrap();
+            path
+        };
+
+        let result = merge_documents_impl(
+            &state,
+            MergeDocumentsRequest {
+                sources: vec![
+                    MergeSource::Handle { handle: opened.handle },
+                    MergeSource::Path {
+                        path: second_path.to_string_lossy().into_owned(),
+                    },
+                ],
+            },
+        )
+        .await
+        .expect("merge_documents must succeed");
+        assert_eq!(result.page_count, 2);
+
+        // The merged document is registered like any other open
+        // document: other commands work on its handle immediately.
+        let extracted = extract_text_impl(
+            &state,
+            ExtractTextRequest {
+                handle: result.handle,
+                page_index: None,
+            },
+            no_progress(),
+        )
+        .await
+        .expect("extracting text from the merged document must succeed");
+        assert_eq!(extracted.len(), 2);
+        assert!(extracted[0].text.contains("Hello"));
+        assert!(extracted[1].text.contains("Second document page"));
+
+        let _ = std::fs::remove_file(&second_path);
+    }
+
+    #[tokio::test]
+    async fn merge_documents_rejects_fewer_than_two_sources() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let result = merge_documents_impl(
+            &state,
+            MergeDocumentsRequest {
+                sources: vec![MergeSource::Handle { handle: opened.handle }],
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn merge_documents_rejects_unknown_handle() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let result = merge_documents_impl(
+            &state,
+            MergeDocumentsRequest {
+                sources: vec![
+                    MergeSource::Handle { handle: opened.handle },
+                    MergeSource::Handle { handle: 999_999 },
+                ],
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    // -- split_document -----------------------------------------------------
+
+    /// Writes a fresh `num_pages`-page fixture to a uniquely-named
+    /// temporary file (never reused/collided across concurrently-running
+    /// tests, unlike a name derived only from the process id) and opens
+    /// it. The file is deliberately **not** removed here -
+    /// [`crate::editor::EditableDocument::open`] memory-maps the file
+    /// rather than reading it fully upfront (see that method's own
+    /// docs), so deleting it immediately after open is not safe; callers
+    /// should remove the returned path once they are done with the
+    /// document, exactly like every other on-disk fixture test in this
+    /// module already does.
+    async fn open_multi_page_sample(state: &AppState, num_pages: usize) -> (OpenDocumentResult, std::path::PathBuf) {
+        use crate::prelude::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let mut builder = DocumentBuilder::new();
+        for i in 0..num_pages {
+            let content = ContentBuilder::new().text("F1", 12.0, 72.0, 700.0, &format!("Page number {i}"));
+            let page = PageBuilder::a4().font("F1", Standard14Font::Helvetica).content(content).build();
+            builder = builder.page(page);
+        }
+        let bytes = builder.build().unwrap().save_to_bytes().unwrap();
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust_pdf_tauri_commands_multipage_test_{}_{}_{unique}.pdf",
+            std::process::id(),
+            num_pages
+        ));
+        std::fs::write(&path, &bytes).expect("writing the multi-page fixture must not fail");
+        let opened = open_document_impl(
+            state,
+            OpenDocumentRequest {
+                path: path.to_string_lossy().into_owned(),
+                password: None,
+            },
+        )
+        .await
+        .expect("opening the multi-page fixture must succeed");
+        (opened, path)
+    }
+
+    #[tokio::test]
+    async fn split_document_extracts_the_requested_pages() {
+        let state = test_state();
+        let (opened, fixture_path) = open_multi_page_sample(&state, 4).await;
+
+        let result = split_document_impl(
+            &state,
+            SplitDocumentRequest {
+                handle: opened.handle,
+                page_indices: vec![1, 3],
+            },
+        )
+        .await
+        .expect("split_document must succeed");
+        assert_eq!(result.page_count, 2);
+
+        let extracted = extract_text_impl(
+            &state,
+            ExtractTextRequest {
+                handle: result.handle,
+                page_index: None,
+            },
+            no_progress(),
+        )
+        .await
+        .expect("extracting text from the split document must succeed");
+        assert_eq!(extracted.len(), 2);
+        assert!(extracted[0].text.contains("Page number 1"));
+        assert!(extracted[1].text.contains("Page number 3"));
+
+        // The source document must be unaffected by the split.
+        let source_page_count = render_page_impl(
+            &state,
+            RenderPageRequest {
+                handle: opened.handle,
+                page_index: 3,
+                dpi: 72.0,
+                viewport: None,
+            },
+        )
+        .await;
+        assert!(source_page_count.is_ok(), "source document's page 3 must still exist after split");
+        let _ = std::fs::remove_file(&fixture_path);
+    }
+
+    #[tokio::test]
+    async fn split_document_rejects_empty_page_indices() {
+        let state = test_state();
+        let (opened, fixture_path) = open_multi_page_sample(&state, 2).await;
+        let result = split_document_impl(
+            &state,
+            SplitDocumentRequest {
+                handle: opened.handle,
+                page_indices: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidArgument);
+        let _ = std::fs::remove_file(&fixture_path);
+    }
+
+    #[tokio::test]
+    async fn split_document_rejects_out_of_range_page() {
+        let state = test_state();
+        let (opened, fixture_path) = open_multi_page_sample(&state, 2).await;
+        let result = split_document_impl(
+            &state,
+            SplitDocumentRequest {
+                handle: opened.handle,
+                page_indices: vec![0, 9],
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidArgument);
+        let _ = std::fs::remove_file(&fixture_path);
+    }
+
+    // -- add_watermark --------------------------------------------------------
+
+    #[tokio::test]
+    async fn add_watermark_stamps_every_page() {
+        let state = test_state();
+        let (opened, fixture_path) = open_multi_page_sample(&state, 3).await;
+
+        let result = add_watermark_impl(
+            &state,
+            AddWatermarkRequest {
+                handle: opened.handle,
+                text: "CONFIDENTIAL".to_string(),
+                font_size: 36.0,
+                opacity: 0.3,
+                rotation_degrees: 45.0,
+                color: ColorRequest { r: 0.5, g: 0.5, b: 0.5 },
+            },
+        )
+        .await
+        .expect("add_watermark must succeed");
+        assert_eq!(result.pages_watermarked, 3);
+
+        let extracted = extract_text_impl(
+            &state,
+            ExtractTextRequest {
+                handle: opened.handle,
+                page_index: None,
+            },
+            no_progress(),
+        )
+        .await
+        .expect("extracting text after watermarking must succeed");
+        // The watermark text is appended as its own text-showing
+        // operator; `extract_text`'s content-stream walk picks it up
+        // right alongside the page's original body text.
+        for page in &extracted {
+            assert!(page.text.contains("CONFIDENTIAL"), "page text was: {:?}", page.text);
+        }
+        let _ = std::fs::remove_file(&fixture_path);
+    }
+
+    #[tokio::test]
+    async fn add_watermark_rejects_empty_text() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let result = add_watermark_impl(
+            &state,
+            AddWatermarkRequest {
+                handle: opened.handle,
+                text: String::new(),
+                font_size: 36.0,
+                opacity: 0.3,
+                rotation_degrees: 45.0,
+                color: ColorRequest { r: 0.5, g: 0.5, b: 0.5 },
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn add_watermark_rejects_unknown_handle() {
+        let state = test_state();
+        let result = add_watermark_impl(
+            &state,
+            AddWatermarkRequest {
+                handle: 999_999,
+                text: "DRAFT".to_string(),
+                font_size: 36.0,
+                opacity: 0.3,
+                rotation_degrees: 45.0,
+                color: ColorRequest { r: 0.5, g: 0.5, b: 0.5 },
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
     }
 }

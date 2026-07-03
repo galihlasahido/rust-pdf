@@ -3,7 +3,7 @@
 //! This module is the "Tauri Integration" phase glue between the pure
 //! `rust-pdf` document engine (parser/editor/render/signatures modules)
 //! and a Tauri desktop application's IPC surface. It provides the nine
-//! commands requested for this phase:
+//! commands requested for the original phase:
 //!
 //! - [`commands::open_document`]
 //! - [`commands::render_page`]
@@ -14,6 +14,15 @@
 //! - [`commands::fill_form`]
 //! - [`commands::add_annotation`]
 //! - [`commands::sign_document`]
+//!
+//! plus five more added in a later phase (PDF/A conversion, password
+//! encryption, merge/split, watermarking):
+//!
+//! - [`commands::convert_to_pdfa`]
+//! - [`commands::set_password`]
+//! - [`commands::merge_documents`]
+//! - [`commands::split_document`]
+//! - [`commands::add_watermark`]
 //!
 //! all `async fn`s registerable directly with `tauri::generate_handler!`,
 //! backed by a single dedicated worker thread pool ([`worker::WorkerPool`])
@@ -97,6 +106,11 @@
 //!             commands::fill_form,
 //!             commands::add_annotation,
 //!             commands::sign_document,
+//!             commands::convert_to_pdfa,
+//!             commands::set_password,
+//!             commands::merge_documents,
+//!             commands::split_document,
+//!             commands::add_watermark,
 //!         ])
 //!         .run(tauri::generate_context!())
 //!         .expect("error while running tauri application");
