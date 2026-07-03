@@ -428,12 +428,25 @@ fn resolve_composite(font_dict: &PdfDictionary) -> CompositeFontRt {
     let descriptor = dict_of(descendant, "FontDescriptor");
     let program = descriptor.map(load_font_program).unwrap_or(FontProgram::Unsupported(UnsupportedFontReason::NotEmbedded));
 
+    // `/CIDToGIDMap` streams are commonly `/FlateDecode`-compressed (a
+    // full-size, unsubset CID font can have tens of thousands of 2-byte
+    // entries), so this must go through `PdfStream::decode_all` rather
+    // than `PdfStream::data`'s raw bytes -- see `stream_bytes` above for
+    // the identical bug this crate already hit once for `FontFile*`
+    // streams. Reading raw (still-compressed) bytes here doesn't fail to
+    // load like a font program does; it silently produces a "valid but
+    // wrong" GID for every CID (each pair of compressed bytes reinterpreted
+    // as a big-endian u16), which renders as consistently wrong glyphs
+    // rather than a caught error -- worse than a hard failure, hence the
+    // regression test below.
     let cid_to_gid = match descendant.get("CIDToGIDMap") {
-        Some(Object::Stream(s)) => {
-            let bytes = s.data();
-            let map = bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-            CidToGidMap::Mapped(map)
-        }
+        Some(Object::Stream(s)) => match s.decode_all() {
+            Ok(bytes) => {
+                let map = bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+                CidToGidMap::Mapped(map)
+            }
+            Err(_) => CidToGidMap::Identity,
+        },
         _ => CidToGidMap::Identity,
     };
 
@@ -535,8 +548,19 @@ fn resolve_type3(font_dict: &PdfDictionary) -> Type3Font {
     let mut char_procs = BTreeMap::new();
     if let Some(Object::Dictionary(procs)) = font_dict.get("CharProcs") {
         for (name, obj) in procs.iter() {
+            // Type 3 glyph procedures are content streams (ISO 32000-1
+            // 9.6.5.2) and just as commonly `/FlateDecode`-compressed as
+            // any other content stream -- see `stream_bytes`'s doc
+            // comment for the identical bug this crate already hit for
+            // `FontFile*`/`CIDToGIDMap`. A glyph proc that fails to
+            // decode is skipped (left out of `char_procs`) rather than
+            // inserted as undecoded, non-content-stream bytes that would
+            // otherwise be fed to the interpreter and fail/misbehave in a
+            // more confusing way at glyph-paint time.
             if let Object::Stream(s) = obj {
-                char_procs.insert(name.clone(), s.data().to_vec());
+                if let Ok(decoded) = s.decode_all() {
+                    char_procs.insert(name.clone(), decoded);
+                }
             }
         }
     }
@@ -773,6 +797,53 @@ mod tests {
         let mut map_bytes = vec![0u8; 12];
         map_bytes[10..12].copy_from_slice(&1u16.to_be_bytes());
         descendant.set("CIDToGIDMap", Object::Stream(PdfStream::new(map_bytes)));
+
+        let mut font_dict = PdfDictionary::new();
+        font_dict.set("Subtype", Object::Name(PdfName::new_unchecked("Type0")));
+        let mut descendants = PdfArray::new();
+        descendants.push(Object::Dictionary(descendant));
+        font_dict.set("DescendantFonts", Object::Array(descendants));
+
+        let resolved = resolve_font(&font_dict);
+        match resolved {
+            ResolvedFont::Composite(f) => {
+                assert_eq!(composite_glyph_id(&f, 5), 1);
+                assert_eq!(composite_glyph_id(&f, 0), 0);
+            }
+            _ => panic!("expected a Composite font"),
+        }
+    }
+
+    /// Regression test for a real-world bug (same class as
+    /// `resolves_flate_compressed_truetype_font_file2` above): the
+    /// `/CIDToGIDMap` stream is commonly `/FlateDecode`-compressed (a
+    /// full, unsubset font's map can have tens of thousands of 2-byte
+    /// entries), and reading its raw, undecoded bytes doesn't fail --
+    /// it silently reinterprets compressed bytes as a big-endian `u16`
+    /// GID for every CID, producing consistently *wrong* glyphs (garbled
+    /// text) rather than a caught error. Caught via a document with a
+    /// genuinely Flate-compressed `/CIDToGIDMap` (as commonly produced by
+    /// e.g. fpdf2/ReportLab-family PDF producers), not this crate's own
+    /// (uncompressed-by-default)
+    /// `resolves_composite_with_explicit_cid_to_gid_map` fixture above.
+    #[test]
+    fn resolves_flate_compressed_cid_to_gid_map() {
+        let font_bytes = build_test_font(&[('A', 1)]);
+        let mut descriptor = PdfDictionary::new();
+        descriptor.set("FontFile2", Object::Stream(PdfStream::new(font_bytes)));
+        let mut descendant = PdfDictionary::new();
+        descendant.set("FontDescriptor", Object::Dictionary(descriptor));
+        // CID 5 -> GID 1, same mapping as the uncompressed test above.
+        let mut map_bytes = vec![0u8; 12];
+        map_bytes[10..12].copy_from_slice(&1u16.to_be_bytes());
+        let compressed_map = PdfStream::new(map_bytes)
+            .with_compression()
+            .expect("compress");
+        assert!(
+            compressed_map.dictionary.get("Filter").is_some(),
+            "test setup: with_compression() should have set /Filter"
+        );
+        descendant.set("CIDToGIDMap", Object::Stream(compressed_map));
 
         let mut font_dict = PdfDictionary::new();
         font_dict.set("Subtype", Object::Name(PdfName::new_unchecked("Type0")));

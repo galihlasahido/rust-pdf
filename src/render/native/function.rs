@@ -161,9 +161,20 @@ fn object_dict(obj: &Object) -> Option<&PdfDictionary> {
     }
 }
 
-fn object_data(obj: &Object) -> Option<&[u8]> {
+/// Extracts and fully decodes a Type 0 (sampled) or Type 4 (PostScript
+/// calculator) function stream (ISO 32000-1 §7.10). Both are commonly
+/// `/FlateDecode`-compressed (a sampled function's data table especially,
+/// which can be large), so this must apply the stream's declared filter
+/// chain via [`PdfStream::decode_all`] rather than reading the raw,
+/// possibly-still-compressed bytes directly -- the identical bug this
+/// crate already hit for `FontFile*`/`CIDToGIDMap` streams (see
+/// `super::font::stream_bytes`'s doc comment). Undecoded sample data
+/// doesn't fail to parse the way an undecoded font program does; it
+/// silently produces plausible-looking but wrong tint-transform output
+/// for every `Separation`/`DeviceN` colour evaluated through it.
+fn object_data(obj: &Object) -> Option<Vec<u8>> {
     match obj {
-        Object::Stream(s) => Some(&s.data),
+        Object::Stream(s) => s.decode_all().ok(),
         _ => None,
     }
 }
@@ -232,7 +243,7 @@ pub(super) fn parse_function(obj: &Object, depth: usize) -> Option<PdfFunction> 
                 bps,
                 encode,
                 decode,
-                data: data.to_vec(),
+                data,
                 n_out,
             }))
         }
@@ -291,7 +302,7 @@ pub(super) fn parse_function(obj: &Object, depth: usize) -> Option<PdfFunction> 
         }
         4 => {
             let data = object_data(obj)?;
-            let program = parse_postscript_program(data)?;
+            let program = parse_postscript_program(&data)?;
             let range = range?;
             if range.is_empty() {
                 return None;
