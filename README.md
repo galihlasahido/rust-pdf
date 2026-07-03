@@ -634,6 +634,9 @@ Runnable, `cargo run`-verified examples in [`examples/`](examples/):
 | `digital_signature_example` | `signatures` | Signing with a certificate/private key, single and multi-signature |
 | `encryption_demo` | `encryption` | AES-256 password protection |
 | `read_existing_pdf_demo` | `parser` | Read-only `PdfReader` API (page count, version, trailer, catalog) |
+| `redaction_example` | `full` | Permanent redaction (`apply_redaction` + full-rewrite) proven by checking raw AND decoded bytes are gone, plus reading back the audit trail |
+| `annotations_and_structure_example` | `full` | Six annotation kinds (highlight/underline/free-text/stamp/text/popup), a named-destination outline tree, and a tagged structure tree for PDF/UA, all re-verified by reopening the saved file |
+| `large_file_streaming_example` | `full` | Lazy/mmap-backed `PdfReader::from_file` + out-of-order random-access page lookup that never scans sequentially |
 | `tauri_commands_example` | `full tauri` | Calls the `tauri_commands` layer's `..._impl` functions directly (`open_document`, `render_page`, `extract_text`, `search_text`, `apply_edit`, `add_annotation`, `save_document`) with no Tauri app/window, plus structured `CommandError`/`ErrorCode` handling for an unknown handle and an out-of-range page index |
 | `c_example.c`, `rust_ffi_example/`, `python_example.py`, `node_example.js`, `go_example.go`, `ruby_example.rb` | (dylib) | FFI usage from other languages (see below) |
 
