@@ -3,7 +3,8 @@
 This is a small, glyph-subsetted derivative of **Noto Sans SC** (a real,
 production CJK typeface), used as a test fixture so
 `tests/font_embedding_tests.rs` can prove actual CJK glyph *rendering*
-fidelity through Pdfium — not just correct PDF/CID structure around a
+fidelity through the crate's native pure-Rust renderer (`rust_pdf::render`,
+tiny-skia + ttf-parser) — not just correct PDF/CID structure around a
 hand-built, zero-contour synthetic font.
 
 - Upstream font: Noto Sans SC (variable font), from the Google Fonts
