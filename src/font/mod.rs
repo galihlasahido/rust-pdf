@@ -26,6 +26,13 @@ pub mod truetype;
 pub mod encoding;
 pub mod tounicode;
 
+// Used only by `render::native::font` (under `native-render`) -
+// `pub(crate)`, not part of this crate's public API. `system.rs` itself
+// handles the `system-fonts` feature gate internally (its
+// `load_system_font_bytes` always exists, just always returns `None`
+// when the feature is off), so this declaration isn't feature-gated.
+pub(crate) mod system;
+
 pub use metrics::{calculate_helvetica_width, helvetica_char_width, FontMetrics};
 pub use standard14::Standard14Font;
 

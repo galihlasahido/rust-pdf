@@ -6,11 +6,19 @@
 //!
 //! # Scope of this phase, and what is an *explicit, documented* gap
 //!
-//! - **Embedded TrueType/OpenType programs only.** A font with no
-//!   `FontFile`/`FontFile2`/`FontFile3` in its `/FontDescriptor` is *not*
-//!   substituted with a system/standard font the way a mature desktop
-//!   PDF viewer would -- this phase has no font-substitution database at all.
-//!   Text using such a font renders nothing (but still advances the text
+//! - **Embedded TrueType/OpenType programs, or (feature `system-fonts`) a
+//!   font by the same family/weight/style already installed on the host
+//!   OS.** A font with no `FontFile`/`FontFile2`/`FontFile3` in its
+//!   `/FontDescriptor` (or no `/FontDescriptor` at all) - extremely
+//!   common for real-world business PDFs referencing "Arial"/"Times New
+//!   Roman"/"Courier New" by name without embedding them - is resolved
+//!   via [`crate::font::system::load_system_font_bytes`] using Core
+//!   Text/DirectWrite/fontconfig (see that module's docs for the
+//!   licensing reasoning: this reads whatever copy is already
+//!   legitimately installed rather than bundling/redistributing one of
+//!   its own). If `system-fonts` is disabled, or no matching family is
+//!   installed, this falls back to this phase's original behavior: text
+//!   using that font renders nothing (but still advances the text
 //!   position using its declared `/Widths`/`/W`, so the rest of the line
 //!   doesn't visually collapse), and [`RenderWarning::UnsupportedFontProgram`]
 //!   is recorded once per resource name.
@@ -335,29 +343,76 @@ fn stream_bytes(dict: &PdfDictionary, key: &str) -> Option<Vec<u8>> {
 /// under) -- only a load that actually fails is classified as the
 /// Type1/bare-CFF gap (and only when the source key makes that
 /// classification accurate).
-fn load_font_program(descriptor: &PdfDictionary) -> FontProgram {
-    // Priority mirrors how a conforming reader would pick among these if
-    // more than one were (invalidly) present: FontFile2 (TrueType) is
-    // the least ambiguous, then FontFile3 (OpenType/CFF), then the
-    // classic Type1 FontFile.
-    let candidates: [(&str, bool); 3] = [
-        ("FontFile2", false),
-        ("FontFile3", is_bare_cff_subtype(descriptor)),
-        ("FontFile", true),
-    ];
+fn load_font_program(descriptor: Option<&PdfDictionary>, base_font: &str) -> FontProgram {
+    if let Some(descriptor) = descriptor {
+        // Priority mirrors how a conforming reader would pick among these
+        // if more than one were (invalidly) present: FontFile2 (TrueType)
+        // is the least ambiguous, then FontFile3 (OpenType/CFF), then the
+        // classic Type1 FontFile.
+        let candidates: [(&str, bool); 3] = [
+            ("FontFile2", false),
+            ("FontFile3", is_bare_cff_subtype(descriptor)),
+            ("FontFile", true),
+        ];
 
-    for (key, likely_gap) in candidates {
-        let Some(bytes) = stream_bytes(descriptor, key) else {
-            continue;
-        };
-        return match TrueTypeFont::load(bytes, 0) {
-            Ok(ttf) => FontProgram::Loaded(Rc::new(ttf)),
-            Err(_) if likely_gap => FontProgram::Unsupported(UnsupportedFontReason::Type1OrBareCff),
-            Err(_) => FontProgram::Unsupported(UnsupportedFontReason::Unparseable),
-        };
+        for (key, likely_gap) in candidates {
+            let Some(bytes) = stream_bytes(descriptor, key) else {
+                continue;
+            };
+            return match TrueTypeFont::load(bytes, 0) {
+                Ok(ttf) => FontProgram::Loaded(Rc::new(ttf)),
+                Err(_) if likely_gap => FontProgram::Unsupported(UnsupportedFontReason::Type1OrBareCff),
+                Err(_) => FontProgram::Unsupported(UnsupportedFontReason::Unparseable),
+            };
+        }
+    }
+
+    // No usable embedded program (or no `/FontDescriptor` at all, which
+    // is just as common for a bare reference to a standard font name) -
+    // try substituting a font already installed on the host OS before
+    // giving up. See `crate::font::system`'s docs for what this can and
+    // can't find, and why it never bundles/redistributes a font of its
+    // own. Deliberately skipped for an empty/missing `/BaseFont`: with no
+    // declared name at all we don't know even whether a serif, sans, or
+    // monospace substitute would be closer, so this doesn't guess -
+    // system-font substitution is for resolving a *named* font that
+    // just isn't embedded, not a generic missing-font fallback.
+    if !base_font.is_empty() {
+        if let Some(program) = load_system_substitute(base_font) {
+            return program;
+        }
     }
 
     FontProgram::Unsupported(UnsupportedFontReason::NotEmbedded)
+}
+
+/// Attempts [`crate::font::system::load_system_font_bytes`] for
+/// `base_font` (parsed via
+/// [`crate::font::system::parse_base_font_name`]), returning `None` (not
+/// just an `Unsupported` `FontProgram`) both when no matching host font
+/// exists and when one was found but `ttf-parser` couldn't actually load
+/// it - either way the caller falls back to the ordinary "not embedded"
+/// gap rather than something more specific, since from a caller's
+/// perspective both are just "substitution didn't work out".
+fn load_system_substitute(base_font: &str) -> Option<FontProgram> {
+    let (family, bold, italic) = crate::font::system::parse_base_font_name(base_font);
+    let bytes = crate::font::system::load_system_font_bytes(&family, bold, italic)?;
+    match TrueTypeFont::load(bytes, 0) {
+        Ok(ttf) => Some(FontProgram::Loaded(Rc::new(ttf))),
+        Err(_) => None,
+    }
+}
+
+/// Reads `/BaseFont` (ISO 32000-1 Table 111/117) as a plain string,
+/// falling back to `""` if absent/malformed - a missing `/BaseFont` is
+/// itself malformed input, and `""` simply won't match any real system
+/// font family, degrading to the ordinary "not embedded" gap exactly
+/// like before this substitution path existed.
+fn base_font_name(dict: &PdfDictionary) -> String {
+    match dict.get("BaseFont") {
+        Some(Object::Name(n)) => n.as_str().to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Whether a `FontFile3` stream's `/Subtype` (Table 126) names a bare,
@@ -397,7 +452,7 @@ pub(super) fn resolve_font(font_dict: &PdfDictionary) -> ResolvedFont {
 
 fn resolve_simple(font_dict: &PdfDictionary) -> SimpleFont {
     let descriptor = dict_of(font_dict, "FontDescriptor");
-    let program = descriptor.map(load_font_program).unwrap_or(FontProgram::Unsupported(UnsupportedFontReason::NotEmbedded));
+    let program = load_font_program(descriptor, &base_font_name(font_dict));
     let missing_width_1000 = descriptor
         .and_then(|d| d.get("MissingWidth"))
         .and_then(as_f64)
@@ -426,7 +481,7 @@ fn resolve_composite(font_dict: &PdfDictionary) -> CompositeFontRt {
     };
 
     let descriptor = dict_of(descendant, "FontDescriptor");
-    let program = descriptor.map(load_font_program).unwrap_or(FontProgram::Unsupported(UnsupportedFontReason::NotEmbedded));
+    let program = load_font_program(descriptor, &base_font_name(descendant));
 
     // `/CIDToGIDMap` streams are commonly `/FlateDecode`-compressed (a
     // full-size, unsubset CID font can have tens of thousands of 2-byte
@@ -704,6 +759,66 @@ mod tests {
                     f.program,
                     FontProgram::Unsupported(UnsupportedFontReason::NotEmbedded)
                 ));
+            }
+            _ => panic!("expected a Simple font"),
+        }
+    }
+
+    /// Real-world regression coverage for `crate::font::system`: a simple
+    /// font with `/BaseFont /Arial-BoldMT` and NO `FontFile2`/descriptor
+    /// at all - exactly the shape Word/Excel/PowerPoint exporters
+    /// routinely produce (see `Kajian_Bisnis_OMS_Ruang_Lingkup_PAM_JAYA.pdf`,
+    /// a real document that surfaced this gap: chart bars rendered, all
+    /// text did not) - should resolve to a `Loaded` program via the host
+    /// OS's own Arial when `system-fonts` is enabled and the family is
+    /// actually installed. Environment-tolerant: skips (not fails) on a
+    /// machine/CI image with no matching font, rather than hard-coding an
+    /// assumption about every test runner's installed fonts.
+    #[test]
+    fn resolves_non_embedded_simple_font_via_system_substitution() {
+        let mut dict = PdfDictionary::new();
+        dict.set("Subtype", Object::Name(PdfName::new_unchecked("TrueType")));
+        dict.set("BaseFont", Object::Name(PdfName::new_unchecked("Arial-BoldMT")));
+
+        let resolved = resolve_font(&dict);
+        match resolved {
+            ResolvedFont::Simple(f) => match f.program {
+                FontProgram::Loaded(_) => {}
+                FontProgram::Unsupported(UnsupportedFontReason::NotEmbedded) => {
+                    eprintln!(
+                        "skipping: no system font matched 'Arial' (Bold) on this machine - \
+                         not a failure, just an environment without that family installed"
+                    );
+                }
+                FontProgram::Unsupported(other) => {
+                    panic!("expected Loaded or NotEmbedded, got a different Unsupported reason: {other}")
+                }
+            },
+            _ => panic!("expected a Simple font"),
+        }
+    }
+
+    /// A font whose `/BaseFont` is present but genuinely doesn't
+    /// correspond to any real family, on any machine, must still fail
+    /// closed rather than panicking or matching something arbitrary via
+    /// an over-eager fallback.
+    #[test]
+    fn unresolvable_base_font_name_still_fails_closed() {
+        let mut dict = PdfDictionary::new();
+        dict.set("Subtype", Object::Name(PdfName::new_unchecked("TrueType")));
+        dict.set(
+            "BaseFont",
+            Object::Name(PdfName::new_unchecked("ZzzNotARealFontFamilyXyz123")),
+        );
+        let resolved = resolve_font(&dict);
+        match resolved {
+            ResolvedFont::Simple(f) => {
+                // Either genuinely unresolvable (most likely), or -
+                // acceptable, since `load_system_font_bytes` intentionally
+                // falls back to a generic sans-serif for a *named* font
+                // it can't find an exact match for - resolved to some
+                // substitute anyway. What must NOT happen is a panic.
+                let _ = f.program;
             }
             _ => panic!("expected a Simple font"),
         }

@@ -31,15 +31,35 @@ full = ["compression", "images", "parser", "encryption", "signatures", "html", "
 # `src/render/native/mod.rs` for the exact scope and its
 # explicitly-documented gaps (no JBIG2/JPX, no Type1/bare-CFF font
 # programs, no true ICC color management, no Patterns/shadings, group
-# isolation/knockout and soft-mask `/BC`/`/TR` are approximated, no
-# non-embedded/system font substitution -- all fail closed with a
-# structured `NativeRenderError`/`RenderWarning` rather than silently
-# mis-rendering). Pulls in `fonts` (ttf-parser) for glyph outline
-# extraction -- see `src/render/native/font.rs`. This is the
-# lowest-level, single-content-stream entry point
+# isolation/knockout and soft-mask `/BC`/`/TR` are approximated -- all
+# fail closed with a structured `NativeRenderError`/`RenderWarning`
+# rather than silently mis-rendering). A non-embedded simple font (no
+# `FontFile`/`FontFile2`/`FontFile3`) is substituted with a matching
+# font already installed on the host OS when `system-fonts` is enabled
+# (see that feature) -- extremely common for real-world business PDFs
+# (Word/Excel/PowerPoint exports referencing "Arial"/"Times New Roman"/
+# "Courier New" by name to save file size) -- or fails closed the same
+# way as the gaps above if `system-fonts` is off or no match is found.
+# Pulls in `fonts` (ttf-parser) for glyph outline extraction -- see
+# `src/render/native/font.rs`. This is the lowest-level,
+# single-content-stream entry point
 # (`render::native::render_content_stream`); see the `render` feature
 # below for the whole-document `PdfRenderer` API built on top of it.
-native-render = ["dep:tiny-skia", "parser", "fonts"]
+native-render = ["dep:tiny-skia", "parser", "fonts", "system-fonts"]
+# Resolves a non-embedded simple font's `/BaseFont` name (e.g.
+# "Arial-BoldMT", "TimesNewRomanPSMT,Italic") to a font already installed
+# on the host OS via `font-kit` (Core Text on macOS, DirectWrite on
+# Windows, fontconfig on Linux), then parses/renders its outlines through
+# this crate's own `ttf-parser`-based pipeline exactly like an embedded
+# font -- `font-kit` is used ONLY for OS-level font *discovery*, never for
+# parsing or rasterizing. Deliberately does NOT bundle/redistribute any
+# font file of its own: Arial/Times New Roman/Courier New are proprietary
+# (Monotype, licensed to OS vendors for on-device use), so reading
+# whatever copy is already legitimately installed on the host is the only
+# licensing-clean way to substitute them -- see `src/font/system.rs`.
+# Falls back to this crate's prior "not embedded, don't render" behavior
+# if disabled or no matching system font is found.
+system-fonts = ["dep:font-kit"]
 # Whole-document page rasterization (`render::PdfRenderer`): resolves a
 # page's effective `/MediaBox`/`/Rotate`/`/Resources`/content streams
 # (ISO 32000-1 Table 30, §7.8.3) via this crate's own pure-Rust parser/
@@ -109,6 +129,14 @@ ttf-parser = { version = "0.25", optional = true }
 # which this crate does not need (embedded fonts are always instanced to a
 # single set of outlines).
 subsetter = { version = "0.2", optional = true, default-features = false }
+# OS-level font *discovery* only (feature `system-fonts`) - finds a font
+# family/weight/style already installed on the host (Core Text/DirectWrite/
+# fontconfig) so a non-embedded simple font can be substituted; this
+# crate's own `ttf-parser` still does all the actual parsing/rasterizing
+# of whatever bytes font-kit locates. Default features pull in a
+# `source-fontconfig` backend on Linux only; macOS/Windows use their own
+# native APIs unconditionally, no extra system library required there.
+font-kit = { version = "0.14", optional = true }
 # Desktop-app command layer (feature `tauri`, see src/tauri_commands).
 tauri = { version = "2", optional = true }
 # Async runtime used only for the oneshot result channel between an async
