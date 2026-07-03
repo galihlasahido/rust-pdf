@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
-use crate::editor::{AnnotationInfo, AnnotationKind, EditableDocument, FormFieldWidget};
+use crate::editor::{AnnotationInfo, AnnotationKind, EditableDocument, FormFieldWidget, RedactionAuditEntry};
 use crate::render::Viewport;
 use crate::types::Rectangle;
 
@@ -2187,6 +2187,143 @@ pub async fn flatten_form(
     flatten_form_impl(&state, request).await
 }
 
+// ===================================================================
+// apply_redaction / get_redaction_log
+// ===================================================================
+
+/// Arguments for [`apply_redaction`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApplyRedactionRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+    pub page_index: usize,
+    /// Area to permanently redact (page default user space, ISO 32000-1
+    /// §8.3.2.2), see [`crate::editor::EditableDocument::apply_redaction`].
+    pub rect: RectangleRequest,
+    /// Who performed the redaction, recorded verbatim in the audit log
+    /// entry - a frontend should populate this from the signed-in user,
+    /// never leave it blank.
+    pub actor: String,
+    /// Why, recorded verbatim in the audit log entry.
+    pub reason: String,
+}
+
+/// Plain-data mirror of [`RedactionAuditEntry`] for IPC (both the direct
+/// result of [`apply_redaction`] and each entry returned by
+/// [`get_redaction_log`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct RedactionAuditEntryResult {
+    pub actor: String,
+    pub reason: String,
+    /// PDF date string (ISO 32000-1 §7.9.4, UTC), e.g. `D:20260702153000Z`.
+    pub timestamp: String,
+    pub page_index: Option<usize>,
+    pub area: Option<RectangleResult>,
+    pub text_runs_removed: usize,
+    pub images_removed: usize,
+    pub tounicode_entries_pruned: usize,
+}
+
+impl From<RedactionAuditEntry> for RedactionAuditEntryResult {
+    fn from(entry: RedactionAuditEntry) -> Self {
+        Self {
+            actor: entry.actor,
+            reason: entry.reason,
+            timestamp: entry.timestamp,
+            page_index: entry.page_index,
+            area: entry.area.map(RectangleResult::from),
+            text_runs_removed: entry.text_runs_removed,
+            images_removed: entry.images_removed,
+            tounicode_entries_pruned: entry.tounicode_entries_pruned,
+        }
+    }
+}
+
+/// Permanently removes every text run and image intersecting `rect` on
+/// `page_index`, via
+/// [`EditableDocument::apply_redaction`](crate::editor::EditableDocument::apply_redaction).
+/// This is destructive and, unlike every other edit command in this
+/// module, is **not reversible by undo**: once applied, the document also
+/// refuses [`save_document`]'s incremental-save path (see that method's
+/// docs) and must be saved with a full rewrite. The frontend is
+/// responsible for getting explicit user confirmation *before* calling
+/// this - there is nothing this command itself can un-apply.
+pub async fn apply_redaction_impl(
+    state: &AppState,
+    request: ApplyRedactionRequest,
+) -> Result<RedactionAuditEntryResult, CommandError> {
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+
+    state
+        .pool
+        .run(move || {
+            let mut doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let audit_entry = doc
+                .apply_redaction(request.page_index, request.rect.into(), &request.actor, &request.reason)
+                .map_err(CommandError::from)?;
+            Ok(RedactionAuditEntryResult::from(audit_entry))
+        })
+        .await
+}
+
+/// Tauri command wrapper for [`apply_redaction_impl`].
+#[tauri::command]
+pub async fn apply_redaction(
+    state: tauri::State<'_, AppState>,
+    request: ApplyRedactionRequest,
+) -> Result<RedactionAuditEntryResult, CommandError> {
+    apply_redaction_impl(&state, request).await
+}
+
+/// Arguments for [`get_redaction_log`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetRedactionLogRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+}
+
+/// Returns every redaction audit entry recorded so far this session
+/// (including entries loaded from the base file, if it was already
+/// redacted by a previous session), via
+/// [`EditableDocument::audit_log`](crate::editor::EditableDocument::audit_log).
+/// An unredacted document returns an empty Vec, not an error.
+pub async fn get_redaction_log_impl(
+    state: &AppState,
+    request: GetRedactionLogRequest,
+) -> Result<Vec<RedactionAuditEntryResult>, CommandError> {
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+
+    state
+        .pool
+        .run(move || {
+            let doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Ok(doc
+                .audit_log()
+                .iter()
+                .cloned()
+                .map(RedactionAuditEntryResult::from)
+                .collect())
+        })
+        .await
+}
+
+/// Tauri command wrapper for [`get_redaction_log_impl`].
+#[tauri::command]
+pub async fn get_redaction_log(
+    state: tauri::State<'_, AppState>,
+    request: GetRedactionLogRequest,
+) -> Result<Vec<RedactionAuditEntryResult>, CommandError> {
+    get_redaction_log_impl(&state, request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3644,6 +3781,148 @@ mod tests {
     async fn flatten_form_rejects_unknown_handle() {
         let state = test_state();
         let result = flatten_form_impl(&state, FlattenFormRequest { handle: 999_999 }).await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    // ---- apply_redaction / get_redaction_log -------------------------
+
+    #[tokio::test]
+    async fn apply_redaction_removes_intersecting_text_and_records_audit_entry() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        // Fixture text is "Hello, rust-pdf tests!" at (72, 700), size 24
+        // (see `sample_pdf_path`); this generously covers its run box.
+        let rect = RectangleRequest {
+            llx: 50.0,
+            lly: 690.0,
+            urx: 500.0,
+            ury: 730.0,
+        };
+
+        let entry = apply_redaction_impl(
+            &state,
+            ApplyRedactionRequest {
+                handle: opened.handle,
+                page_index: 0,
+                rect,
+                actor: "alice@example.com".to_string(),
+                reason: "PII removal".to_string(),
+            },
+        )
+        .await
+        .expect("apply_redaction must succeed");
+
+        assert_eq!(entry.actor, "alice@example.com");
+        assert_eq!(entry.reason, "PII removal");
+        assert_eq!(entry.page_index, Some(0));
+        assert_eq!(entry.text_runs_removed, 1);
+        assert!(entry.area.is_some());
+
+        let extracted = extract_text_impl(
+            &state,
+            ExtractTextRequest {
+                handle: opened.handle,
+                page_index: None,
+            },
+            no_progress(),
+        )
+        .await
+        .expect("extract_text must succeed");
+        assert!(!extracted.iter().any(|p| p.text.contains("Hello, rust-pdf tests!")));
+    }
+
+    #[tokio::test]
+    async fn apply_redaction_rejects_out_of_range_page() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let result = apply_redaction_impl(
+            &state,
+            ApplyRedactionRequest {
+                handle: opened.handle,
+                page_index: 9,
+                rect: RectangleRequest {
+                    llx: 0.0,
+                    lly: 0.0,
+                    urx: 10.0,
+                    ury: 10.0,
+                },
+                actor: "alice".to_string(),
+                reason: "test".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn apply_redaction_rejects_unknown_handle() {
+        let state = test_state();
+        let result = apply_redaction_impl(
+            &state,
+            ApplyRedactionRequest {
+                handle: 999_999,
+                page_index: 0,
+                rect: RectangleRequest {
+                    llx: 0.0,
+                    lly: 0.0,
+                    urx: 10.0,
+                    ury: 10.0,
+                },
+                actor: "alice".to_string(),
+                reason: "test".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_redaction_log_is_empty_before_any_redaction() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let log = get_redaction_log_impl(&state, GetRedactionLogRequest { handle: opened.handle })
+            .await
+            .expect("get_redaction_log must succeed");
+        assert!(log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_redaction_log_reflects_a_prior_apply_redaction() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let rect = RectangleRequest {
+            llx: 50.0,
+            lly: 690.0,
+            urx: 500.0,
+            ury: 730.0,
+        };
+        apply_redaction_impl(
+            &state,
+            ApplyRedactionRequest {
+                handle: opened.handle,
+                page_index: 0,
+                rect,
+                actor: "bob@example.com".to_string(),
+                reason: "contract redaction".to_string(),
+            },
+        )
+        .await
+        .expect("apply_redaction must succeed");
+
+        let log = get_redaction_log_impl(&state, GetRedactionLogRequest { handle: opened.handle })
+            .await
+            .expect("get_redaction_log must succeed");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].actor, "bob@example.com");
+        assert_eq!(log[0].reason, "contract redaction");
+        assert_eq!(log[0].page_index, Some(0));
+        assert!(log[0].area.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_redaction_log_rejects_unknown_handle() {
+        let state = test_state();
+        let result = get_redaction_log_impl(&state, GetRedactionLogRequest { handle: 999_999 }).await;
         assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
     }
 }

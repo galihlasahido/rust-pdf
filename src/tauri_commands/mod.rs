@@ -28,6 +28,12 @@
 //!
 //! - [`commands::get_outline`]
 //!
+//! plus two more added for a redaction-UI phase (draw-a-box-and-permanently-
+//! remove-it, plus reading back the resulting audit trail):
+//!
+//! - [`commands::apply_redaction`]
+//! - [`commands::get_redaction_log`]
+//!
 //! all `async fn`s registerable directly with `tauri::generate_handler!`,
 //! backed by a single dedicated worker thread pool ([`worker::WorkerPool`])
 //! so that none of them ever block Tauri's own async-command executor
@@ -116,6 +122,8 @@
 //!             commands::split_document,
 //!             commands::add_watermark,
 //!             commands::get_outline,
+//!             commands::apply_redaction,
+//!             commands::get_redaction_log,
 //!         ])
 //!         .run(tauri::generate_context!())
 //!         .expect("error while running tauri application");
