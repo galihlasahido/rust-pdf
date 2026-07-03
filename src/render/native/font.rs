@@ -306,9 +306,23 @@ fn dict_of<'a>(dict: &'a PdfDictionary, key: &str) -> Option<&'a PdfDictionary> 
     }
 }
 
-fn stream_bytes<'a>(dict: &'a PdfDictionary, key: &str) -> Option<&'a [u8]> {
+/// Extracts and fully decodes an embedded font program stream (ISO
+/// 32000-1 Table 122's `FontFile`/`FontFile2`/`FontFile3`).
+///
+/// Font program streams are commonly `/Filter /FlateDecode`-compressed
+/// (every mainstream PDF producer compresses large embedded font data),
+/// so this must apply the stream's declared filter chain via
+/// [`PdfStream::decode_all`] rather than reading [`PdfStream::data`]'s
+/// raw, possibly-still-compressed bytes directly -- `ttf-parser` (or any
+/// TrueType/OpenType parser) cannot parse zlib-compressed bytes as a font
+/// program; passing them in unconditionally fails every compressed
+/// `FontFile*`, which in practice is most of them. A stream whose filter
+/// chain fails to decode is treated as absent (`None`) here, which the
+/// caller already classifies as [`UnsupportedFontReason::Unparseable`] --
+/// consistent with how any other unparseable font program degrades.
+fn stream_bytes(dict: &PdfDictionary, key: &str) -> Option<Vec<u8>> {
     match dict.get(key) {
-        Some(Object::Stream(s)) => Some(s.data()),
+        Some(Object::Stream(s)) => s.decode_all().ok(),
         _ => None,
     }
 }
@@ -336,7 +350,7 @@ fn load_font_program(descriptor: &PdfDictionary) -> FontProgram {
         let Some(bytes) = stream_bytes(descriptor, key) else {
             continue;
         };
-        return match TrueTypeFont::load(bytes.to_vec(), 0) {
+        return match TrueTypeFont::load(bytes, 0) {
             Ok(ttf) => FontProgram::Loaded(Rc::new(ttf)),
             Err(_) if likely_gap => FontProgram::Unsupported(UnsupportedFontReason::Type1OrBareCff),
             Err(_) => FontProgram::Unsupported(UnsupportedFontReason::Unparseable),
@@ -612,6 +626,45 @@ mod tests {
                 // Below FirstChar: falls back to MissingWidth (0 here).
                 assert_eq!(f.widths.width_1000(64), 0.0);
             }
+            _ => panic!("expected a Simple font"),
+        }
+    }
+
+    /// Regression test for a real-world bug: `stream_bytes` used to read
+    /// [`PdfStream::data`] (raw, still-filtered bytes) instead of applying
+    /// the stream's `/Filter` chain via [`PdfStream::decode_all`]. Every
+    /// mainstream PDF producer Flate-compresses embedded font programs
+    /// (they are large), so this silently broke text rendering for the
+    /// overwhelming majority of real-world PDFs with embedded TrueType
+    /// fonts -- caught via a document with a genuinely `/FlateDecode`d
+    /// `FontFile2` (`DejaVuSans`, as commonly embedded by e.g. WeasyPrint/
+    /// ReportLab-family PDF producers), not one of this crate's own
+    /// (uncompressed-by-default) test fixtures.
+    #[test]
+    fn resolves_flate_compressed_truetype_font_file2() {
+        let font_bytes = build_test_font(&[('A', 1), ('B', 2)]);
+        let compressed = PdfStream::new(font_bytes)
+            .with_compression()
+            .expect("compress");
+        assert!(
+            compressed.dictionary.get("Filter").is_some(),
+            "test setup: with_compression() should have set /Filter"
+        );
+
+        let mut descriptor = PdfDictionary::new();
+        descriptor.set("FontFile2", Object::Stream(compressed));
+        let mut dict = PdfDictionary::new();
+        dict.set("Subtype", Object::Name(PdfName::new_unchecked("TrueType")));
+        dict.set("FontDescriptor", Object::Dictionary(descriptor));
+
+        let resolved = resolve_font(&dict);
+        match resolved {
+            ResolvedFont::Simple(f) => match f.program {
+                FontProgram::Loaded(_) => {}
+                FontProgram::Unsupported(reason) => {
+                    panic!("expected a Flate-compressed FontFile2 to load, got: {reason}")
+                }
+            },
             _ => panic!("expected a Simple font"),
         }
     }
