@@ -1,6 +1,35 @@
 # rust-pdf — Architecture & Audit (as of 2026-07-03)
 
-> **Status of this document (fifth refresh, current — corrects §2's per-file `%Ln` column, which
+> **Status of this document (sixth refresh, current — corrects the fifth refresh's own
+> `parser/recovery.rs` instability range, which was itself stale/incomplete relative to a live
+> re-run):** the fifth refresh characterized `parser/recovery.rs`'s run-to-run line-coverage flip
+> as bounded to **77.2–77.6%**, based on observing exactly two values (77.22%, 77.64%) across two
+> back-to-back runs. Running the identical command, `cargo llvm-cov --release --features
+> full,tauri --summary-only`, **12 times back-to-back** on this same commit surfaced a **third**
+> value outside that documented window: **76.79%** (missed 55/237 executable lines), alongside the
+> previously-documented 77.64% (missed 53/237) and 77.22% (missed 54/237). All three are real,
+> reproduced-live measurements of the same 237-line file, not a transcription error — of the 12
+> runs, 4 landed at 77.64%, 5 at 77.22%, and 3 at 76.79%. The root cause is unchanged from the
+> fifth refresh's diagnosis (a line whose execution depends on which thread wins a race in a
+> concurrent test, same class as §10's documented aggregate ±1-line wobble) — what was wrong was
+> only the *claimed bound* on how far that race can move the rounded percentage, not the
+> explanation for *why* it moves. Corrected the range to **76.8–77.6%** (76.79-77.64% unrounded,
+> missed 53-55/237 lines) in §2's module-inventory row (the only place a numeric range for this
+> file is stated as current fact — the fifth refresh's own historical status-banner table below is
+> left as a record of what *it* observed, not rewritten), and reworded the description from "flips
+> between 77.22% and 77.64%" (implying exactly two possible values) to "has been observed at three
+> distinct values across 12 runs, and — being a live thread-scheduling race, not a fixed
+> enumeration — the true set of reachable values is not proven to be limited to these three." This
+> refresh does **not** re-assert a new tight bound as fact; it explicitly declines to claim the
+> 76.8–77.6% range is exhaustive, which is the honest lesson from the fifth refresh's range itself
+> turning out to be incomplete. Also re-ran `cargo test --release --features full,tauri` (841 passed / 0 failed / 11
+> ignored, identical per-suite breakdown to the fifth refresh) and `cargo clippy --release
+> --features full,tauri --all-targets -- -D warnings` (clean) to confirm nothing else regressed;
+> neither is affected by this documentation-only correction, and `git diff 31b5f5a HEAD -- src/
+> Cargo.toml Cargo.lock` is empty for this commit — only `ARCHITECTURE.md` changed. See §15 for
+> the full provenance entry.
+>
+> **Status of this document (fifth refresh — corrects §2's per-file `%Ln` column, which
 > did not actually match a live `cargo llvm-cov` re-run for 16 of the 105 covered rows despite the
 > third refresh's explicit claim, quoted verbatim from this file at the time, that "every row below
 > was re-verified by this refresh's own re-run, not assumed unchanged"):** that claim was false for
@@ -342,7 +371,7 @@ the ones that had drifted.** Every `%Ln` value below is now current as of the fi
 | `parser/trailer.rs` | 147 | 84.9 | Trailer + `/XRefStm` hybrid-reference handling |
 | `parser/xref.rs` | 311 | 91.5 | Classic + xref-stream parsing |
 | `parser/inline_image.rs` | 209 | 97.3 | `BI...ID...EI` inline image operator parsing |
-| `parser/recovery.rs` | 367 | 77.2–77.6 | Repair-mode object scanning when the xref table is unusable; `MAX_RECOVERED_OBJECTS`; this file's coverage genuinely flips between back-to-back re-runs of the identical command (77.22% one run, 77.64% the next, both observed live this refresh) — one line's execution depends on which thread wins a race in a concurrent test, same root cause as §10's documented aggregate ±1-line wobble, just large enough here (out of only 237 executable lines) to move the rounded percentage instead of disappearing into it |
+| `parser/recovery.rs` | 367 | 76.8–77.6 | Repair-mode object scanning when the xref table is unusable; `MAX_RECOVERED_OBJECTS`; this file's coverage genuinely flips between back-to-back re-runs of the identical command — **12** consecutive runs this (sixth) refresh landed on **three** distinct values (76.79% missed=55, 77.22% missed=54, 77.64% missed=53, all out of 237 executable lines; 4/5/3 of the 12 runs respectively), not the two (77.22%/77.64%) the fifth refresh had observed and documented as a closed 77.2–77.6% bound — one line's execution depends on which thread wins a race in a concurrent test, same root cause as §10's documented aggregate ±1-line wobble, just large enough here to move the rounded percentage instead of disappearing into it. This 76.8–77.6% range is the widest empirically observed so far, **not** a proven upper/lower bound — a longer run could surface a fourth value outside it |
 | **`editor/`** (19 files, 10,852 LOC) | | | **New since the original audit.** In-place editing of an existing PDF — see §6 |
 | `editor/mod.rs` | 93 | — | `EditableDocument` entry point; +5 LOC since the second refresh (incidental, part of wiring `EditableDocument` up as `render::PdfRenderer`'s backing store, §8c) |
 | `editor/graph.rs` | 481 | 91.8 | Core mutable object graph; `MAX_PAGE_TREE_NODES`, `MAX_REACHABLE_OBJECTS` |
@@ -1604,3 +1633,32 @@ module inventory in §2 rather than by extrapolating from a percentage-closed co
   Cargo.toml Cargo.lock` is empty for this commit: only `ARCHITECTURE.md` changed. This is,
   deliberately, the **last commit of this remediation** — no `src/**` change follows it (verify:
   `git log --stat -1` on the commit this refresh lands in touches only `ARCHITECTURE.md`).
+- **Sixth refresh** (this pass, commit `31b5f5a`'s successor): a targeted correction, not a full
+  re-audit — the *only* thing revisited is the fifth refresh's own `parser/recovery.rs` 77.2–77.6%
+  instability range, which a subsequent verification pass found was itself stale/incomplete: a
+  live re-run of `cargo llvm-cov --release --features full,tauri --summary-only`, **12 times
+  back-to-back** on commit `31b5f5a` (cargo-llvm-cov `0.8.7`, unchanged tool version), produced
+  **three** distinct line-coverage values for `parser/recovery.rs` (237 executable lines) — 77.64%
+  (missed 53, 4/12 runs), 77.22% (missed 54, 5/12 runs), and **76.79%** (missed 55, 3/12 runs) — not
+  the two values (77.22%/77.64%) the fifth refresh had observed in its own two back-to-back runs
+  and documented as a closed 77.2–77.6% bound. 76.79% falls outside that documented window, meaning
+  the fifth refresh's characterization of the instability's *bounds* was itself an unverified claim
+  that did not survive a live re-run — the same class of error the fifth refresh was created to
+  fix, just one level up (a range, not a point value, going stale). Corrected the range to
+  **76.8–77.6%** in §2's module-inventory row and added the sixth-refresh status banner at the top
+  of this document explaining the three-value finding; deliberately phrased the correction as an
+  *empirically observed* range over 12 runs, not a proven bound, since the same lesson (a
+  previously-stated bound turning out to be incomplete) should not be repeated by asserting a new
+  bound with unearned confidence. Also re-ran `cargo build --release --features full,tauri`
+  (succeeds, ~9s, no errors), `cargo test --release --features full,tauri` (841 passed / 0 failed /
+  11 ignored, identical per-suite breakdown to the fifth refresh: unit 721, `editor_tests` 7,
+  `font_embedding_tests` 6, `integration_tests` 68, `interactive_features_tests` 7, `render_tests`
+  11, `signature_verification_tests` 15, `tauri_commands_integration` 2, doctests 4 passed/8
+  ignored, `large_file_render_bench` 1 ignored, `large_file_rss_bench` 2 ignored) and `cargo clippy
+  --release --features full,tauri --all-targets -- -D warnings` (clean) to confirm nothing else
+  regressed since the fifth refresh; none of the other 15 corrected per-file `%Ln` values, the
+  crate-wide aggregate (Regions 83.97%/Functions 79.79%/Lines 82.54%), or the LOC/file-count totals
+  (48,168 lines / 111 files) moved. `git diff 31b5f5a HEAD -- src/ Cargo.toml Cargo.lock` is empty
+  for this commit: only `ARCHITECTURE.md` changed. This is, deliberately, the **last commit of this
+  remediation** — no `src/**` change follows it (verify: `git log --stat -1` on the commit this
+  refresh lands in touches only `ARCHITECTURE.md`).
