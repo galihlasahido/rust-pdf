@@ -70,8 +70,9 @@ rust-pdf = { version = "0.1.0", features = ["full"] }
 | `parser` | Read existing PDFs | `nom` |
 | `encryption` | AES-256 password protection | `aes`, `sha2`, `rand` |
 | `signatures` | Digital signatures | `rsa`, `x509-cert`, `cms` |
-| `render` | Rasterize pages to `RgbaImage` via Pdfium FFI (see `src/render/mod.rs`) | `pdfium-render`, `image`; requires a native `libpdfium` at run time — see `scripts/fetch_pdfium.sh` |
-| `full` | All features enabled *except* `render` (native binary dependency, opted into separately) | All above except `render` |
+| `render` | Rasterize pages to `RgbaImage` via a pure-Rust content-stream interpreter/rasterizer, no native binary or FFI at all (see `src/render/mod.rs`) | `tiny-skia`, `ttf-parser`, `image` |
+| `native-render` | The lower-level content-stream-to-pixel-buffer engine `render` is built on (single content stream in, no document/page-tree access) | `tiny-skia`, `ttf-parser` |
+| `full` | All features enabled *except* `render`/`native-render` (kept separate since pure structural/generation consumers don't need a rasterizer) | All above except `render`/`native-render` |
 
 ## Quick Start
 

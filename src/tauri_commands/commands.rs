@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
 use crate::editor::EditableDocument;
+use crate::render::Viewport;
 use crate::types::Rectangle;
 
 use super::error::CommandError;
 use super::progress::{ProgressEvent, ProgressReporter, PROGRESS_EVENT_NAME};
-use super::render_actor::{RenderedPage, ViewportRequest};
 use super::state::{AppState, DocumentHandle};
 
 /// Upper bound on an `open_document`/`sign_document` output path length,
@@ -68,6 +68,15 @@ pub struct OpenDocumentRequest {
     pub path: String,
     /// Password to try (as both user and owner password) if the document
     /// turns out to be encrypted.
+    ///
+    /// Currently accepted (for request-shape stability) but **not acted
+    /// on**: this crate's pure-Rust parser
+    /// ([`crate::parser::PdfReader`]) implements no decryption filter at
+    /// all, so an encrypted document fails to open here regardless of any
+    /// password supplied -- see [`crate::error::RenderError::PasswordRequired`]'s
+    /// docs. This is a pre-existing limitation of this crate's whole
+    /// structural-editing pipeline (not introduced by, or specific to,
+    /// rendering).
     pub password: Option<String>,
 }
 
@@ -114,7 +123,7 @@ pub async fn open_document_impl(
         .await?;
 
     let page_count = doc.page_count().map_err(CommandError::from)?;
-    let handle = state.insert_document(path, request.password, doc);
+    let handle = state.insert_document(path, doc);
 
     Ok(OpenDocumentResult {
         handle: handle.0,
@@ -135,6 +144,11 @@ pub async fn open_document(
 // render_page
 // ===================================================================
 
+/// A rectangular sub-region of a page-at-DPI raster to render (device
+/// pixels), mirroring [`crate::render::Viewport`] as a plain,
+/// IPC-`Deserialize`-able tuple.
+pub type ViewportRequest = (u32, u32, u32, u32);
+
 /// Arguments for [`render_page`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct RenderPageRequest {
@@ -151,25 +165,61 @@ pub struct RenderPageRequest {
     pub viewport: Option<ViewportRequest>,
 }
 
-/// Renders one page to an RGBA raster via the dedicated
-/// [`super::render_actor::RenderActor`] (see that module's docs for why
-/// rendering doesn't go through [`super::worker::WorkerPool`]).
+/// One rasterized page, ready to hand back across the Tauri IPC boundary.
+#[derive(Debug, Clone, Serialize)]
+pub struct RenderedPage {
+    /// Raster width in pixels.
+    pub width: u32,
+    /// Raster height in pixels.
+    pub height: u32,
+    /// Raw 8-bit RGBA pixels, row-major, `width * height * 4` bytes.
+    ///
+    /// Sent as a plain byte array over Tauri's default JSON IPC here.
+    /// For high-frequency interactive rendering (zoom/pan) a production
+    /// integration should instead return this via
+    /// `tauri::ipc::Response`/a raw byte channel to avoid JSON's
+    /// per-byte encoding overhead; that is a frontend-transport choice
+    /// left to the consuming Tauri application.
+    pub rgba: Vec<u8>,
+}
+
+/// Renders one page to an RGBA raster on [`super::worker::WorkerPool`],
+/// exactly like every other command in this module: [`crate::render`]'s
+/// pure-Rust rendering pipeline has no native-library/FFI concurrency
+/// constraint (unlike the FFI-backed engine this crate used previously --
+/// see that module's docs), so page rasterization needs no dedicated
+/// rendering-only thread/actor. This locks the same
+/// [`EditableDocument`](crate::editor::EditableDocument) other commands
+/// (`extract_text`, `apply_edit`, ...) already share for this document
+/// handle -- briefly, just to read the requested page's content/resources
+/// -- rather than opening a second, independent copy of the file.
 pub async fn render_page_impl(
     state: &AppState,
     request: RenderPageRequest,
 ) -> Result<RenderedPage, CommandError> {
     let handle = DocumentHandle(request.handle);
     let entry = state.get_document(handle)?;
+    let page_index = request.page_index;
+    let dpi = request.dpi;
+    let viewport = request
+        .viewport
+        .map(|(x, y, width, height)| Viewport::new(x, y, width, height));
+
     state
-        .render_actor
-        .render_page(
-            handle,
-            entry.path.clone(),
-            entry.password.clone(),
-            request.page_index,
-            request.dpi,
-            request.viewport,
-        )
+        .pool
+        .run(move || {
+            let doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let image = crate::render::render_page_document(&doc, page_index, dpi, viewport)
+                .map_err(CommandError::from)?;
+            Ok(RenderedPage {
+                width: image.width(),
+                height: image.height(),
+                rgba: image.into_raw(),
+            })
+        })
         .await
 }
 
@@ -1164,19 +1214,12 @@ mod tests {
             },
         )
         .await;
-        // No separate "is Pdfium available" probe: see
-        // `render_actor`'s test module (`warm_up`) for why the
-        // availability check has to be this exact call, not an
-        // independent one -- `pdfium-render` only permits binding the
-        // native library once per process, ever.
-        let page = match result {
-            Ok(page) => page,
-            Err(err) if err.code == ErrorCode::RenderEngineUnavailable => {
-                eprintln!("skipping render_page_end_to_end: Pdfium native library not available in this environment ({})", err.message);
-                return;
-            }
-            Err(err) => panic!("rendering page 0 of the fixture PDF failed unexpectedly: {err:?}"),
-        };
+        // Unlike the previous FFI-backed rendering engine, this pure-Rust
+        // pipeline has no native-library-availability precondition, so
+        // there is nothing to skip here: it must simply succeed.
+        let page = result.unwrap_or_else(|err| {
+            panic!("rendering page 0 of the fixture PDF failed unexpectedly: {err:?}")
+        });
         assert!(page.width > 0 && page.height > 0);
     }
 
@@ -1194,6 +1237,131 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    /// Definition-of-Done regression guard for the render-actor retirement:
+    /// `render_page` now dispatches to the same [`super::worker::WorkerPool`]
+    /// every other command uses (see [`super`]'s module docs) instead of a
+    /// dedicated single-threaded rendering actor, because
+    /// [`crate::render::PdfRenderer`] is built on
+    /// [`crate::editor::EditableDocument`] (`Send + Sync`, no native-library/
+    /// FFI concurrency constraint). This proves that actually works: many
+    /// concurrent `render_page_impl` calls for *several different pages* of
+    /// the *same* open document, issued from multiple `tokio::spawn`ed tasks
+    /// on a multi-threaded runtime (so they really do run concurrently,
+    /// including on the `WorkerPool`'s own separate OS threads -- not just
+    /// interleaved on one), must all succeed, each page's concurrent renders
+    /// must all agree pixel-for-pixel with each other (no data race on the
+    /// shared, `Mutex`-protected `EditableDocument`), and different pages
+    /// must render differently (proving no cross-talk between concurrent
+    /// calls).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn render_page_is_correct_under_concurrent_calls_via_worker_pool() {
+        use crate::prelude::*;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // A small multi-page fixture where each page is a distinctly
+        // colored solid rectangle, so different page indices are trivially
+        // distinguishable in their rendered output.
+        let bytes = {
+            let mut builder = DocumentBuilder::new().title("render concurrency test fixture");
+            for i in 0..4 {
+                let hue = f64::from(i) / 4.0;
+                let content = ContentBuilder::new()
+                    .fill_color(Color::rgb(hue, 0.2, 1.0 - hue))
+                    .rect(0.0, 0.0, 200.0, 200.0)
+                    .fill();
+                builder = builder.page(PageBuilder::a4().content(content).build());
+            }
+            builder.build().unwrap().save_to_bytes().unwrap()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "rust_pdf_render_concurrency_test_{}.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).expect("writing the concurrency-test fixture must not fail");
+
+        // `AppState` itself isn't `Clone` -- the `Arc` here only exists so
+        // this test can move a shared reference into several
+        // `tokio::spawn`ed 'static tasks; it is not something
+        // `render_page_impl`/`WorkerPool` require (see `AppState`'s own
+        // `Send + Sync` compile-time assertion in `state.rs`).
+        let state = Arc::new(test_state());
+        let opened = open_document_impl(
+            &state,
+            OpenDocumentRequest {
+                path: path.to_string_lossy().into_owned(),
+                password: None,
+            },
+        )
+        .await
+        .expect("opening the concurrency-test fixture must succeed");
+        assert_eq!(opened.page_count, 4);
+
+        // Submit every render *before* awaiting any of them: `tokio::spawn`
+        // starts a task running as soon as the multi-threaded runtime
+        // schedules it, not merely when its `JoinHandle` is later awaited
+        // -- this is what actually exercises several concurrent renders in
+        // flight at once, rather than proving correctness of one render at
+        // a time in sequence.
+        const RENDERS_PER_PAGE: usize = 8;
+        let mut handles = Vec::new();
+        for _ in 0..RENDERS_PER_PAGE {
+            for page_index in 0..4usize {
+                let state = Arc::clone(&state);
+                let handle = opened.handle;
+                handles.push(tokio::spawn(async move {
+                    let page = render_page_impl(
+                        &state,
+                        RenderPageRequest {
+                            handle,
+                            page_index,
+                            dpi: 72.0,
+                            viewport: None,
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("concurrent render_page of page {page_index} failed: {e:?}")
+                    });
+                    (page_index, page)
+                }));
+            }
+        }
+
+        let mut by_page: HashMap<usize, Vec<RenderedPage>> = HashMap::new();
+        for handle in handles {
+            let (page_index, page) = handle.await.expect("render task must not panic");
+            assert!(page.width > 0 && page.height > 0);
+            by_page.entry(page_index).or_default().push(page);
+        }
+
+        // Every concurrent render of the *same* page must be pixel-for-
+        // pixel identical to every other render of that same page.
+        for (page_index, pages) in &by_page {
+            assert_eq!(
+                pages.len(),
+                RENDERS_PER_PAGE,
+                "expected {RENDERS_PER_PAGE} concurrent renders of page {page_index}"
+            );
+            let first = &pages[0];
+            for other in &pages[1..] {
+                assert_eq!(
+                    other.rgba, first.rgba,
+                    "page {page_index} rendered inconsistently across concurrent calls"
+                );
+            }
+        }
+
+        // Different pages (different fill colors) must not render
+        // identically -- proving each concurrent call actually rendered
+        // its own requested page rather than some shared/racy buffer.
+        let page0 = &by_page[&0][0];
+        let page1 = &by_page[&1][0];
+        assert_ne!(page0.rgba, page1.rgba, "different pages must not render identically");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

@@ -8,8 +8,8 @@
 //!
 //! - **Embedded TrueType/OpenType programs only.** A font with no
 //!   `FontFile`/`FontFile2`/`FontFile3` in its `/FontDescriptor` is *not*
-//!   substituted with a system/standard font the way Pdfium (or a desktop
-//!   viewer) would -- this phase has no font-substitution database at all.
+//!   substituted with a system/standard font the way a mature desktop
+//!   PDF viewer would -- this phase has no font-substitution database at all.
 //!   Text using such a font renders nothing (but still advances the text
 //!   position using its declared `/Widths`/`/W`, so the rest of the line
 //!   doesn't visually collapse), and [`RenderWarning::UnsupportedFontProgram`]

@@ -3,8 +3,9 @@
 //! the Fonts-phase Definition of Done:
 //!
 //! - A document with CJK text is built as a well-formed Type 0/CIDFontType2
-//!   PDF (glyph *rendering* fidelity itself is delegated to Pdfium via the
-//!   `render` feature; see `ARCHITECTURE.md` and `src/font/cid.rs` docs).
+//!   PDF (glyph *rendering* fidelity itself is verified via the `render`
+//!   feature's pure-Rust content-stream interpreter; see `ARCHITECTURE.md`
+//!   and `src/font/cid.rs` docs).
 //! - Text extraction recovers correct Unicode for both an embedded
 //!   (composite, CJK) font and a non-embedded (Standard 14) font.
 //! - Subsetting produces a smaller file than a full embed of the same font.
@@ -15,13 +16,16 @@
 //! *structure* in isolation without a large binary fixture.
 //!
 //! That is not sufficient on its own, though: a synthetic font's glyphs are
-//! empty (zero-contour) outlines, so it can never prove that Pdfium (or any
-//! real viewer) actually paints recognizable CJK glyph *shapes* on the
-//! page — only that the surrounding PDF structure is well-formed. The
-//! [`cjk_visual_render`] module below closes that gap with a small, real,
-//! OFL-licensed CJK font (a glyph-subsetted derivative of Noto Sans SC; see
+//! empty (zero-contour) outlines, so it can never prove that a real viewer
+//! actually paints recognizable CJK glyph *shapes* on the page — only that
+//! the surrounding PDF structure is well-formed. The [`cjk_visual_render`]
+//! module below closes that gap with a small, real, OFL-licensed CJK font
+//! (a glyph-subsetted derivative of Noto Sans SC; see
 //! `tests/fixtures/fonts/NOTICE.md` for provenance and licensing) rendered
-//! through the actual Pdfium engine, asserting non-background ink pixels
+//! through this crate's own pure-Rust content-stream interpreter/rasterizer
+//! (`render::native`, an *embedded* CID/Type0 TrueType font -- see that
+//! module's docs: this is squarely within its supported scope, unlike
+//! non-embedded/Standard-14 fonts), asserting non-background ink pixels
 //! appear exactly where the CJK glyphs were placed.
 
 #![cfg(all(feature = "fonts", feature = "parser"))]
@@ -380,7 +384,8 @@ fn non_embedded_composite_font_omits_font_file_but_still_declares_type0() {
 }
 
 // ---------------------------------------------------------------------
-// Visual verification: a *real* CJK font, rendered through actual Pdfium.
+// Visual verification: a *real* CJK font, rendered through this crate's
+// own pure-Rust content-stream interpreter/rasterizer.
 //
 // Every test above proves the PDF *structure* around CJK text is correct
 // (Type0/CIDFontType2, ToUnicode, subsetting) using a synthetic font whose
@@ -389,15 +394,15 @@ fn non_embedded_composite_font_omits_font_file_but_still_declares_type0() {
 // computation that would still produce a structurally-valid PDF but render
 // the *wrong* (or no) glyph shape. This module renders real CJK glyph
 // outlines (a small OFL-licensed subset of Noto Sans SC — see
-// `tests/fixtures/fonts/NOTICE.md`) through the actual Pdfium engine and
-// asserts non-background ink pixels land exactly where the glyphs were
-// placed.
+// `tests/fixtures/fonts/NOTICE.md`) through the real `render::native`
+// interpreter (an *embedded* CID/Type0 TrueType font -- squarely within
+// this pure-Rust renderer's documented scope) and asserts non-background
+// ink pixels land exactly where the glyphs were placed.
 // ---------------------------------------------------------------------
 #[cfg(feature = "render")]
 mod cjk_visual_render {
     use super::*;
-    use rust_pdf::render::{PdfRenderer, PdfiumLibrary};
-    use std::sync::OnceLock;
+    use rust_pdf::render::PdfRenderer;
 
     /// A real, OFL-licensed CJK font (glyph-subsetted Noto Sans SC; see
     /// `tests/fixtures/fonts/NOTICE.md`), with genuine multi-contour glyph
@@ -405,26 +410,6 @@ mod cjk_visual_render {
     /// [`super::build_test_font`]'s empty/zero-contour synthetic glyphs.
     fn real_cjk_font_bytes() -> Vec<u8> {
         include_bytes!("fixtures/fonts/NotoSansSC-Subset.ttf").to_vec()
-    }
-
-    /// Loads (once per test process) the native Pdfium library, matching
-    /// the pattern in `render_tests.rs`: Pdfium's C API is a process-wide
-    /// singleton, so every test in this binary must share one instance.
-    fn library() -> Option<&'static PdfiumLibrary> {
-        static LIBRARY: OnceLock<Option<PdfiumLibrary>> = OnceLock::new();
-        LIBRARY
-            .get_or_init(|| match PdfiumLibrary::bind() {
-                Ok(library) => Some(library),
-                Err(err) => {
-                    eprintln!(
-                        "skipping cjk_visual_render tests: could not load the Pdfium shared \
-                         library ({err}). Run `scripts/fetch_pdfium.sh` and set \
-                         RUST_PDF_PDFIUM_LIB_DIR, or install Pdfium system-wide."
-                    );
-                    None
-                }
-            })
-            .as_ref()
     }
 
     /// The CJK text rendered by this test, all width-1000/1000-em (full
@@ -507,9 +492,7 @@ mod cjk_visual_render {
     }
 
     #[test]
-    fn cjk_real_glyphs_render_visible_ink_via_pdfium() {
-        let Some(lib) = library() else { return };
-
+    fn cjk_real_glyphs_render_visible_ink() {
         // Bounding box around the expected glyph area, generously padded
         // (the fixture font's glyphs are ~1000/1000-em full-width CJK
         // ideographs with a small negative descender, per
@@ -523,8 +506,8 @@ mod cjk_visual_render {
         );
 
         let with_text = build_page(true);
-        let renderer = PdfRenderer::open_bytes(lib, with_text, None).expect("failed to open CJK render-test document");
-        let image = renderer.render_page(0, RENDER_DPI, None).expect("failed to render CJK page via Pdfium");
+        let renderer = PdfRenderer::open_bytes(with_text).expect("failed to open CJK render-test document");
+        let image = renderer.render_page(0, RENDER_DPI, None).expect("failed to render CJK page");
         let (width, height) = image.dimensions();
         let pixel_bbox = pdf_rect_to_pixel_rect(bbox_pt, RENDER_DPI, (width, height));
 
@@ -541,8 +524,8 @@ mod cjk_visual_render {
         // above is specifically due to the CJK glyphs, not some unrelated
         // page decoration or rendering artifact.
         let without_text = build_page(false);
-        let blank_renderer = PdfRenderer::open_bytes(lib, without_text, None).expect("failed to open blank control document");
-        let blank_image = blank_renderer.render_page(0, RENDER_DPI, None).expect("failed to render blank control page via Pdfium");
+        let blank_renderer = PdfRenderer::open_bytes(without_text).expect("failed to open blank control document");
+        let blank_image = blank_renderer.render_page(0, RENDER_DPI, None).expect("failed to render blank control page");
         let blank_ink_pixels = count_ink_pixels(&blank_image, pixel_bbox);
         assert!(
             blank_ink_pixels < 5,

@@ -16,11 +16,24 @@
 //! - [`commands::sign_document`]
 //!
 //! all `async fn`s registerable directly with `tauri::generate_handler!`,
-//! backed by a dedicated worker thread pool ([`worker::WorkerPool`]) and a
-//! dedicated single-thread rendering actor ([`render_actor::RenderActor`])
+//! backed by a single dedicated worker thread pool ([`worker::WorkerPool`])
 //! so that none of them ever block Tauri's own async-command executor
-//! threads (see each type's module docs for exactly why two different
-//! concurrency strategies are used).
+//! threads.
+//!
+//! Rasterization ([`commands::render_page`]) used to require its own,
+//! separate single-thread "actor" (rather than sharing this same
+//! [`worker::WorkerPool`]) because the previous rendering backend's
+//! per-document handle was not `Send` and its underlying native library's
+//! C API was not safe to call concurrently. The rendering backend is now
+//! [`rust_pdf::render::PdfRenderer`], built entirely on
+//! [`rust_pdf::editor::EditableDocument`] (already `Send + Sync` -- the
+//! same type every other command in this module already shares across
+//! [`worker::WorkerPool`]'s threads), so that separate actor has been
+//! retired: [`commands::render_page`] now dispatches to
+//! [`worker::WorkerPool`] exactly like every other command, reusing the
+//! same already-open document as [`commands::extract_text`]/
+//! [`commands::apply_edit`]/etc. rather than opening a second, independent
+//! copy of the file just to render it.
 //!
 //! # Architecture
 //!
@@ -40,9 +53,10 @@
 //!   AppState.documents: Mutex<HashMap<DocumentHandle, Arc<DocumentEntry>>>
 //! ```
 //!
-//! Rasterization ([`commands::render_page`]) does not go through
-//! [`worker::WorkerPool`]; see [`render_actor`]'s module docs for why it
-//! instead uses a single dedicated actor thread.
+//! [`commands::render_page`] follows the same shape, locking the same
+//! `Arc<DocumentEntry>`'s `EditableDocument` (briefly, just to read the
+//! page's content/resources) from within a [`worker::WorkerPool`] job
+//! rather than going through a separate rendering-specific code path.
 //!
 //! # Error handling
 //!
@@ -102,11 +116,10 @@
 pub mod commands;
 pub mod error;
 pub mod progress;
-mod render_actor;
 pub mod state;
 mod worker;
 
+pub use commands::RenderedPage;
 pub use error::{CommandError, ErrorCode};
 pub use progress::{ProgressEvent, ProgressReporter, PROGRESS_EVENT_NAME};
-pub use render_actor::RenderedPage;
 pub use state::{AppState, DocumentHandle};

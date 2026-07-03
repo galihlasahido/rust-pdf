@@ -34,10 +34,14 @@ pub enum ErrorCode {
     /// The file could not be parsed as a valid PDF (ISO 32000-1 structure
     /// error), or is corrupt/truncated.
     ParseFailed,
-    /// Rasterization failed (Pdfium reported an error, or requested
-    /// output would exceed this crate's pixel budget).
+    /// Rasterization failed (the content-stream interpreter reported a
+    /// hard failure, or requested output would exceed this crate's pixel
+    /// budget).
     RenderFailed,
-    /// The native Pdfium rendering engine could not be loaded/bound.
+    /// The rendering engine could not be initialized. Reserved for a
+    /// future rendering backend with its own initialization step; this
+    /// build's pure-Rust renderer has none (no native library to load), so
+    /// no command in this build currently emits this code.
     RenderEngineUnavailable,
     /// A filesystem I/O operation (open/read/write) failed.
     IoFailed,
@@ -130,7 +134,6 @@ fn render_error_code(err: &crate::error::RenderError) -> ErrorCode {
         | RenderError::ViewportOutOfBounds { .. }
         | RenderError::EmptyViewport
         | RenderError::InvalidDpi(_) => ErrorCode::InvalidArgument,
-        RenderError::LibraryLoad { .. } => ErrorCode::RenderEngineUnavailable,
         RenderError::DocumentLoad(_) | RenderError::PageRender { .. } => ErrorCode::RenderFailed,
     }
 }

@@ -17,12 +17,15 @@
 //!
 //! This is a genuinely different kind of "font fallback" than glyph
 //! *rendering* substitution (picking a replacement typeface when a
-//! referenced font isn't embedded and isn't installed) — this crate has no
-//! rasterizer of its own and delegates page rendering to Pdfium via the
-//! `render` feature (see [`crate::render`] and `ARCHITECTURE.md`), which
-//! already performs that kind of substitution internally. What this module
-//! provides is the fallback needed to still recover readable Unicode text
-//! from a non-embedded (or embedded-but-`ToUnicode`-less) simple font.
+//! referenced font isn't embedded and isn't installed) — this crate's own
+//! pure-Rust rasterizer (see [`crate::render::native`], `render`/
+//! `native-render` features) has no standard/system-font substitution
+//! database at all, and explicitly does not paint any glyph for a
+//! non-embedded font (a documented gap, not silent data loss — see that
+//! module's docs). What this module provides is the fallback needed to
+//! still recover readable Unicode *text* (for extraction/search, not
+//! rendering) from a non-embedded (or embedded-but-`ToUnicode`-less)
+//! simple font.
 
 /// Decodes a single WinAnsiEncoding-ish byte to its best-effort Unicode
 /// scalar value, per the module-level caveat above.

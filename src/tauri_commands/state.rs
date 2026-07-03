@@ -1,6 +1,6 @@
 //! Tauri-managed application state: the registry of currently-open
-//! documents plus the [`WorkerPool`]/[`RenderActor`] every command
-//! dispatches its actual work to.
+//! documents plus the [`WorkerPool`] every command (including page
+//! rasterization) dispatches its actual work to.
 //!
 //! An [`AppState`] is created once at application startup and registered
 //! with `tauri::Builder::manage` (see the [module docs](super)); every
@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use crate::editor::EditableDocument;
 
 use super::error::CommandError;
-use super::render_actor::RenderActor;
 use super::worker::{default_worker_thread_count, WorkerPool};
 
 /// Opaque identifier for a document opened via
@@ -37,21 +36,17 @@ use super::worker::{default_worker_thread_count, WorkerPool};
 pub struct DocumentHandle(pub u64);
 
 /// One document currently open for structural editing (parsing,
-/// text/annotation/form operations, saving, signing).
-///
-/// Deliberately holds only the [`EditableDocument`] (parser/editor
-/// path), not a [`crate::render::PdfRenderer`]: rendering is owned
-/// exclusively by [`RenderActor`] (keyed by the same [`DocumentHandle`])
-/// for the `Send`-related reasons documented on that type.
+/// text/annotation/form operations, saving, signing) *and* rendering:
+/// [`commands::render_page`](super::commands::render_page) locks this same
+/// [`EditableDocument`] (briefly, just to read a page's content/resources)
+/// rather than opening a second, independent copy of the file through
+/// [`crate::render::PdfRenderer`] the way an earlier, FFI-backed rendering
+/// engine's `Send`-related constraints once required (see
+/// [`crate::render`]'s module docs for that migration history).
 pub(crate) struct DocumentEntry {
     /// Path the document was opened from, kept so `save_document`/
-    /// `sign_document` can default their output path to it, and so
-    /// [`RenderActor`] can lazily open its own renderer for the same
-    /// file.
+    /// `sign_document` can default their output path to it.
     pub(crate) path: PathBuf,
-    /// Password supplied at `open_document` time, if any, re-used when
-    /// [`RenderActor`] needs to open an encrypted document.
-    pub(crate) password: Option<String>,
     pub(crate) doc: Mutex<EditableDocument>,
 }
 
@@ -72,7 +67,6 @@ pub struct AppState {
     documents: Mutex<HashMap<DocumentHandle, Arc<DocumentEntry>>>,
     next_handle: AtomicU64,
     pub(crate) pool: WorkerPool,
-    pub(crate) render_actor: RenderActor,
 }
 
 impl AppState {
@@ -90,21 +84,14 @@ impl AppState {
             documents: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             pool: WorkerPool::new(thread_count),
-            render_actor: RenderActor::spawn(),
         }
     }
 
     /// Registers a newly-opened document and returns its handle.
-    pub(crate) fn insert_document(
-        &self,
-        path: PathBuf,
-        password: Option<String>,
-        doc: EditableDocument,
-    ) -> DocumentHandle {
+    pub(crate) fn insert_document(&self, path: PathBuf, doc: EditableDocument) -> DocumentHandle {
         let handle = DocumentHandle(self.next_handle.fetch_add(1, Ordering::Relaxed));
         let entry = Arc::new(DocumentEntry {
             path,
-            password,
             doc: Mutex::new(doc),
         });
         // Poisoned-lock recovery: a panic while some *other* document's
@@ -135,8 +122,7 @@ impl AppState {
     }
 
     /// Removes a document from the registry (used by a future
-    /// `close_document` command / on save-to-a-new-path flows) and
-    /// releases any cached renderer for it.
+    /// `close_document` command / on save-to-a-new-path flows).
     #[allow(dead_code)]
     pub(crate) fn remove_document(&self, handle: DocumentHandle) {
         let mut documents = self
@@ -144,8 +130,6 @@ impl AppState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         documents.remove(&handle);
-        drop(documents);
-        self.render_actor.close_document(handle);
     }
 }
 
@@ -204,11 +188,6 @@ pub(crate) mod test_support {
         .clone()
     }
 
-    // Deliberately no separate "is Pdfium available" probe here: see
-    // `render_actor`'s own test module (`warm_up`) for why a rendering
-    // test's availability check must go through the exact same
-    // `RenderActor::render_page` call site every other rendering test
-    // uses, rather than an independent `PdfiumLibrary::bind()` call.
 }
 
 #[cfg(test)]
@@ -232,7 +211,7 @@ mod tests {
         let state = AppState::with_worker_threads(1);
         let path = test_support::sample_pdf_path();
         let doc = EditableDocument::open(&path).expect("open fixture PDF");
-        let handle = state.insert_document(path, None, doc);
+        let handle = state.insert_document(path, doc);
         let entry = state.get_document(handle).expect("just-inserted document");
         assert_eq!(entry.doc.lock().unwrap().page_count().unwrap(), 1);
     }
@@ -242,11 +221,11 @@ mod tests {
         let state = AppState::with_worker_threads(1);
         let path = test_support::sample_pdf_path();
         let doc_a = EditableDocument::open(&path).expect("open fixture PDF");
-        let handle_a = state.insert_document(path.clone(), None, doc_a);
+        let handle_a = state.insert_document(path.clone(), doc_a);
         state.remove_document(handle_a);
 
         let doc_b = EditableDocument::open(&path).expect("open fixture PDF");
-        let handle_b = state.insert_document(path, None, doc_b);
+        let handle_b = state.insert_document(path, doc_b);
 
         assert_ne!(handle_a.0, handle_b.0);
         assert!(state.get_document(handle_a).is_err());

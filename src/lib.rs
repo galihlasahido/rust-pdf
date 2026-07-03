@@ -129,7 +129,7 @@ pub use object::{
 };
 pub use page::{Page, PageBuilder};
 #[cfg(feature = "render")]
-pub use render::{PdfRenderer, PdfiumLibrary, RgbaImage, Viewport};
+pub use render::{PdfRenderer, RgbaImage, Viewport};
 pub use types::{Matrix, ObjectId, Rectangle};
 pub use writer::PdfWriter;
 
@@ -183,7 +183,7 @@ pub mod prelude {
     pub use crate::parser::PdfReader;
     pub use crate::page::{Page, PageBuilder};
     #[cfg(feature = "render")]
-    pub use crate::render::{PdfRenderer, PdfiumLibrary, RgbaImage, Viewport};
+    pub use crate::render::{PdfRenderer, RgbaImage, Viewport};
     #[cfg(feature = "render")]
     pub use crate::error::RenderError;
     pub use crate::types::{Matrix, ObjectId, Rectangle};

@@ -68,9 +68,10 @@ rather than "prevent exploitation" — see §4.5.
                                               │
                         ┌─────────────────────┼───────────────────────┐
                         ▼                     ▼                       ▼
-              editor:: (content-stream    font::truetype (ttf-parser  render:: (pdfium FFI,
-              rewriting, redaction,       over untrusted FontFile2/3) optional feature, decodes
-              forms, structure)                                       to raster pixels)
+              editor:: (content-stream    font::truetype (ttf-parser  render:: (pure-Rust
+              rewriting, redaction,       over untrusted FontFile2/3) content-stream interp-
+              forms, structure)                                       reter, optional feature,
+                                                                        decodes to raster pixels)
 ```
 
 Every arrow above is a trust boundary: data crosses from "fully attacker
@@ -147,18 +148,48 @@ damage from native code regardless of what this crate does). Residual
 risk: none beyond "caller must honor the contract", which is the accepted
 nature of any `unsafe extern "C"` API.
 
-### 4.6 Renderer (`src/render/*`, optional `render` feature, pdfium FFI)
+### 4.6 Renderer (`src/render/*`, optional `render`/`native-render` features)
 
-`PdfRenderer` wraps Google's Pdfium via `pdfium-render`. The one `unsafe`
-block here (`ManuallyDrop::drop` in `Drop for PdfRenderer`) is documented
-as safe because `Drop::drop` runs at most once per value by language
-guarantee. `MAX_RENDER_PIXELS = 64_000_000` (`render/mod.rs:173`) bounds
-output-buffer allocation against a page requesting an absurd raster
-target size. Residual risk: Pdfium itself is a large, separate C++ codebase
-outside this crate's control; a memory-safety bug inside Pdfium is outside
-this document's scope (mitigations there are Google's responsibility) but
-worth flagging to the embedding application since it runs in-process, not
-sandboxed, from this crate's perspective.
+**Updated: this renderer was migrated off an earlier FFI binding to a
+third-party native rendering engine (Google's Pdfium, via `pdfium-render`)
+to a from-scratch, pure-Rust content-stream interpreter and rasterizer
+(`render::native`, backed by `tiny-skia` for rasterization and
+`ttf-parser` for font outlines); see `src/render/mod.rs`'s module docs for
+the migration history. `pdfium-render` and every other FFI/native-binary
+dependency have been fully removed from this crate -- there is no
+`unsafe extern "C"` boundary in the renderer at all anymore, and no
+process-wide native-library singleton/lock.**
+
+`PdfRenderer` (`render::PdfRenderer`) resolves a page's effective
+`/MediaBox`/`/Rotate`/`/Resources`/content streams/`/Annots` through this
+crate's own `EditableDocument` parser and hands the content stream to
+`render::native::render_content_stream`, a pure-Rust interpreter with no
+`unsafe` blocks of its own. `MAX_RENDER_PIXELS = 64_000_000`
+(`render/mod.rs`) still bounds output-buffer allocation against a page
+requesting an absurd raster target size, computed *before* any raster is
+allocated, for both full-page and tiled/viewport renders; a similar
+`MAX_RESOLVE_REFERENCES`/`MAX_RESOLVE_DEPTH` budget
+(`render/renderer.rs`) bounds the work done resolving a page's
+`/Resources`/`/Annots` indirect-reference graph against a crafted
+reference cycle or a pathologically wide/deep fan-out.
+
+Residual risk shifts accordingly: instead of "a memory-safety bug inside
+a large, separate C++ codebase outside this crate's control" (Pdfium's
+old risk profile), the risk is now "a bug inside this crate's own,
+newly-written, pure-Rust content-stream interpreter" -- memory-safety
+bugs are far less likely (Rust's ownership model rules out the classic
+C/C++ buffer-overflow/use-after-free class entirely, modulo the handful
+of `unsafe` blocks inside this crate's own dependencies, `tiny-skia`/
+`ttf-parser`/`image`, which are outside this document's scope the same
+way Pdfium's internals were), but logic bugs (a malformed/adversarial
+content stream producing an incorrect, or a panicking, render) are this
+crate's own responsibility to fix, not an upstream project's. Every
+currently-known compatibility gap (JBIG2/JPX images, Type1/bare-CFF font
+programs, non-embedded/system font substitution, true ICC colour
+management, Patterns/shadings) is designed to fail closed -- a structured,
+documented warning or placeholder, never a panic or a silently blank/
+wrong render -- see `src/render/native/mod.rs`'s "Explicit, honest gaps"
+section for the exhaustive, currently-accurate list.
 
 ### 4.7 Signatures / encryption (`src/signatures/*`, `src/encryption/*`)
 
@@ -383,12 +414,17 @@ routine `tauri` bump that pulls it in) resolves this normally and the two
 ## 8. Known residual risk / explicitly out of scope
 
 Carried over from the prior audit phase (`ARCHITECTURE.md` §9/§10) and
-still accurate as of this phase:
+still accurate as of this phase, **except where updated below**:
 
-- **No content-stream interpreter/rasterizer of this crate's own** — the
-  optional `render` feature is a thin FFI wrapper around Google's Pdfium,
-  not this crate's code; Pdfium's own security posture is outside this
-  document.
+- **Update: this crate now has its own content-stream interpreter/
+  rasterizer.** The optional `render`/`native-render` features were
+  migrated off an earlier FFI wrapper around Google's Pdfium to a
+  from-scratch, pure-Rust implementation (`render::native` +
+  `render::PdfRenderer`; see §4.6). This removes the "a large, separate
+  C++ codebase outside this crate's control" residual risk Pdfium carried,
+  but introduces the residual risk of bugs in this crate's own,
+  newly-written interpreter -- see §4.6 for how that risk is bounded and
+  handled (fail-closed on every known compatibility gap, never a panic).
 - **No "repair mode" parser** tolerant of the many ways real-world
   producers violate the spec (broken xref, missing `endobj`, byte-offset
   drift). `parser::recovery` provides a bounded best-effort object scan
@@ -409,5 +445,6 @@ still accurate as of this phase:
 Revisit this document when: a new fuzz-found crash reveals a residual-risk
 category not listed in §4; a new dependency advisory needs a §7 entry; a
 new attacker-controlled size/count/depth field is added anywhere in the
-crate (add it to §6); or the `render`/pdfium trust boundary changes (e.g.
-sandboxing is added at the application level).
+crate (add it to §6); or the `render` trust boundary changes again (e.g.
+sandboxing is added at the application level, or a future change
+reintroduces a native/FFI dependency).

@@ -5,7 +5,7 @@
 //! production-grade reader implements one because real-world files are
 //! routinely damaged (truncated downloads, buggy producers, manual
 //! editing). The standard technique - used here and by virtually every
-//! other implementation (Acrobat, mupdf, pdfium, qpdf) - is to ignore the
+//! other implementation (Acrobat, mupdf, poppler, qpdf) - is to ignore the
 //! `/Prev`-linked cross-reference chain entirely and instead:
 //!
 //! 1. Linearly scan the whole file for `<n> <gen> obj` headers and record

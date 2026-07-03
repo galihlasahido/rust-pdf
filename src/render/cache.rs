@@ -1,9 +1,10 @@
 //! A small bounded LRU cache for rendered page thumbnails.
 //!
 //! Re-rendering a page thumbnail on every redraw of a page-list/grid UI (as
-//! a Tauri desktop viewer would do while scrolling) is wasteful: Pdfium's
-//! rendering cost dominates redraw latency for the typical "many small
-//! thumbnails" access pattern. This cache keeps the most recently used
+//! a Tauri desktop viewer would do while scrolling) is wasteful: the
+//! content-stream interpreter's rendering cost dominates redraw latency
+//! for the typical "many small thumbnails" access pattern. This cache
+//! keeps the most recently used
 //! `max_entries` thumbnails (keyed by `(page_index, max_dimension)`, since a
 //! caller may request different thumbnail sizes for the same page — e.g. a
 //! sidebar strip vs. a grid view) in memory, evicting the least-recently

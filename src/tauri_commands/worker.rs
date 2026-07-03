@@ -14,12 +14,13 @@
 //! `async fn`. This pool gives that work its own dedicated OS threads
 //! instead.
 //!
-//! Used by every command whose underlying rust-pdf type is `Send`
-//! (`EditableDocument`, `Certificate`, `PrivateKey`,
-//! `IncrementalSigner`, ...) -- i.e. every command except page
-//! rasterization, which instead goes through
-//! [`super::render_actor::RenderActor`] because Pdfium's document handle
-//! is not `Send` (see that module's docs for why).
+//! Used by every command in this module, including page rasterization
+//! (`render_page`): every underlying rust-pdf type this layer touches
+//! (`EditableDocument`, `Certificate`, `PrivateKey`, `IncrementalSigner`,
+//! ...) is `Send`, so there is no need for a separate, dedicated
+//! rendering-only concurrency strategy the way an earlier, FFI-backed
+//! rendering engine once required (see `crate::render`'s module docs for
+//! that migration history).
 
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;

@@ -260,7 +260,7 @@ fn truetype_simple_font_glyph_paints_ink_in_expected_bbox() {
 /// [`crate::font::cid::CompositeFont`]'s `Identity-H` code/CID/GID
 /// conventions (see `font.rs`'s module docs on what "reuse" means here)
 /// against the real, OFL-licensed CJK fixture font already used by
-/// `tests/font_embedding_tests.rs`'s Pdfium-based visual verification.
+/// `tests/font_embedding_tests.rs`'s own visual-rendering verification.
 #[test]
 fn composite_cid_font_cjk_glyph_paints_ink_in_expected_bbox() {
     let font_bytes = include_bytes!("../../../tests/fixtures/fonts/NotoSansSC-Subset.ttf").to_vec();

@@ -132,14 +132,10 @@ async fn no_blocking_of_a_single_threaded_executor() {
     .expect("open_document must succeed on a valid, freshly-written PDF");
     assert_eq!(opened.page_count, PAGE_COUNT);
 
-    // No separate "is Pdfium available" pre-check: `pdfium-render` only
-    // permits binding its native library once per process, ever (see
-    // `rust_pdf::render::PdfiumLibrary::bind`'s docs), so the *only*
-    // reliable way to learn whether it's available is to make the one
-    // real call this test needs and inspect its outcome -- matching the
-    // convention in `tests/render_tests.rs` and
-    // `src/tauri_commands/render_actor.rs`'s own test module.
-    match render_page_impl(
+    // Unlike the previous FFI-backed rendering engine, this pure-Rust
+    // pipeline has no native-library-availability precondition (see
+    // `rust_pdf::render`'s module docs), so there is nothing to skip here.
+    let page = render_page_impl(
         &state,
         RenderPageRequest {
             handle: opened.handle,
@@ -149,19 +145,8 @@ async fn no_blocking_of_a_single_threaded_executor() {
         },
     )
     .await
-    {
-        Ok(page) => assert!(page.width > 0 && page.height > 0),
-        Err(err) if err.code == rust_pdf::tauri_commands::ErrorCode::RenderEngineUnavailable => {
-            eprintln!(
-                "skipping the rendering step of the tauri_commands integration test: Pdfium \
-                 native library not available in this environment ({}). Run \
-                 `scripts/fetch_pdfium.sh` and set RUST_PDF_PDFIUM_LIB_DIR, or install Pdfium \
-                 system-wide.",
-                err.message
-            );
-        }
-        Err(err) => panic!("render_page failed unexpectedly: {err:?}"),
-    }
+    .expect("render_page must succeed on a valid, freshly-written PDF");
+    assert!(page.width > 0 && page.height > 0);
 
     let pages = extract_text_impl(
         &state,

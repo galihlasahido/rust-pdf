@@ -9,19 +9,19 @@
 //! structural access to a page *dictionary* (ISO 32000-1 7.7.3.3), which
 //! is exactly what [`PdfReader`]'s memory-mapped, lazy-parsing design (see
 //! `src/parser/mod.rs` module docs) is built to make cheap. It never
-//! called into Pdfium to actually **rasterize pixels**
+//! actually **rasterized pixels**
 //! ([`rust_pdf::render::PdfRenderer::render_page`]), which is a
-//! completely different code path (a separate native library, its own
-//! document load, its own content-stream interpretation and rendering).
-//! No prior committed test or benchmark built a realistic ~2GB /
-//! 10,000-page fixture and measured *that* path's wall-clock time.
+//! completely different code path (document-structure resolution plus
+//! content-stream interpretation/rasterization). No prior committed test
+//! or benchmark built a realistic ~2GB / 10,000-page fixture and measured
+//! *that* path's wall-clock time.
 //!
 //! This test does exactly that: it builds (or reuses a cached, previously
 //! built) real ~2GB / 10,000-page PDF on disk, opens it through
 //! [`PdfRenderer::open_file`] (the same entry point
-//! `src/tauri_commands/render_actor.rs` uses), calls the real
-//! [`PdfRenderer::render_page`] for page 0, and asserts + prints the
-//! actual measured wall-clock time.
+//! `src/tauri_commands/commands.rs`'s `render_page` command uses), calls
+//! the real [`PdfRenderer::render_page`] for page 0, and asserts + prints
+//! the actual measured wall-clock time.
 //!
 //! # Why page 0 has modest (not inflated) content
 //!
@@ -37,14 +37,13 @@
 //!
 //! # Running
 //!
-//! This test is `#[ignore]`d by default: building a ~2GB fixture and
-//! rendering through the native Pdfium library is far too slow/heavy for
-//! a routine `cargo test`. Run it explicitly (after
-//! `scripts/fetch_pdfium.sh`):
+//! This test is `#[ignore]`d by default: building a ~2GB fixture is far
+//! too slow/heavy for a routine `cargo test`. This pure-Rust rendering
+//! pipeline needs no native library to fetch/bind beforehand, so running
+//! it explicitly is just:
 //!
 //! ```sh
-//! RUST_PDF_PDFIUM_LIB_DIR=.pdfium/<platform>/lib \
-//!   cargo test --release --features render --test large_file_render_bench \
+//! cargo test --release --features render --test large_file_render_bench \
 //!   -- --ignored --nocapture
 //! ```
 //!
@@ -62,7 +61,7 @@
 #![cfg(feature = "render")]
 
 use rust_pdf::prelude::*;
-use rust_pdf::render::{PdfRenderer, PdfiumLibrary};
+use rust_pdf::render::PdfRenderer;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -213,24 +212,6 @@ fn ensure_fixture(path: &std::path::Path) {
     build_fixture(path);
 }
 
-fn library() -> Option<&'static PdfiumLibrary> {
-    use std::sync::OnceLock;
-    static LIBRARY: OnceLock<Option<PdfiumLibrary>> = OnceLock::new();
-    LIBRARY
-        .get_or_init(|| match PdfiumLibrary::bind() {
-            Ok(library) => Some(library),
-            Err(err) => {
-                eprintln!(
-                    "skipping large_file_render_bench: could not load the Pdfium shared \
-                     library ({err}). Run `scripts/fetch_pdfium.sh` and set \
-                     RUST_PDF_PDFIUM_LIB_DIR, or install Pdfium system-wide."
-                );
-                None
-            }
-        })
-        .as_ref()
-}
-
 /// Generous upper bound on real-path render time for page 0, chosen to be
 /// far above any plausible legitimate render latency on slow CI hardware
 /// while still catching a regression where opening/rendering scales with
@@ -242,11 +223,6 @@ const MAX_ACCEPTABLE_RENDER_TIME: Duration = Duration::from_secs(15);
 #[test]
 #[ignore = "builds/reads a ~2GB, 10,000-page fixture; run explicitly, see module docs"]
 fn render_page_zero_of_a_2gb_10000_page_fixture() {
-    let library = match library() {
-        Some(library) => library,
-        None => return,
-    };
-
     let path = fixture_path();
     ensure_fixture(&path);
 
@@ -255,12 +231,12 @@ fn render_page_zero_of_a_2gb_10000_page_fixture() {
         .len();
 
     // ---- The actual measurement: open + render page 0 via the real
-    // production path (`PdfRenderer::open_file` /
-    // `PdfRenderer::render_page`), exactly as
-    // `src/tauri_commands/render_actor.rs` calls it. ----
+    // production path (`PdfRenderer::open_file` / `PdfRenderer::render_page`),
+    // exactly as `src/tauri_commands/commands.rs`'s `render_page` command
+    // uses it. ----
     let start = Instant::now();
-    let renderer = PdfRenderer::open_file(library, &path, None)
-        .expect("opening the large fixture through Pdfium must succeed");
+    let renderer =
+        PdfRenderer::open_file(&path).expect("opening the large fixture must succeed");
     let page_count_reported = renderer.page_count();
     let image = renderer
         .render_page(0, 96.0, None)
@@ -269,7 +245,7 @@ fn render_page_zero_of_a_2gb_10000_page_fixture() {
 
     eprintln!(
         "large_file_render_bench: opened + rendered page 0 of a {:.2} GB / {}-page fixture \
-         (Pdfium-reported page count: {page_count_reported}) in {elapsed:?} \
+         (reported page count: {page_count_reported}) in {elapsed:?} \
          ({}x{} px raster)",
         file_bytes as f64 / 1e9,
         page_count(),

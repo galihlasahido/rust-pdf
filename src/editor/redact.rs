@@ -122,7 +122,7 @@
 //!   engine and true pixel-level image cropping across every ISO
 //!   32000-1 filter/color space - is out of scope for this task and is
 //!   realistically a multi-week (shaping) to multi-month (full filter
-//!   parity, matching pdfium/mupdf's raster decode coverage) effort on
+//!   parity, matching mupdf/poppler's raster decode coverage) effort on
 //!   its own; see `ARCHITECTURE.md` §10 for the crate-wide version of
 //!   this same gap.**
 

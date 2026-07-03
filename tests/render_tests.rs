@@ -24,32 +24,26 @@
 //! regression test for *this crate's* `render_page` API and its
 //! untrusted-input bounds-checking. It does **not** by itself substitute
 //! for testing against arbitrary real-world third-party PDFs (scanned
-//! documents, PDFs from Word/Illustrator/LaTeX/etc. producers) — that
-//! breadth of compatibility is exactly what delegating rasterization to
-//! Pdfium (rather than a from-scratch interpreter) is meant to buy this
-//! project; see the "Native vs. FFI rendering decision" section of
-//! `src/render/mod.rs`. A handful of real-world PDFs were also rendered
-//! and visually spot-checked manually during development (not committed
-//! here; see the task report).
+//! documents, PDFs from Word/Illustrator/LaTeX/etc. producers) — every
+//! fixture here uses this crate's own writer, so text is always drawn with
+//! an *embedded* font program; real-world documents relying on
+//! non-embedded/standard-font substitution are a documented gap of this
+//! pure-Rust rendering pipeline (see `src/render/native/mod.rs`'s "Explicit,
+//! honest gaps" section) that this self-generated corpus does not exercise.
 //!
 //! # Requirements to run
 //!
-//! These tests need the native Pdfium shared library. Run
-//! `scripts/fetch_pdfium.sh` once, then:
+//! None beyond the `render` feature itself: this rendering pipeline is
+//! pure Rust with no native binary/FFI dependency, so there is nothing to
+//! fetch, bind, or skip at runtime.
 //! ```sh
-//! RUST_PDF_PDFIUM_LIB_DIR=.pdfium/<platform>/lib cargo test --features render --test render_tests
+//! cargo test --features render --test render_tests
 //! ```
-//! If the library cannot be loaded, every test prints a message and
-//! returns early (skips) rather than failing, so `cargo test --features
-//! render` still passes in environments without the native binary
-//! available (e.g. a bare `cargo test` in this repo without having run
-//! the fetch script) -- consistent with `render` being an opt-in feature.
 
 #![cfg(feature = "render")]
 
 use rust_pdf::prelude::*;
-use rust_pdf::render::{PdfRenderer, PdfiumLibrary, RgbaImage, Viewport};
-use std::sync::OnceLock;
+use rust_pdf::render::{PdfRenderer, RgbaImage, Viewport};
 
 /// The corpus below is built to comfortably exceed this many total
 /// rendered pages across multiple distinct documents.
@@ -66,39 +60,6 @@ fn output_dir() -> std::path::PathBuf {
         .join("render");
     std::fs::create_dir_all(&dir).ok();
     dir
-}
-
-/// Loads (once per test process) the native Pdfium library. Pdfium's C API
-/// is a process-wide singleton, so every test in this binary must share a
-/// single [`PdfiumLibrary`]; `cargo test` runs tests from one binary in
-/// parallel threads within the same process, so a lazily-initialized
-/// `static` is required rather than binding per-test.
-fn library() -> Option<&'static PdfiumLibrary> {
-    static LIBRARY: OnceLock<Option<PdfiumLibrary>> = OnceLock::new();
-    LIBRARY
-        .get_or_init(|| match PdfiumLibrary::bind() {
-            Ok(library) => Some(library),
-            Err(err) => {
-                eprintln!(
-                    "skipping render_tests: could not load the Pdfium shared library ({err}). \
-                     Run `scripts/fetch_pdfium.sh` and set RUST_PDF_PDFIUM_LIB_DIR, \
-                     or install Pdfium system-wide."
-                );
-                None
-            }
-        })
-        .as_ref()
-}
-
-/// Skips the calling test (with an explanatory message already printed by
-/// [`library`]) if Pdfium isn't available in this environment.
-macro_rules! require_pdfium {
-    () => {
-        match library() {
-            Some(library) => library,
-            None => return,
-        }
-    };
 }
 
 // ---------------------------------------------------------------------
@@ -328,10 +289,9 @@ fn corpus_totals_at_least_fifty_pages_across_multiple_documents() {
     let docs = corpus();
     assert!(docs.len() >= 5, "corpus should span multiple distinct documents");
 
-    let lib = require_pdfium!();
     let mut total_pages = 0usize;
     for (name, bytes) in &docs {
-        let renderer = PdfRenderer::open_bytes(lib, bytes.clone(), None)
+        let renderer = PdfRenderer::open_bytes(bytes.clone())
             .unwrap_or_else(|e| panic!("failed to open corpus document {name}: {e}"));
         total_pages += renderer.page_count();
     }
@@ -344,13 +304,12 @@ fn corpus_totals_at_least_fifty_pages_across_multiple_documents() {
 
 #[test]
 fn every_page_of_every_document_renders_with_correct_dimensions_and_content() {
-    let lib = require_pdfium!();
     let docs = corpus();
     let mut rendered_pages = 0usize;
     let mut saved_samples = 0usize;
 
     for (doc_name, bytes) in &docs {
-        let renderer = PdfRenderer::open_bytes(lib, bytes.clone(), None)
+        let renderer = PdfRenderer::open_bytes(bytes.clone())
             .unwrap_or_else(|e| panic!("failed to open {doc_name}: {e}"));
 
         for page_index in 0..renderer.page_count() {
@@ -402,9 +361,8 @@ fn every_page_of_every_document_renders_with_correct_dimensions_and_content() {
 
 #[test]
 fn viewport_tile_matches_crop_of_full_page_render() {
-    let lib = require_pdfium!();
     let bytes = build_shapes(1);
-    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+    let renderer = PdfRenderer::open_bytes(bytes).unwrap();
 
     let full = renderer.render_page(0, TEST_DPI, None).unwrap();
     let (w, h) = full.dimensions();
@@ -426,9 +384,8 @@ fn viewport_tile_matches_crop_of_full_page_render() {
 
 #[test]
 fn render_thumbnail_is_bounded_and_cached() {
-    let lib = require_pdfium!();
     let bytes = build_text_report(1);
-    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+    let renderer = PdfRenderer::open_bytes(bytes).unwrap();
 
     let thumb = renderer.render_thumbnail(0, 128).unwrap();
     assert!(thumb.width() <= 128 && thumb.height() <= 128);
@@ -441,9 +398,8 @@ fn render_thumbnail_is_bounded_and_cached() {
 
 #[test]
 fn invalid_page_index_is_rejected() {
-    let lib = require_pdfium!();
     let bytes = build_text_report(2);
-    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+    let renderer = PdfRenderer::open_bytes(bytes).unwrap();
 
     let err = renderer.render_page(99, TEST_DPI, None).unwrap_err();
     match err {
@@ -457,9 +413,8 @@ fn invalid_page_index_is_rejected() {
 
 #[test]
 fn invalid_dpi_values_are_rejected() {
-    let lib = require_pdfium!();
     let bytes = build_text_report(1);
-    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+    let renderer = PdfRenderer::open_bytes(bytes).unwrap();
 
     for bad_dpi in [0.0f32, -10.0, f32::NAN, f32::INFINITY] {
         let err = renderer.render_page(0, bad_dpi, None).unwrap_err();
@@ -469,9 +424,8 @@ fn invalid_dpi_values_are_rejected() {
 
 #[test]
 fn empty_viewport_is_rejected() {
-    let lib = require_pdfium!();
     let bytes = build_text_report(1);
-    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+    let renderer = PdfRenderer::open_bytes(bytes).unwrap();
 
     let err = renderer
         .render_page(0, TEST_DPI, Some(Viewport::new(0, 0, 0, 10)))
@@ -481,9 +435,8 @@ fn empty_viewport_is_rejected() {
 
 #[test]
 fn out_of_bounds_viewport_is_rejected() {
-    let lib = require_pdfium!();
     let bytes = build_text_report(1);
-    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+    let renderer = PdfRenderer::open_bytes(bytes).unwrap();
 
     let full = renderer.render_page(0, TEST_DPI, None).unwrap();
     let (w, h) = full.dimensions();
@@ -496,9 +449,8 @@ fn out_of_bounds_viewport_is_rejected() {
 
 #[test]
 fn oversized_dpi_is_rejected_before_allocating() {
-    let lib = require_pdfium!();
     let bytes = build_text_report(1);
-    let renderer = PdfRenderer::open_bytes(lib, bytes, None).unwrap();
+    let renderer = PdfRenderer::open_bytes(bytes).unwrap();
 
     // An A4 page at an absurd DPI would need a many-gigapixel raster; this
     // must be rejected by the pre-allocation bounds check
@@ -509,17 +461,18 @@ fn oversized_dpi_is_rejected_before_allocating() {
 
 // ---------------------------------------------------------------------
 // Visual verification: annotation appearance streams, rendered through
-// actual Pdfium.
+// this crate's own pure-Rust rendering pipeline.
 //
 // `tests/interactive_features_tests.rs` proves (via `lopdf`) that every
 // annotation kind's appearance stream is structurally well-formed and
 // present (`/AP /N`). That is necessary but not sufficient: a bug that
 // produces a structurally valid but visually-empty (or mis-positioned)
 // appearance stream would still pass that test. This module renders a
-// page with one of every annotation kind through the real Pdfium engine
-// and asserts each annotation's on-page bounding box renders differently
-// from the *same* box on the *same* page with no annotations at all --
-// proving the appearance is genuinely painted, not just declared.
+// page with one of every annotation kind through the real content-stream
+// interpreter/rasterizer and asserts each annotation's on-page bounding
+// box renders differently from the *same* box on the *same* page with no
+// annotations at all -- proving the appearance is genuinely painted, not
+// just declared.
 // ---------------------------------------------------------------------
 #[cfg(feature = "parser")]
 mod annotation_visual_render {
@@ -601,14 +554,12 @@ mod annotation_visual_render {
     }
 
     #[test]
-    fn every_annotation_kind_visibly_changes_the_rendered_page_via_pdfium() {
-        let lib = require_pdfium!();
+    fn every_annotation_kind_visibly_changes_the_rendered_page() {
+        let plain_renderer = PdfRenderer::open_bytes(plain_page_bytes()).expect("failed to open plain (no-annotation) control document");
+        let plain_image = plain_renderer.render_page(0, TEST_DPI, None).expect("failed to render plain control page");
 
-        let plain_renderer = PdfRenderer::open_bytes(lib, plain_page_bytes(), None).expect("failed to open plain (no-annotation) control document");
-        let plain_image = plain_renderer.render_page(0, TEST_DPI, None).expect("failed to render plain control page via Pdfium");
-
-        let annotated_renderer = PdfRenderer::open_bytes(lib, annotated_page_bytes(), None).expect("failed to open annotated document");
-        let annotated_image = annotated_renderer.render_page(0, TEST_DPI, None).expect("failed to render annotated page via Pdfium");
+        let annotated_renderer = PdfRenderer::open_bytes(annotated_page_bytes()).expect("failed to open annotated document");
+        let annotated_image = annotated_renderer.render_page(0, TEST_DPI, None).expect("failed to render annotated page");
 
         assert_eq!(
             plain_image.dimensions(),
@@ -650,11 +601,21 @@ mod annotation_visual_render {
     }
 }
 
+/// Honest gap regression guard: this pure-Rust rendering engine's parser
+/// ([`rust_pdf::parser::PdfReader`]) implements no decryption filter at
+/// all (ISO 32000-1 §7.6), so an encrypted document cannot be opened
+/// through [`PdfRenderer`] *regardless* of whether the password supplied
+/// is correct, missing, or absent entirely -- unlike the previous,
+/// now-removed FFI-backed renderer, which really could decrypt a
+/// password-protected document. This is a real, accepted compatibility
+/// trade-off of the migration to a pure-Rust engine (see
+/// `src/render/mod.rs` and `rust_pdf::error::RenderError::PasswordRequired`'s
+/// docs), not an oversight -- this test exists specifically to make sure
+/// that gap fails closed (a structured `PasswordRequired` error) rather
+/// than silently succeeding with garbage/empty output.
 #[cfg(feature = "encryption")]
 #[test]
-fn password_protected_document_requires_password() {
-    let lib = require_pdfium!();
-
+fn password_protected_document_cannot_be_opened_at_all() {
     let page = PageBuilder::a4().build();
     let doc = DocumentBuilder::new()
         .page(page)
@@ -667,15 +628,12 @@ fn password_protected_document_requires_password() {
         .unwrap();
     let bytes = doc.save_to_bytes().unwrap();
 
-    let no_password = PdfRenderer::open_bytes(lib, bytes.clone(), None);
-    match no_password {
+    match PdfRenderer::open_bytes(bytes) {
         Err(rust_pdf::RenderError::PasswordRequired) => {}
         Err(other) => panic!("expected PasswordRequired, got {other}"),
-        Ok(_) => panic!("expected opening without a password to fail"),
-    }
-
-    let with_password = PdfRenderer::open_bytes(lib, bytes, Some("correct-horse"));
-    if let Err(err) = with_password {
-        panic!("expected the correct password to open the document: {err}");
+        Ok(_) => panic!(
+            "expected opening an encrypted document to fail unconditionally -- this pure-Rust \
+             engine has no decryption support at all, so even the correct password must not open it"
+        ),
     }
 }

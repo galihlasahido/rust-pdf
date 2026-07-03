@@ -20,14 +20,6 @@ office = []
 # src/font/truetype.rs and src/font/subset.rs.
 fonts = ["dep:ttf-parser", "dep:subsetter"]
 full = ["compression", "images", "parser", "encryption", "signatures", "html", "office", "fonts"]
-# Content-stream rasterization (path fill/stroke, text, clipping, transparency,
-# color-space conversion) via an FFI binding to Google's Pdfium engine. See
-# src/render/mod.rs and ARCHITECTURE.md ("Native vs FFI rendering decision")
-# for why this is FFI rather than a from-scratch Rust rasterizer. Kept out of
-# `full` deliberately: it requires bundling a native, per-platform Pdfium
-# shared library at application-packaging time (scripts/fetch_pdfium.sh),
-# which pure structural/generation consumers of this crate do not need.
-render = ["dep:pdfium-render", "images"]
 # Pure-Rust content-stream interpreter and 2D rasterizer (no native/FFI
 # dependency at all): graphics-state stack, path construction/painting,
 # clipping, ExtGState (alpha/line width/dash/blend mode/soft mask),
@@ -39,13 +31,25 @@ render = ["dep:pdfium-render", "images"]
 # `src/render/native/mod.rs` for the exact scope and its
 # explicitly-documented gaps (no JBIG2/JPX, no Type1/bare-CFF font
 # programs, no true ICC color management, no Patterns/shadings, group
-# isolation/knockout and soft-mask `/BC`/`/TR` are approximated -- all
-# fail closed with a structured `NativeRenderError`/`RenderWarning`
-# rather than silently mis-rendering).
-# Coexists with the `render` (Pdfium/FFI) feature during the migration;
-# neither replaces the other in this phase. Pulls in `fonts` (ttf-parser)
-# for glyph outline extraction -- see `src/render/native/font.rs`.
+# isolation/knockout and soft-mask `/BC`/`/TR` are approximated, no
+# non-embedded/system font substitution -- all fail closed with a
+# structured `NativeRenderError`/`RenderWarning` rather than silently
+# mis-rendering). Pulls in `fonts` (ttf-parser) for glyph outline
+# extraction -- see `src/render/native/font.rs`. This is the
+# lowest-level, single-content-stream entry point
+# (`render::native::render_content_stream`); see the `render` feature
+# below for the whole-document `PdfRenderer` API built on top of it.
 native-render = ["dep:tiny-skia", "parser", "fonts"]
+# Whole-document page rasterization (`render::PdfRenderer`): resolves a
+# page's effective `/MediaBox`/`/Rotate`/`/Resources`/content streams
+# (ISO 32000-1 Table 30, §7.8.3) via this crate's own pure-Rust parser/
+# editor (`parser`/`EditableDocument`) and rasterizes them via
+# `native-render`'s content-stream interpreter, producing an
+# `image::RgbaImage` (hence `images`). No native binary or FFI dependency
+# of any kind -- see `src/render/mod.rs` for the (now-completed) migration
+# away from an earlier FFI-to-Pdfium design and the compatibility/
+# performance trade-offs that migration explicitly accepted.
+render = ["native-render", "images"]
 # Async Tauri desktop-app command layer (open_document, render_page,
 # extract_text, search_text, apply_edit, save_document, fill_form,
 # add_annotation, sign_document) plus a dedicated worker thread pool and
@@ -87,7 +91,6 @@ der = { version = "0.7", optional = true, features = ["std", "pem", "alloc"] }
 spki = { version = "0.7", optional = true, features = ["std"] }
 pkcs8 = { version = "0.10", optional = true, features = ["std", "pem"] }
 signature = { version = "2.2", optional = true }
-pdfium-render = { version = "0.9.2", optional = true }
 # Pure-Rust 2D rasterizer (path fill/stroke, clipping via alpha masks) used
 # by the `native-render` feature's content-stream interpreter
 # (src/render/native/). No native/FFI dependency: this and its own

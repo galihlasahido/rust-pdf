@@ -1,10 +1,13 @@
 //! A pure-Rust content-stream interpreter and 2D rasterizer -- no native
 //! binary, no FFI, at all. Gated behind the `native-render` Cargo feature.
 //!
-//! This coexists with [`crate::render::PdfRenderer`] (the Pdfium/FFI
-//! backend, feature `render`) during the pure-Rust migration described in
-//! `ARCHITECTURE.md`; neither replaces the other yet, and both can be
-//! enabled at once. The 2D rasterizer backend is
+//! [`crate::render::PdfRenderer`] (feature `render`) is the whole-document
+//! API built on top of this module: it resolves a page's effective
+//! `/MediaBox`/`/Rotate`/`/Resources`/content streams and hands the
+//! content stream to [`render_content_stream`] below, which has no PDF
+//! *document* (page tree, xref) access of its own -- see
+//! [`crate::render`]'s module docs for how the two layers fit together and
+//! for the migration history that led here. The 2D rasterizer backend is
 //! [`tiny-skia`](https://docs.rs/tiny-skia) (pure Rust, BSD-3-Clause);
 //! font outline extraction uses `ttf-parser` (this crate's `fonts`
 //! feature, pulled in automatically by `native-render`).
@@ -155,8 +158,8 @@
 //!   supported, not a fallback wearing a disguise. See `font`'s module
 //!   docs for the exact classification logic.
 //! - **Non-embedded fonts are also not rendered** -- this phase has no
-//!   standard/system-font substitution database at all (unlike Pdfium).
-//!   Any font (of *any* `/Subtype`, including TrueType) with no
+//!   standard/system-font substitution database at all (unlike a mature
+//!   desktop PDF viewer). Any font (of *any* `/Subtype`, including TrueType) with no
 //!   `FontFile`/`FontFile2`/`FontFile3` fails the same way as the
 //!   Type1/CFF gap above. This is a distinct, separately-documented gap
 //!   from Type1/CFF -- do not conflate "we have no charstring

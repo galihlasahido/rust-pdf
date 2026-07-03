@@ -1,126 +1,79 @@
 //! Page rasterization: renders PDF pages to raster buffers suitable for
 //! display in a desktop viewer (e.g. a Tauri `<canvas>`/GPU texture).
 //!
-//! As of this migration phase, this module offers **two independent,
-//! coexisting rendering backends** behind two separate Cargo features:
+//! This module is a **from-scratch, pure-Rust rendering pipeline with no
+//! native binary or FFI dependency at all**, built from two layers behind
+//! two Cargo features:
 //!
-//! - `render`: [`PdfRenderer`]/[`PdfiumLibrary`], a thin, safety-checked
-//!   FFI wrapper around Google's Pdfium engine (see "Native vs. FFI
-//!   rendering decision" below for why this exists and its trade-offs).
-//!   Rasterization happens entirely inside the native `libpdfium` binary;
-//!   this module contains no content-stream interpreter of its own for
-//!   this backend.
-//! - `native-render`: [`native`], a from-scratch, pure-Rust content-stream
-//!   interpreter and rasterizer (backed by `tiny-skia`) with **no native
-//!   binary or FFI dependency at all**. This is a currently-in-progress
-//!   migration away from the Pdfium/FFI decision below, explicitly
-//!   accepting the compatibility/performance trade-offs that decision was
-//!   written to avoid. See [`native`]'s module docs for exactly what is
-//!   (and, honestly, is not yet) implemented.
+//! - `native-render`: [`native`], the content-stream interpreter and 2D
+//!   rasterizer (ISO 32000-1:2008 Chapter 8/9/11 operators, backed by
+//!   `tiny-skia` for rasterization and `ttf-parser` for font outlines).
+//!   Operates on a single already-decoded content stream plus its
+//!   `/Resources` -- it has no PDF *document* (page tree, xref) access of
+//!   its own. See [`native`]'s module docs for exactly what operator/
+//!   color-space/font/filter coverage this phase implements, and its
+//!   explicitly-documented, honestly-labeled gaps (JBIG2/JPX images,
+//!   Type1/bare-CFF font programs, true ICC color management, Patterns/
+//!   shadings, and more -- every one of these fails closed with a
+//!   structured, non-panicking warning/placeholder, never a silent
+//!   mis-render).
+//! - `render`: [`PdfRenderer`], the whole-document API built on top of
+//!   `native-render` and this crate's own structural parser/editor
+//!   ([`crate::editor::EditableDocument`]): given a page index, it
+//!   resolves the *effective* `/MediaBox`/`/Rotate`/`/Resources`/content
+//!   streams (following `/Parent` inheritance per ISO 32000-1 Table 30),
+//!   hands the content stream to [`native::render_content_stream`], and
+//!   applies the page's rotation and any requested tile/viewport crop.
 //!
-//! Both features can be enabled at once; neither replaces the other yet.
-//! Callers should currently prefer `render` (Pdfium) for real-world PDF
-//! compatibility and use `native-render` only where a pure-Rust dependency
-//! chain is a hard requirement and the current phase's gaps (see
-//! [`native`]'s docs) are acceptable.
+//! # Migration history: this module previously used a native/FFI engine
 //!
-//! # Native vs. FFI rendering decision (the *original* `render`/Pdfium choice)
+//! An earlier phase of this crate rendered pages by binding, via FFI, to a
+//! mature, widely-deployed third-party C/C++ PDF-rendering engine -- a
+//! deliberate trade-off at the time, favoring that engine's real-world PDF
+//! compatibility (built from over a decade of fuzzing/regression testing)
+//! over the multi-year effort of writing a from-scratch content-stream
+//! interpreter and rasterizer. That trade-off required bundling a native,
+//! per-platform shared library at application-packaging time and
+//! serializing every render call behind a process-wide lock, since that
+//! native library's C API was not safe to call concurrently. (See this
+//! project's `ARCHITECTURE.md` and version-control history for the full,
+//! named account of that earlier design and the migration away from it.)
 //!
-//! **Decision: FFI to Pdfium, not a from-scratch Rust rasterizer.**
+//! This module has since been **fully migrated off that FFI dependency**:
+//! `rust-pdf` (including this `render`/`native-render` pair of features)
+//! is now 100% pure Rust, with no native binary to bundle, load, or
+//! version-match at deployment time. This was an explicit, accepted
+//! trade-off in the *other* direction -- real-world compatibility gaps
+//! (see [`native`]'s module docs: JBIG2/JPX images, Type1/bare-CFF font
+//! programs, non-embedded/system font substitution, true ICC color
+//! management, Patterns/shadings) and likely slower rasterization than a
+//! decade-matured C++ engine, in exchange for a dependency-light, fully
+//! auditable, memory-safe rendering pipeline with no FFI/crash-level risk
+//! and no per-platform native binary to bundle. Every one of those gaps
+//! fails closed (a structured, documented warning or placeholder) rather
+//! than silently mis-rendering or panicking -- see [`native`]'s "Explicit,
+//! honest gaps" section for the exhaustive list.
 //!
-//! This section is kept as a historical record of that decision's
-//! reasoning; it is no longer the *only* option -- see `native-render`
-//! above for the pure-Rust alternative now being built out.
-//!
-//! `rust-pdf` already contains a full PDF *object model, parser, and
-//! writer*. Rendering, however, is a fundamentally different engineering
-//! problem: it requires a content-stream interpreter plus a 2D
-//! rasterizer/font-shaping pipeline that correctly reproduces two decades
-//! of "PDF producers violate the spec in every possible way" behavior that
-//! cannot be derived from ISO 32000 alone. Crates such as `tiny-skia` and
-//! `ttf-parser` are **not** PDF parsers — they are a 2D rasterizer and a
-//! font-file parser, respectively. Using them would still require this
-//! crate to build, from zero, the content-stream interpreter, all
-//! ISO 32000 color spaces (§8.6: DeviceGray/RGB/CMYK, CalGray/CalRGB, Lab,
-//! ICCBased, Indexed, Separation/DeviceN), every filter needed to decode
-//! real-world images (DCT/JPX/JBIG2/CCITT — and the Rust ecosystem has no
-//! mature JBIG2 or JPX decoder today, both of which are common in scanned
-//! enterprise documents), CID/Type0 font handling with embedded CFF/
-//! TrueType/OpenType programs, transparency groups and blend modes
-//! (§11), annotation appearance streams (§12.5.5), and AcroForm field
-//! appearance generation — i.e. re-implementing the majority of a
-//! mature PDF engine. That is a multi-year, multi-person effort (see
-//! `ARCHITECTURE.md` §10 for the fuller gap analysis written during the
-//! Phase 0 audit of this codebase), and the resulting renderer would still
-//! be measured, on day one, against real-world PDF compatibility that
-//! Pdfium has spent over a decade and tens of thousands of regression
-//! files getting right.
-//!
-//! Pdfium is the PDF engine used by Google Chrome, so it is exercised at a
-//! scale (billions of page views) and against a corpus of real-world PDF
-//! producer quirks that no from-scratch Rust implementation could
-//! realistically match in this project's timeframe. It has a mature,
-//! actively maintained Rust binding (`pdfium-render`) and prebuilt,
-//! per-platform binaries are published by `bblanchon/pdfium-binaries` that
-//! are straightforward to bundle as a native resource in a Tauri
-//! application (see "Bundling in a Tauri app" below).
-//!
-//! The explicit trade-off accepted by this decision:
-//! - **Native binary dependency.** The application must ship a
-//!   `libpdfium.{dylib,so,dll}` per target platform/architecture (a few MB
-//!   each) instead of being 100% pure Rust. `rust-pdf` itself stays a pure
-//!   Rust crate for structure/generation/signing; only the optional
-//!   `render` feature pulls in an FFI dependency, and it is not part of
-//!   the `full` feature for that reason.
-//! - **FFI/crash-level risk** is real (a `panic`-free Rust program can
-//!   still segfault if the native library is corrupted, mismatched for
-//!   the platform, or hits a Pdfium-side bug) but is minimized by the fact
-//!   that Pdfium is continuously fuzzed by Google/Chromium's fuzzing
-//!   infrastructure — far beyond what this project could do for a
-//!   from-scratch renderer in this phase.
-//! - **We do not control Pdfium's internal correctness.** Bugs in Pdfium
-//!   itself cannot be fixed in this repository; only worked around or
-//!   reported upstream. This module's job is to (a) load the library
-//!   safely, (b) validate all caller/file-derived inputs before handing
-//!   them to the FFI boundary (see "Untrusted input handling" below), and
-//!   (c) convert results into `image::RgbaImage` with clear error types —
-//!   not to second-guess Pdfium's rasterization itself.
-//!
-//! ## Bundling in a Tauri app
-//!
-//! `pdfium-render` loads Pdfium *dynamically at run time* (via
-//! `libloading`), not via static linking, so there is no special build-time
-//! toolchain requirement for `rust-pdf` itself. A Tauri application:
-//! 1. Downloads the platform-appropriate archive from
-//!    <https://github.com/bblanchon/pdfium-binaries/releases> (this repo's
-//!    `scripts/fetch_pdfium.sh` does this for local development/testing).
-//! 2. Ships the shared library as a Tauri "resource" or "external binary"
-//!    for each target triple, per Tauri's bundling docs.
-//! 3. At startup, calls [`PdfiumLibrary::bind_from_path`] (or sets
-//!    `RUST_PDF_PDFIUM_LIB_DIR` and calls [`PdfiumLibrary::bind`]) pointing
-//!    at the resolved resource directory before constructing any
-//!    [`PdfRenderer`].
+//! One concrete, welcome consequence of this migration: because
+//! [`PdfRenderer`] now wraps [`crate::editor::EditableDocument`] (a plain,
+//! `Send + Sync` Rust value, not a handle into a process-wide native
+//! library singleton), it may be constructed, held, and called
+//! concurrently from multiple threads without any dedicated
+//! single-threaded "actor" or global FFI lock -- see
+//! [`crate::tauri_commands`] for how the Tauri command layer takes
+//! advantage of this.
 //!
 //! ## Known limitation: tile rendering re-renders the full page
 //!
 //! [`PdfRenderer::render_page`]'s tiled/`Viewport` path currently renders
 //! the *whole* page at the requested DPI internally and then crops the
-//! requested rectangle out of that raster, rather than asking Pdfium to
-//! rasterize only the requested tile via a custom device-space transform
-//! (`FPDF_RenderPageBitmapWithMatrix`). This was a deliberate choice for
-//! this phase: it reuses `pdfium-render`'s default, most-exercised
-//! rendering path (which is known to correctly honor page rotation), and
-//! this crate could not, from the ISO 32000 spec alone, confirm exactly
-//! how a hand-rolled transform matrix interacts with Pdfium's internal
-//! page-rotation handling — getting that wrong would silently produce
-//! *visually incorrect* tiles, which is worse than the current, slightly
-//! less memory-efficient behavior. Practically this means memory use for
-//! tiled rendering is still bounded by the *full page* at the requested
-//! DPI (checked against [`MAX_RENDER_PIXELS`]), not by the tile size.
-//! Implementing genuine partial-bitmap tiling (bounded by tile size, not
-//! full-page size, so very high zoom levels on very large pages stay
-//! cheap) is a reasonable follow-up, estimated at 1-3 engineer-days
-//! including empirical verification against rotated real-world PDFs.
+//! requested rectangle out of that raster, rather than the content-stream
+//! interpreter honoring a device-space sub-rectangle directly. Practically
+//! this means memory use for tiled rendering is still bounded by the *full
+//! page* at the requested DPI (checked against [`MAX_RENDER_PIXELS`]), not
+//! by the tile size. Implementing genuine partial-raster tiling (bounded
+//! by tile size, not full-page size, so very high zoom levels on very
+//! large pages stay cheap) is a reasonable follow-up.
 //!
 //! ## Untrusted input handling
 //!
@@ -131,21 +84,20 @@
 //! against the *rendering* memory budget instead of a stream filter). This
 //! module always computes the target raster's pixel count up front and
 //! rejects renders exceeding [`MAX_RENDER_PIXELS`] with
-//! [`crate::error::RenderError::OutputTooLarge`] *before* asking Pdfium to
-//! allocate a bitmap, for both full-page and tiled/viewport renders.
+//! [`crate::error::RenderError::OutputTooLarge`] *before* allocating a
+//! raster, for both full-page and tiled/viewport renders. A malformed or
+//! missing `/MediaBox` falls back to a US Letter default rather than
+//! propagating non-finite/degenerate geometry into the rasterizer (see
+//! [`crate::editor::EditableDocument::effective_media_box`]'s docs).
 //!
 //! # Example
 //!
 //! ```no_run
 //! # #[cfg(feature = "render")]
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use rust_pdf::render::{PdfRenderer, PdfiumLibrary, Viewport};
+//! use rust_pdf::render::{PdfRenderer, Viewport};
 //!
-//! // Bind the native Pdfium library once per process (share this across
-//! // every document/renderer you open).
-//! let library = PdfiumLibrary::bind()?;
-//!
-//! let renderer = PdfRenderer::open_file(&library, "example.pdf", None)?;
+//! let renderer = PdfRenderer::open_file("example.pdf")?;
 //!
 //! // Render page 0 at 150 DPI, full page.
 //! let page_image = renderer.render_page(0, 150.0, None)?;
@@ -170,7 +122,14 @@ mod cache;
 mod renderer;
 
 #[cfg(feature = "render")]
-pub use renderer::{PdfRenderer, PdfiumLibrary};
+pub use renderer::PdfRenderer;
+// Only [`crate::tauri_commands::commands::render_page_impl`] calls this
+// directly (`PdfRenderer::render_page` calls it too, but from *within*
+// `renderer`, so that alone doesn't need this re-export) -- cfg-gated so
+// a `render`-without-`tauri` build doesn't warn about an unused `pub(crate)`
+// import.
+#[cfg(all(feature = "render", feature = "tauri"))]
+pub(crate) use renderer::render_page_document;
 
 /// A pure-Rust content-stream interpreter and 2D rasterizer (no native
 /// binary/FFI dependency), gated behind the `native-render` Cargo feature.
@@ -185,9 +144,9 @@ pub mod native;
 /// non-premultiplied `ImageBuffer<Rgba<u8>, Vec<u8>>`) so callers can use it
 /// directly with `image`'s encoders (`RgbaImage::save(...)`, PNG/etc.), or
 /// read `.as_raw()` to hand the pixel buffer straight to a GPU texture
-/// upload. This is the *same* `image` crate version `pdfium-render` itself
-/// uses internally (both depend on `image = "0.25"`), so no extra
-/// conversion or copy is needed at the FFI boundary.
+/// upload. `tiny-skia`'s own `Pixmap` (premultiplied-alpha) is converted to
+/// this straight-alpha representation once, at the end of rendering -- see
+/// `renderer::pixmap_to_rgba_image`.
 #[cfg(feature = "render")]
 pub type RgbaImage = image::RgbaImage;
 
@@ -213,10 +172,9 @@ pub const MAX_RENDER_PIXELS: u64 = 64_000_000;
 /// whole page.
 ///
 /// Coordinates are in device pixels with the origin at the page's
-/// top-left corner (matching how raster image coordinates, and Pdfium's
-/// own bitmap coordinate system, are conventionally addressed) — *not*
-/// PDF user-space points, whose origin is bottom-left (ISO 32000-1
-/// §8.3.2.3).
+/// top-left corner (the conventional origin for raster image/bitmap
+/// coordinate systems) — *not* PDF user-space points, whose origin is
+/// bottom-left (ISO 32000-1 §8.3.2.3).
 #[cfg(feature = "render")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {

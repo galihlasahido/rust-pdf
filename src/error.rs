@@ -436,34 +436,40 @@ pub enum FormError {
     InvalidOptionIndex(usize),
 }
 
-/// Errors related to page rasterization via the Pdfium FFI backend
-/// (`render` feature).
+/// Errors related to page rasterization via this crate's pure-Rust
+/// rendering pipeline (`render` feature: [`crate::render::PdfRenderer`],
+/// built on [`crate::editor::EditableDocument`] for document structure and
+/// [`crate::render::native`] for content-stream interpretation/
+/// rasterization).
 ///
-/// See the [`crate::render`] module documentation for the native-vs-FFI
-/// rationale behind this error type wrapping `pdfium_render::PdfiumError`
-/// rather than reimplementing a content-stream interpreter's own error set.
+/// See the [`crate::render`] module documentation for this backend's
+/// explicitly-documented scope and gaps (this type intentionally does not
+/// wrap a third-party FFI error type -- there is no native/FFI dependency
+/// anywhere in this rendering pipeline).
 #[cfg(feature = "render")]
 #[derive(Debug, Error)]
 pub enum RenderError {
-    /// Failed to load the native Pdfium shared library from any of the
-    /// configured search locations.
-    #[error("failed to load the Pdfium shared library (searched: {tried}): {source}")]
-    LibraryLoad {
-        /// Human-readable description of the search locations that were tried.
-        tried: String,
-        /// Underlying `pdfium-render` error.
-        #[source]
-        source: pdfium_render::prelude::PdfiumError,
-    },
-
-    /// Pdfium failed to load/parse the document (corrupt file, wrong
-    /// password, unsupported security handler, truncated data, etc).
+    /// Failed to load/parse the document's structure (corrupt file,
+    /// unsupported/malformed cross-reference table, missing catalog,
+    /// truncated data, etc). See [`crate::error::PdfError`]'s `Display`
+    /// for the underlying cause.
     #[error("failed to open PDF document: {0}")]
-    DocumentLoad(#[source] pdfium_render::prelude::PdfiumError),
+    DocumentLoad(#[source] Box<PdfError>),
 
-    /// The document is encrypted and requires a password (ISO 32000-1
-    /// §7.6.4) that was not supplied, or the supplied password was wrong.
-    #[error("document requires a (correct) password to open")]
+    /// The document is encrypted (ISO 32000-1 §7.6). This crate's
+    /// pure-Rust parser ([`crate::parser::PdfReader`]) does not implement
+    /// any decryption filter (RC4/AES) at all -- a pre-existing limitation
+    /// of this crate's whole structural-editing pipeline, not something
+    /// newly introduced by this rendering backend -- so *no* password,
+    /// correct or not, allows opening an encrypted document here. (The
+    /// previous, now-removed renderer (an FFI binding to a third-party
+    /// native rendering engine) *could* decrypt a password-protected
+    /// document; this is a real, accepted compatibility trade-off of the
+    /// migration to a pure-Rust engine, not an oversight.)
+    #[error(
+        "document is encrypted; decryption is not supported by this pure-Rust engine \
+         (no password can open it)"
+    )]
     PasswordRequired,
 
     /// `page_index` was out of range for the document's page count.
@@ -475,14 +481,17 @@ pub enum RenderError {
         page_count: usize,
     },
 
-    /// Pdfium reported an error while rendering a specific page.
+    /// The native content-stream interpreter reported a hard failure while
+    /// rendering a specific page (see
+    /// [`crate::render::native::NativeRenderError`] for the exhaustive list
+    /// -- all structurally-impossible-request cases, never a panic).
     #[error("failed to render page {page_index}: {source}")]
     PageRender {
         /// The zero-based page index that failed to render.
         page_index: usize,
-        /// Underlying `pdfium-render` error.
+        /// Underlying interpreter error.
         #[source]
-        source: pdfium_render::prelude::PdfiumError,
+        source: crate::render::native::NativeRenderError,
     },
 
     /// The requested output raster would exceed the configured maximum

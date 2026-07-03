@@ -716,6 +716,117 @@ described above. Plus new unit tests in `font.rs` (10) and `glyph.rs` (2), and t
 in `mod.rs` (the old "text is unsupported" test was replaced with one showing `Do` is still
 unsupported, plus a new one for a `Tf` naming a missing font resource).
 
+## 8c. Pure-Rust rendering migration, FINAL phase: Integration — Pdfium fully removed (completed)
+
+**This closes out §8/§8a/§8b's "live migration in progress" status.** Per an explicit user
+request, `render::PdfRenderer::render_page`'s implementation has been swapped to run entirely on
+the pure-Rust engine built in §8a/§8b/(subsequent Color-Spaces/Images and Transparency &
+Blend-Modes phases, both implemented in `render::native` — see that module's own docs for their
+Definitions of Done); the FFI-to-Pdfium backend described in §8 has been **deleted, not just
+deprecated**:
+
+- `pdfium-render` is no longer a dependency (removed from `Cargo.toml`). `PdfiumLibrary` no longer
+  exists. `grep -ri pdfium src/` returns nothing (this file and `docs/THREAT_MODEL.md` keep the
+  historical record; source code does not).
+- `scripts/fetch_pdfium.sh` and the gitignored `.pdfium/` local-binary cache are gone.
+- The `render` Cargo feature no longer means "FFI to Pdfium" — it now means "whole-document
+  `PdfRenderer` API, built on `native-render` + this crate's own `EditableDocument` parser", and
+  pulls in `native-render` (previously the two features were independent/coexisting). `native-render`
+  itself is unchanged: still the lower-level, single-content-stream engine with no document/page-tree
+  access of its own.
+- **`render::PdfRenderer` is rebuilt on `editor::EditableDocument`** instead of a Pdfium
+  `PdfDocument` handle: `open_file`/`open_bytes` no longer take a `PdfiumLibrary` handle (there is
+  nothing left to bind), and `render_page`'s own signature (`&self, page_index: usize, dpi: f32,
+  viewport: Option<Viewport>) -> Result<RgbaImage, RenderError>`) is **unchanged**, so the Tauri
+  command layer's own `render_page` call site needed no signature changes downstream of it.
+- **`tauri_commands/render_actor.rs` is deleted.** That module existed solely because Pdfium's
+  `PdfDocument` was not `Send` and its C API was not safe to call concurrently (see §9's original
+  text, kept below for history), forcing a dedicated single-OS-thread "actor" instead of the normal
+  `WorkerPool`. `EditableDocument` is already `Send + Sync` (proven by a compile-time assertion in
+  `tauri_commands/state.rs`, and by the fact every *other* command already shared it across
+  `WorkerPool` threads), so `commands::render_page_impl` now just locks the same
+  `Arc<DocumentEntry>`'s `Mutex<EditableDocument>` other commands (`extract_text`, `apply_edit`,
+  ...) already share for that handle, briefly, inside a normal `WorkerPool::run` job — no dedicated
+  actor thread, no per-document cached renderer, no FFI lock. A dedicated regression test,
+  `tauri_commands::commands::tests::render_page_is_correct_under_concurrent_calls_via_worker_pool`,
+  proves this: many concurrent `render_page_impl` calls for several different pages of the same
+  open document, issued from multiple `tokio::spawn`ed tasks on a multi-threaded runtime, all
+  succeed, agree pixel-for-pixel per page, and never cross-contaminate between pages.
+- **New capability, required to make whole-document rendering actually work (not previously
+  needed by §8a/§8b's single-content-stream-in-isolation tests):** `render::renderer::deep_resolve`
+  recursively dereferences every `Object::Reference` reachable from a page's `/Resources` (fonts,
+  `/DescendantFonts`, `FontFile*`/`CIDToGIDMap` streams, XObjects — including a Form XObject's own
+  nested `/Resources` — ExtGStates, colour spaces) before handing it to
+  `native::render_content_stream`, which has always assumed (documented in its own module docs)
+  that `/Resources` arrives already fully dereferenced. A real, serialized-then-reparsed PDF almost
+  always represents these as indirect references, so without this step, essentially every embedded
+  font/image/ExtGState on a genuine whole-document page silently failed to resolve. Bounded
+  (`MAX_RESOLVE_REFERENCES`/`MAX_RESOLVE_DEPTH`) against a crafted reference cycle or a
+  pathologically wide/deep resource graph, per this crate's untrusted-input rules. This bug was
+  caught by this phase's own CJK visual-render test (`tests/font_embedding_tests.rs`) regressing
+  from "0 warnings, ink present" (against a hand-built, already-inline-dictionary fixture in
+  `render::native`'s own unit tests) to "0 ink pixels" once wired through a real parsed document —
+  fixed before this phase was reported done, not left as a known gap.
+- **New capability: page rotation (`/Rotate`, ISO 32000-1 Table 30) is now honored.**
+  `render::native::render_content_stream` itself has no concept of page rotation (it just
+  rasterizes a content stream into a given pixel buffer); `render::renderer` normalizes the
+  effective `/Rotate` to `{0, 90, 180, 270}` (a non-multiple-of-90 value — spec-non-conformant — is
+  treated as `0`), renders the *unrotated* content at the swapped-if-needed pixel dimensions, and
+  applies the rotation as a whole-image `image::imageops::rotate90/180/270` post-processing step
+  (exact for the only values ISO 32000-1 permits, and cheap — a pixel transpose/flip, not a
+  re-render). `Viewport` tiling operates on the *rotated* (displayed) raster, matching the
+  previous Pdfium-backed behavior's coordinate convention.
+- **New capability: annotation appearance streams (ISO 32000-1 §12.5.5) are now painted.**
+  `native::render_content_stream` only ever interprets a page's main content stream — it has no
+  knowledge of `/Annots` at all, and painting annotation appearances was never part of §8a/§8b's
+  scope (Pdfium's `render_with_config` handled this internally and invisibly to this crate, so it
+  was never an explicit gap on `render::native`'s own list either — it simply wasn't wired up
+  anywhere in this crate's own code until whole-document rendering needed it). This phase's own
+  regression test (`tests/render_tests.rs`'s `annotation_visual_render` module — pre-existing,
+  written against the Pdfium backend) caught this immediately: highlight/underline/strikeout/
+  freetext/stamp/ink annotations rendered *zero* visible difference from an unannotated control
+  page. Fixed by `render::renderer::append_annotation_appearances`, which resolves each visible
+  annotation's current `/AP /N` appearance stream (honoring `/AS` for a multi-state appearance,
+  skipping `Hidden`/`NoView`-flagged and `/Subtype /Popup` annotations per spec convention),
+  computes the ISO 32000-1 §12.5.5 BBox-to-Rect fitting matrix, and synthesizes a
+  `q <matrix> cm /<name> Do Q` appended to the page's content stream, registering the resolved
+  appearance as an ordinary Form XObject resource — reusing the *existing*, already-tested Form
+  XObject rendering path (including transparency groups, if an appearance happens to declare one)
+  rather than a separate, annotation-specific renderer. Honest, documented simplifications: a
+  missing/malformed appearance `/BBox` falls back to an unscaled placement at `/Rect`'s origin
+  instead of failing; Optional Content (`/OC`) visibility is not evaluated; Widget annotations
+  without a usable appearance are not synthesized from `/DA`/field values (a distinct,
+  separately-scoped "generate a default appearance" feature).
+- **Accepted trade-off, honestly regressed and documented (not silently dropped): decryption.**
+  The previous Pdfium-backed renderer could open a password-protected document (Pdfium implements
+  RC4/AES decryption internally); this crate's own parser (`parser::PdfReader`) has never
+  implemented any decryption filter at all (a pre-existing limitation of the whole
+  structural-editing pipeline, predating this migration — `open_document` already rejected
+  encrypted files the same way before `render_page` did). `RenderError::PasswordRequired` is
+  returned unconditionally for an encrypted document now, regardless of any password supplied; see
+  that variant's doc comment and the `password_protected_document_cannot_be_opened_at_all` test in
+  `tests/render_tests.rs`, which exists specifically to prove this fails closed rather than
+  silently "succeeding" with garbage output.
+- Every compatibility gap this migration accepted going in (JBIG2/JPX images, Type1/bare-CFF font
+  programs, non-embedded/system font substitution, no true ICC colour management, no
+  Patterns/shadings, approximated transparency-group/soft-mask semantics) is unchanged from
+  §8a/§8b and `render::native::mod.rs`'s own "Explicit, honest gaps" section — this integration
+  phase did not attempt to close any of them, only to wire the already-implemented engine up to
+  whole-document rendering and the Tauri command layer correctly.
+
+### Tests
+
+`tests/render_tests.rs` (11), `tests/font_embedding_tests.rs` (6, including the CJK visual-render
+regression above), `tests/large_file_render_bench.rs` (1, `#[ignore]`d — no longer needs a native
+library fetch/bind step at all, since this pipeline has none), `tests/tauri_commands_integration.rs`
+(2), plus `render::renderer`'s own new unit tests (`normalize_rotate`/`apply_rotation_to_dims`/
+`check_dimensions`/`page_pixel_size`/`open_bytes` error-path/`page_count` fallback) and
+`editor::pages`'s new `effective_media_box`/`parse_media_box` tests (valid + adversarial: missing
+`/MediaBox`, swapped corners, wrong element count, non-numeric entry, non-finite coordinate) — all
+passing. `cargo build`/`cargo test`/`cargo clippy -- -D warnings` were re-run clean across every
+feature combination touched by this migration (`default`, `native-render`, `render`, `full`,
+`full,tauri`), not just the one named in this phase's Definition of Done.
+
 ## 9. The Tauri command layer (`tauri_commands/`)
 
 New top-level module since the original audit (7 files, 2,865 lines), gated by the `tauri`
@@ -726,16 +837,19 @@ Rust library and a Tauri desktop application:
   `extract_text`, `search_text`, `apply_edit`, `save_document`, `fill_form`, `add_annotation`,
   `sign_document`. Every command follows a `..._impl` (plain async, testable without a live Tauri
   `AppHandle`) + thin Tauri-wired wrapper shape.
-- **`state.rs`**: Tauri-managed application state — the registry of currently-open documents plus
-  handles to the worker pool and render actor.
-- **`worker.rs`**: a dependency-light thread pool that runs CPU-bound PDF parsing/editing/signing
-  work off of Tauri's own async-command executor threads (verified by
+- **`state.rs`**: Tauri-managed application state — the registry of currently-open documents
+  (each an `Arc<DocumentEntry>` wrapping a `Mutex<EditableDocument>`, shared by every command
+  including `render_page`) plus a handle to the single worker pool every command uses.
+- **`worker.rs`**: a dependency-light thread pool that runs CPU-bound PDF parsing/editing/signing/
+  **rendering** work off of Tauri's own async-command executor threads (verified by
   `no_blocking_of_a_single_threaded_executor` in `tests/tauri_commands_integration.rs`).
-- **`render_actor.rs`**: a single dedicated OS thread owning every open document's `PdfRenderer`
-  (Pdfium instances are not `Send` across arbitrary threads the way this actor pattern needs —
-  see §8's concurrency trade-offs), with panic containment added in a later "RenderActor Panic
-  Resilience" remediation phase (a panic inside a render call no longer takes down the actor
-  thread or poisons subsequent renders).
+- **`render_actor.rs`: retired, see §8c.** This module used to give page rasterization its own
+  dedicated single OS thread, separate from `worker.rs`'s pool, because Pdfium's `PdfDocument`
+  handle was not `Send` and its C API was not safe to call concurrently (a panic-containment
+  layer was added to it in a later "RenderActor Panic Resilience" remediation phase, back when it
+  still existed). Now that rendering is built on `EditableDocument` (`Send + Sync`, no native
+  library involved), `render_page` dispatches to the same `worker.rs` pool as every other
+  command, and this module no longer exists.
 - **`progress.rs`**: progress-event reporting decoupled from the `tauri` crate's own event/window
   types.
 - **`error.rs`**: `CommandError`, a structured, `Serialize`-able error type every command returns
@@ -743,6 +857,15 @@ Rust library and a Tauri desktop application:
   panicking` in `tests/tauri_commands_integration.rs`.
 
 ## 10. Test coverage (measured, live re-run)
+
+**Historical note (post-§8c):** the numbers and `RUST_PDF_PDFIUM_LIB_DIR` setup instructions
+below predate the §8c Pdfium-removal migration and describe that earlier, FFI-backed renderer's
+coverage run. They are kept as-is (rerunning `cargo-llvm-cov` was out of scope for §8c's own
+task) but are no longer an accurate description of *how* to run coverage today: this crate has no
+native library to fetch/bind at all now, so `RUST_PDF_PDFIUM_LIB_DIR` is unused/unrecognized, and
+`cargo test --features full,tauri` (no env var needed) exercises every render/tauri test
+unconditionally — see §8c's own "Tests" subsection for what was re-verified (clean
+build/test/clippy across every feature combination) as part of that migration.
 
 Tool: `cargo-llvm-cov 0.8.7`.
 
@@ -941,9 +1064,12 @@ The original audit's gap list, updated with what has since closed (re-verified v
 inventory) vs. what has not (not independently re-verified beyond noting the module still doesn't
 exist):
 
-- ~~A real content-stream interpreter + rasterizer/vector-renderer~~ — **closed**: §8, via Pdfium
-  FFI (a deliberate build-vs-buy decision, not a from-scratch interpreter — see §8 for why that
-  distinction still matters for the "setara Adobe Acrobat" framing).
+- ~~A real content-stream interpreter + rasterizer/vector-renderer~~ — **closed**: originally via
+  an FFI binding to a third-party engine (§8, a deliberate build-vs-buy decision at the time), now
+  **superseded by §8c**: a from-scratch, pure-Rust content-stream interpreter/rasterizer
+  (`render::native`), with that FFI dependency fully removed. See §8c for the completed migration
+  and its accepted compatibility trade-offs (§8's original "why FFI" reasoning is kept as
+  historical record, not current status).
 - ~~Font program parsing/subsetting (TrueType/OpenType) and embedding~~ — **closed** for
   TrueType/OpenType: §7. CFF/Type1 embedding was not confirmed either way.
 - **Still open, not re-verified this refresh**: a "repair mode" parser tolerant of arbitrary

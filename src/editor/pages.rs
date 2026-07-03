@@ -18,6 +18,8 @@ use super::graph::EditableDocument;
 use crate::error::{EditorError, PdfResult};
 use crate::object::{Object, PdfArray, PdfDictionary, PdfName};
 use crate::types::ObjectId;
+#[cfg(feature = "render")]
+use crate::types::Rectangle;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Maximum number of objects that a single page/document import (merge or
@@ -196,7 +198,12 @@ impl EditableDocument {
     /// Resolves the *effective* `/Rotate` for a page, following `/Parent`
     /// (inheritable attribute, ISO 32000-1 Table 30) if the leaf doesn't
     /// set it directly. Defaults to 0.
-    fn effective_rotate(&self, mut id: ObjectId) -> PdfResult<i64> {
+    ///
+    /// `pub(crate)` (rather than private) so [`crate::render::PdfRenderer`]
+    /// can resolve the same effective rotation this module's own
+    /// [`EditableDocument::rotate_page`] reads/writes, instead of
+    /// duplicating the `/Parent`-inheritance walk.
+    pub(crate) fn effective_rotate(&self, mut id: ObjectId) -> PdfResult<i64> {
         for _ in 0..64 {
             let dict = self.get_dictionary(id)?;
             if let Some(Object::Integer(r)) = dict.get("Rotate") {
@@ -208,6 +215,46 @@ impl EditableDocument {
             }
         }
         Ok(0)
+    }
+
+    /// Resolves the *effective* `/MediaBox` for a page (ISO 32000-1
+    /// §7.7.3.3, Table 30: inheritable, required at some level of the page
+    /// tree), following `/Parent` if the leaf doesn't set it directly.
+    ///
+    /// Falls back to [`Rectangle::letter`] if no ancestor declares one, or
+    /// if the declared array is malformed -- not exactly 4 numbers,
+    /// non-finite, or zero/negative width or height (a corrupt/adversarial
+    /// source file; ISO 32000-1 requires a valid `/MediaBox` somewhere in
+    /// the ancestor chain, but this is untrusted input, so a missing or
+    /// nonsensical one degrades to a sane default rather than propagating
+    /// NaN/inf into the rendering pipeline or failing outright). The two
+    /// corner points are also normalized (min/max per axis) since ISO
+    /// 32000-1 does not require `[llx lly urx ury]` to already be in
+    /// lower-left/upper-right order.
+    ///
+    /// `pub(crate)` so [`crate::render::PdfRenderer`] can read page
+    /// geometry without this crate's renderer needing its own `/Parent`-
+    /// inheritance walk (or direct access to this module's private
+    /// dictionary-resolution helpers). Only that (`render`-feature) caller
+    /// exists today, hence the `#[cfg(feature = "render")]` -- a
+    /// `native-render`-only build (which pulls in `parser`, hence this
+    /// module, but not `render`) would otherwise warn about this being
+    /// unused.
+    #[cfg(feature = "render")]
+    pub(crate) fn effective_media_box(&self, mut id: ObjectId) -> PdfResult<Rectangle> {
+        for _ in 0..64 {
+            let dict = self.get_dictionary(id)?;
+            if let Some(Object::Array(arr)) = dict.get("MediaBox") {
+                if let Some(rect) = parse_media_box(arr) {
+                    return Ok(rect);
+                }
+            }
+            match dict.get("Parent") {
+                Some(Object::Reference(parent)) => id = *parent,
+                _ => break,
+            }
+        }
+        Ok(Rectangle::letter())
     }
 
     /// Extracts the given (0-based) page indices into a brand-new,
@@ -503,6 +550,38 @@ impl EditableDocument {
     }
 }
 
+/// Parses a `/MediaBox` array (ISO 32000-1 §7.7.3.3: `[llx lly urx ury]`,
+/// each a `number`) into a [`Rectangle`], normalizing the corners (so a
+/// non-conformant producer that swapped lower-left/upper-right still
+/// yields a valid rectangle) and rejecting anything else: wrong element
+/// count, a non-numeric entry, a non-finite coordinate, or zero/negative
+/// width or height. Returns `None` for any of those (see
+/// [`EditableDocument::effective_media_box`]'s fallback).
+#[cfg(feature = "render")]
+fn parse_media_box(arr: &PdfArray) -> Option<Rectangle> {
+    if arr.len() != 4 {
+        return None;
+    }
+    let mut nums = [0.0f64; 4];
+    for (slot, obj) in nums.iter_mut().zip(arr.iter()) {
+        *slot = match obj {
+            Object::Real(r) => *r,
+            Object::Integer(n) => *n as f64,
+            _ => return None,
+        };
+    }
+    let [x0, y0, x1, y1] = nums;
+    if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+        return None;
+    }
+    let (llx, urx) = (x0.min(x1), x0.max(x1));
+    let (lly, ury) = (y0.min(y1), y0.max(y1));
+    if urx - llx <= 0.0 || ury - lly <= 0.0 {
+        return None;
+    }
+    Some(Rectangle::new(llx, lly, urx, ury))
+}
+
 /// Collects every [`Object::Reference`] reachable from `obj` without
 /// descending through [`SKIP_IMPORT_KEYS`] dictionary entries.
 fn collect_refs(obj: &Object, out: &mut Vec<ObjectId>) {
@@ -706,5 +785,85 @@ mod tests {
 
         let item_after = doc.get_dictionary(outline_item_id).unwrap();
         assert!(item_after.get("Dest").is_none(), "dangling /Dest must be stripped");
+    }
+
+    // ---- `effective_media_box` / `parse_media_box` (valid + adversarial) ----
+    // Both are `#[cfg(feature = "render")]` (see their own doc comments),
+    // so these tests are too.
+
+    #[test]
+    #[cfg(feature = "render")]
+    fn effective_media_box_reads_the_page_own_mediabox() {
+        let doc = doc_with_pages(1);
+        let id = doc.page_id_at(0).unwrap();
+        let rect = doc.effective_media_box(id).unwrap();
+        // `PageBuilder::a4()` (see `doc_with_pages`).
+        assert_eq!(rect, Rectangle::a4());
+    }
+
+    #[test]
+    #[cfg(feature = "render")]
+    fn effective_media_box_falls_back_to_letter_when_missing() {
+        // A page whose `/MediaBox` has been stripped entirely (simulating
+        // a corrupt/adversarial source file: ISO 32000-1 requires one
+        // somewhere in the ancestor chain, but this reader must not choke
+        // on a file that omits it).
+        let mut doc = doc_with_pages(1);
+        let id = doc.page_id_at(0).unwrap();
+        let mut dict = doc.get_dictionary(id).unwrap();
+        dict.remove("MediaBox");
+        doc.set_object(id, Object::Dictionary(dict));
+
+        let rect = doc.effective_media_box(id).unwrap();
+        assert_eq!(rect, Rectangle::letter());
+    }
+
+    #[test]
+    #[cfg(feature = "render")]
+    fn parse_media_box_normalizes_swapped_corners() {
+        // Non-conformant producer: llx/urx and lly/ury swapped.
+        let arr = PdfArray::from_objects(vec![
+            Object::Real(200.0),
+            Object::Real(300.0),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ]);
+        let rect = parse_media_box(&arr).expect("swapped corners should still parse");
+        assert_eq!(rect, Rectangle::new(0.0, 0.0, 200.0, 300.0));
+    }
+
+    #[test]
+    #[cfg(feature = "render")]
+    fn parse_media_box_rejects_adversarial_arrays() {
+        // Wrong element count.
+        let too_few = PdfArray::from_objects(vec![Object::Real(0.0), Object::Real(0.0), Object::Real(1.0)]);
+        assert!(parse_media_box(&too_few).is_none());
+
+        // Non-numeric entry.
+        let non_numeric = PdfArray::from_objects(vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Name(PdfName::new_unchecked("NotANumber")),
+            Object::Real(100.0),
+        ]);
+        assert!(parse_media_box(&non_numeric).is_none());
+
+        // Degenerate (zero width).
+        let degenerate = PdfArray::from_objects(vec![
+            Object::Real(10.0),
+            Object::Real(0.0),
+            Object::Real(10.0),
+            Object::Real(100.0),
+        ]);
+        assert!(parse_media_box(&degenerate).is_none());
+
+        // Non-finite coordinate.
+        let non_finite = PdfArray::from_objects(vec![
+            Object::Real(f64::NAN),
+            Object::Real(0.0),
+            Object::Real(100.0),
+            Object::Real(100.0),
+        ]);
+        assert!(parse_media_box(&non_finite).is_none());
     }
 }

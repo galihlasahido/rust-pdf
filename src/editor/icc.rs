@@ -10,8 +10,9 @@
 //! caller (e.g. a vendored `sRGB2014.icc` shipped by the embedding
 //! desktop application), matching the crate's existing policy of not
 //! reimplementing mature C/C++-grade functionality (see
-//! `src/render/mod.rs`'s Pdfium rationale for the same policy applied to
-//! rasterization). What this module *does* do is:
+//! `src/render/native/mod.rs`'s ICCBased-colour-space-approximation gap
+//! for the same policy applied to rasterization). What this module
+//! *does* do is:
 //! - validate that the supplied bytes look like a structurally sane ICC
 //!   profile before trusting them (the ICC.1 header layout referenced
 //!   below), rejecting obvious garbage rather than embedding it silently;

@@ -163,11 +163,13 @@ impl EditableDocument {
     /// `/Parent` (inheritable attribute, ISO 32000-1 Table 30) if the leaf
     /// doesn't set it directly.
     ///
-    /// `pub(super)` rather than private so [`crate::editor::redact`] (area
+    /// `pub(crate)` rather than private so [`crate::editor::redact`] (area
     /// and font/`ToUnicode` bookkeeping needs the same font-resource
-    /// resolution this module already implements) can reuse it instead of
-    /// duplicating the `/Parent`-inheritance walk.
-    pub(super) fn effective_resources(&self, mut id: ObjectId) -> PdfResult<PdfDictionary> {
+    /// resolution this module already implements) and
+    /// [`crate::render::PdfRenderer`] (needs the same resolved
+    /// `/Resources` to hand to the content-stream interpreter) can reuse
+    /// it instead of duplicating the `/Parent`-inheritance walk.
+    pub(crate) fn effective_resources(&self, mut id: ObjectId) -> PdfResult<PdfDictionary> {
         for _ in 0..64 {
             let dict = self.get_dictionary(id)?;
             if let Some(res) = dict.get("Resources") {
