@@ -1,61 +1,200 @@
-# rust-pdf — Architecture & Audit (as of 2026-07-02)
+# rust-pdf — Architecture & Audit (as of 2026-07-03)
 
 > **Status of this document:** objective inventory of the codebase as it exists today on branch
-> `workflow/enterprise-buildout` (commit `fb6f8e9`). It is **not** a design proposal. Where the
-> code diverges from what the README/marketing text implies, that is called out explicitly.
-> No functional code was changed while producing this document (audit-only phase).
+> `workflow/enterprise-buildout` (commit `ce36ee9`). This is a **refresh** of the original
+> audit-phase document (which stopped at commit `4ed35fe`, the "Rendering Decision" phase) —
+> nine further phases (Content Editing, Fonts, Interactive Features, Redaction, Standards
+> Conformance, Large File Streaming, Signature, Security Hardening, Tauri Integration, plus four
+> follow-up remediation passes) landed roughly **23,000 additional lines of Rust** and six new
+> top-level modules (`editor/`, `filter/`, `render/`, `tauri_commands/`, plus new files inside
+> `font/`) that the previous version of this file never mentioned. This refresh:
+>
+> - Regenerates **§2 Module inventory** from a live `find src -name '*.rs' | xargs wc -l` —
+>   every module named in the remediation brief (`editor/redact.rs`, `editor/audit.rs`,
+>   `editor/pdfa.rs`, `editor/pdfx.rs`, `editor/pdfua.rs`, `editor/icc.rs`, `editor/xmp.rs`,
+>   `editor/structure.rs`, `editor/outline.rs`, `font/cid.rs`, `font/subset.rs`,
+>   `font/truetype.rs`, `render/*`, `tauri_commands/*`) now has a row.
+> - Regenerates **§10 coverage** and **§11 `cargo audit`** from a live re-run against
+>   `--features full,tauri` (the old numbers were measured against a ~102-dependency build with
+>   no `render`/`tauri` feature compiled in at all — meaningless for today's codebase).
+> - Fixes a factual error carried since the original audit: **the largest file in the crate is
+>   `src/signatures/signer.rs` (1,825 lines), not `src/document/mod.rs`** (1,387 lines — still
+>   large, but no longer the largest by a wide margin; `parser/mod.rs` at 1,687 and
+>   `tauri_commands/commands.rs` at 1,516 also now exceed it).
+> - Adds three new sections for functionality the old document had no entry for at all: **§6
+>   in-place editing (`editor/`)**, **§7 embedded/CID fonts (`font/cid.rs`, `subset.rs`,
+>   `truetype.rs`)**, **§9 the Tauri command layer (`tauri_commands/`)**.
+>
+> **What this refresh did *not* do:** a full line-by-line re-verification of every narrative claim
+> in the old §4 ("read path findings"), §5 (signatures), §13 (risk register) and §14 (gap
+> analysis). Those sections describe the codebase as it stood at the *original* audit
+> (commit `4ed35fe`) and are, in several specific places checked opportunistically while doing
+> this refresh, now **stale** (e.g. several of the parser DoS findings in the original §4.1 have
+> since been fixed — see the callout box at the top of §4). `docs/THREAT_MODEL.md` is the actively
+> maintained, current source of truth for untrusted-input risk and dependency-advisory rationale
+> (it says as much itself); this document did not attempt to duplicate or re-derive it. Where this
+> refresh spot-checked and found an old claim to be superseded, that is called out explicitly and
+> cited to a source (a constant, a doc-comment, a test name) — nothing below is invented.
 
 ## 1. What this crate actually is today
 
-`rust-pdf` is primarily a **PDF *generation* (write-only) library** with a secondary,
-partially-implemented **structural PDF reader**. It is good at building new PDF 1.7/2.0 files
-(text, vector graphics, images, AcroForm widgets, classic encryption, detached PKCS#7
-signatures) from a Rust object model. It is **not** currently a general-purpose PDF consumer:
-it cannot open arbitrary third-party PDFs reliably, cannot decrypt existing encrypted PDFs,
-and has no text/content extraction API.
+`rust-pdf` started as a **PDF *generation* (write-only) library** with a partial structural
+reader. It is now also: an **in-place editor** for existing PDFs (`editor/`: pages, forms,
+annotations, outlines, tagged structure, redaction, PDF/A-PDF/X-PDF/UA conformance, ICC/XMP
+metadata), a **font-embedding pipeline** (`font/`: TrueType/OpenType loading, CID/Type0 composite
+fonts for CJK, subsetting), a **PDF rasterizer** (`render/`, FFI to Google's Pdfium — see §8), and
+a **Tauri desktop-app command layer** (`tauri_commands/`, nine async commands wired to a worker
+pool and a dedicated render actor thread).
 
-This distinction matters for the stated goal ("engine PDF enterprise-grade setara Adobe
-Acrobat" — open/view/edit/sign arbitrary PDFs from the wild). See §8 for a gap analysis.
+It is still **not** a general-purpose arbitrary-PDF consumer in one specific, load-bearing way,
+verified again for this refresh: `PdfReader::from_bytes` (`src/parser/mod.rs`) still
+unconditionally returns `ParserError::EncryptedPdf` the instant a trailer's `/Encrypt` entry is
+present — there is still no code path that takes a password and opens an existing encrypted PDF
+(§4, finding #1, re-verified true today). Encryption (`encryption` feature) remains write-only:
+it builds `/Encrypt` dictionaries for documents *this crate* creates.
 
 ```
-Cargo.toml features: compression, images, parser, encryption, signatures, html(empty), office(empty), full
-Default features:    none (bare crate builds with color/content/document/font/forms/object/page/types/writer/error only)
+Cargo.toml features: compression, images, parser, encryption, signatures, html(empty),
+                      office(empty), fonts, render, tauri, full
+Default features:    none (bare crate builds with color/content/document/font/forms/object/
+                      page/types/writer/error only)
 ```
 
-`html` and `office` are declared Cargo features with **no corresponding module** — they compile
-(because they gate nothing) but do nothing. This is aspirational surface area, not implemented
-functionality.
+`html` and `office` remain declared Cargo features with **no corresponding module** — still
+aspirational surface area, not implemented functionality. `render` and `tauri` are deliberately
+**not** part of `full` (see §8/§9 — both require bundling a native platform-specific binary /
+desktop-app runtime that a pure structural/generation/signing consumer does not need).
 
 ## 2. Module inventory (src/)
 
-16,427 lines of Rust across 51 files. Table below: purpose, and whether the module is part of
-the **write path** (Document → bytes) or **read path** (bytes → Document), plus measured line
-coverage (see §6).
+**39,299 lines of Rust across 98 files** (live count, this refresh:
+`find src -name '*.rs' | xargs wc -l`), up from 16,427 lines / 51 files at the original audit —
+more than double the codebase. Grouped by directory below; `%Ln` is line coverage from the live
+`cargo llvm-cov --release --features full,tauri` re-run in §10 (not a stale carry-over).
 
-| Module | LOC | Path | Purpose | Line cov. |
-|---|---|---|---|---|
-| `types/` (matrix, object_id, rectangle) | 341 | shared | Geometry primitives, `ObjectId`, transform matrix | 86–100% |
-| `color/` (rgb, cmyk, gray) | 373 | shared | Device color spaces | 79–91% |
-| `object/` (mod, array, dictionary, name, string, stream) | 1,363 | shared | The PDF object model (`Object`, `PdfDictionary`, `PdfArray`, `PdfName`, `PdfString`, `PdfStream`) used by both write and (partially) read paths | 63–94% |
-| `content/` (mod, graphics, operator, text) | 1,247 | write | Content-stream builders (`ContentBuilder`, `GraphicsBuilder`, `TextBuilder`, `Operator`) | 60–89% |
-| `font/` (mod, metrics, standard14) | 484 | write | Standard-14 font metadata only — **no embedded/TrueType/CFF font support** | 49–100% |
-| `page/mod.rs` | 327 | write | `Page`/`PageBuilder` | 69% |
-| `document/` (mod, info, version) | 1,665 | write | `Document`/`DocumentBuilder`, orchestrates page tree + writer | 28–80% (mod.rs itself is the least-covered file in the crate) |
-| `writer/` (mod, serializer, xref) | 673 | write | Serializes the object graph to PDF bytes; **classic (table) xref only**, no xref-stream / object-stream output | 74–95% |
-| `forms/` (mod, field, widget) | 2,132 | write | AcroForm field + widget construction (text, checkbox, radio, combo, list, push button) | 38–100% (field.rs is 41% covered — 129 pub items, largest single file besides document/mod.rs and signer.rs) |
-| `image/` (mod, xobject) | 478 | write | JPEG/PNG embedding via the `image` crate, builds `Image XObject`s | 18–92% (`image/mod.rs` at 17.5% is the second-worst-covered non-FFI file) |
-| `encryption/` (mod, config, key_derivation, permissions) | 1,186 | write only | Builds `/Encrypt` dictionaries + RC4/AES-128/AES-256 (rev 2/3/4/5/6) key derivation, **encrypts new documents only — there is no code path to open/decrypt an existing encrypted PDF** | 84–94% |
-| `signatures/` (mod, config, certificate, pkcs7, signer, verifier) | 3,238 | write + read | X.509/PKCS#7 detached signing (RSA/ECDSA), verification of existing signatures. Two very different implementation strategies inside this one module — see §4.3 | 47–86% |
-| `parser/` (mod, lexer, objects, trailer, xref) | 1,556 | read | nom-based structural PDF reader | 48–84% (parser/mod.rs, the orchestrator, is 48%) |
-| `error.rs` | 313 | shared | `thiserror`-based error taxonomy, one enum per subsystem | not separately measured (trivial) |
-| `ffi.rs` | 126 | C ABI | 4 `unsafe extern "C"` functions exposing the *write* path only (`pdf_create_simple`, `pdf_get_data`, `pdf_save_to_file`, `pdf_free`) | **0%** — no test exercises the FFI layer at all |
-| `lib.rs` | 310 | — | Crate root, `prelude` re-exports, doctests | 100% (doctested) |
+| File | LOC | %Ln | Purpose |
+|---|---:|---:|---|
+| `lib.rs` | 339 | 100.0 | Crate root, `prelude` re-exports, doctests |
+| `error.rs` | 555 | — | `thiserror`-based error taxonomy, one enum per subsystem |
+| `ffi.rs` | 157 | 0.0 | C ABI: `unsafe extern "C"` functions exposing the *write* path only |
+| **`types/`** (4 files, 441 LOC) | | | Geometry primitives |
+| `types/mod.rs` | 9 | — | Re-exports |
+| `types/matrix.rs` | 189 | 86.8 | 2D affine transform matrix |
+| `types/object_id.rs` | 101 | 100.0 | `ObjectId` (object number + generation) |
+| `types/rectangle.rs` | 142 | 91.9 | `/MediaBox`-style rectangles |
+| **`color/`** (4 files, 533 LOC) | | | Device color spaces |
+| `color/mod.rs` | 173 | 85.2 | `Color` enum, conversions |
+| `color/rgb.rs` | 159 | 89.7 | DeviceRGB |
+| `color/cmyk.rs` | 119 | 81.8 | DeviceCMYK |
+| `color/gray.rs` | 82 | 78.6 | DeviceGray |
+| **`object/`** (6 files, 1,572 LOC) | | | The PDF object model, used by write + (partial) read paths |
+| `object/mod.rs` | 282 | 63.0 | `Object` enum, top-level dispatch |
+| `object/dictionary.rs` | 190 | 91.1 | `PdfDictionary` |
+| `object/array.rs` | 141 | 81.6 | `PdfArray` |
+| `object/name.rs` | 199 | 67.2 | `PdfName` |
+| `object/string.rs` | 160 | 85.9 | `PdfString` (literal/hex, escaping) |
+| `object/stream.rs` | 600 | 93.2 | `PdfStream`; legacy `decompress()` (FlateDecode-only, silently passes through other filters — see §13) plus the newer, full-filter-set `decode_all()` |
+| **`content/`** (4 files, 1,310 LOC) | | | Content-stream *builders* (write path) |
+| `content/mod.rs` | 377 | 90.8 | `ContentBuilder` |
+| `content/graphics.rs` | 343 | 60.1 | `GraphicsBuilder` |
+| `content/operator.rs` | 393 | 79.4 | `Operator` enum + serialization |
+| `content/text.rs` | 197 | 88.4 | `TextBuilder` |
+| **`font/`** (8 files, 2,550 LOC) | | | Font metadata, embedding and CID/subsetting — see §7 |
+| `font/mod.rs` | 225 | 45.3 | `Font` trait/dispatch across Standard-14 and embedded fonts |
+| `font/standard14.rs` | 182 | 91.8 | The 14 standard PostScript font metrics/AFM data |
+| `font/metrics.rs` | 176 | 49.1 | Glyph-width lookup |
+| `font/encoding.rs` | 115 | 57.1 | WinAnsi/MacRoman/Standard text encodings |
+| `font/truetype.rs` | 795 | 96.5 | Embedded TrueType/OpenType font loading via `ttf-parser` (feature `fonts`) |
+| `font/cid.rs` | 571 | 90.1 | Type 0 / CIDFontType2 composite fonts for embedded + CJK text |
+| `font/subset.rs` | 95 | 96.9 | Font subsetting via the `subsetter` crate |
+| `font/tounicode.rs` | 391 | 92.0 | `/ToUnicode` CMap generation for text extraction/accessibility |
+| **`page/`** (1 file, 327 LOC) | | | |
+| `page/mod.rs` | 327 | 63.3 | `Page`/`PageBuilder` |
+| **`document/`** (3 files, 1,758 LOC) | | | |
+| `document/mod.rs` | 1,387 | 77.8 | `Document`/`DocumentBuilder`, orchestrates page tree + writer |
+| `document/info.rs` | 238 | 77.9 | `/Info` dictionary |
+| `document/version.rs` | 133 | 61.2 | PDF version handling |
+| **`writer/`** (3 files, 673 LOC) | | | Serializes the object graph to PDF bytes |
+| `writer/mod.rs` | 276 | 89.9 | `PdfWriter` orchestration |
+| `writer/serializer.rs` | 240 | 83.1 | Object → byte serialization |
+| `writer/xref.rs` | 157 | 96.1 | Classic (table) xref + trailer output |
+| **`forms/`** (3 files, 2,129 LOC) | | | AcroForm field/widget *construction* (write path) |
+| `forms/mod.rs` | 125 | 100.0 | Re-exports |
+| `forms/field.rs` | 1,404 | 51.5 | Text/checkbox/radio/combo/list/push-button field construction (largest single file in this group; 100+ public items, worst-covered) |
+| `forms/widget.rs` | 600 | 83.9 | Widget annotation appearance construction |
+| **`image/`** (2 files, 478 LOC) | | | |
+| `image/mod.rs` | 319 | 26.2 | JPEG/PNG embedding via the `image` crate (worst-covered non-FFI file) |
+| `image/xobject.rs` | 159 | 87.0 | `/XObject /Image` construction |
+| **`filter/`** (8 files, 2,050 LOC) | | | Stream filter codecs (ISO 32000-1 §7.4) — new top-level module since the original audit |
+| `filter/mod.rs` | 221 | 72.9 | `decode_filter`/dispatch, `MAX_DECODED_SIZE` |
+| `filter/ascii_hex.rs` | 88 | 97.8 | `ASCIIHexDecode` |
+| `filter/ascii85.rs` | 147 | 95.6 | `ASCII85Decode` |
+| `filter/run_length.rs` | 115 | 90.3 | `RunLengthDecode` |
+| `filter/lzw.rs` | 278 | 89.3 | `LZWDecode` |
+| `filter/predictor.rs` | 474 | 88.2 | PNG/TIFF predictors (used by Flate/LZW) |
+| `filter/dct.rs` | 125 | 49.2 | `DCTDecode` (baseline/progressive JPEG passthrough for image XObjects) |
+| `filter/ccitt.rs` | 602 | 81.8 | `CCITTFaxDecode` (Group 3/4) |
+| **`encryption/`** (4 files, 1,288 LOC) | | | Builds `/Encrypt` dictionaries; write-only (§1) |
+| `encryption/mod.rs` | 296 | 90.6 | Orchestration |
+| `encryption/config.rs` | 174 | 96.6 | `EncryptionConfig` |
+| `encryption/key_derivation.rs` | 589 | 91.3 | RC4/AES-128/AES-256 key derivation (rev 2–6) |
+| `encryption/permissions.rs` | 229 | 75.5 | `/P` permission bits |
+| **`signatures/`** (9 files, 5,285 LOC) | | | Detached PKCS#7/CMS signing + verification + PAdES LTV — see §5 |
+| `signatures/mod.rs` | 230 | 84.9 | Orchestration |
+| `signatures/config.rs` | 240 | 93.4 | `SignatureConfig` |
+| `signatures/certificate.rs` | 442 | 62.1 | X.509 cert parsing/build |
+| `signatures/chain.rs` | 253 | 80.2 | Certificate chain (path) validation, `MAX_CHAIN_DEPTH` |
+| `signatures/pkcs7.rs` | 619 | 86.0 | Hand-rolled minimal DER/PKCS#7 encoder |
+| `signatures/signer.rs` | **1,825** | 73.0 | **Largest file in the crate.** `DocumentSigner` (fresh `Document`) + `IncrementalSigner` (ad-hoc plain-text scan of an existing PDF buffer — see original §4.3 finding, not re-verified this refresh) |
+| `signatures/timestamp.rs` | 631 | 70.7 | RFC 3161 TSP client — PAdES "B-T" |
+| `signatures/dss.rs` | 342 | 77.5 | `/DSS` Document Security Store embedding — PAdES "B-LT" |
+| `signatures/verifier.rs` | 703 | 87.9 | `SignatureVerifier`, `/ByteRange` handling |
+| **`parser/`** (7 files, 3,506 LOC) | | | nom-based structural PDF reader — see §4 |
+| `parser/mod.rs` | 1,687 | 93.4 | `PdfReader` orchestrator; `MAX_XREF_SECTIONS`, `MAX_PAGE_TREE_WALK_*` |
+| `parser/lexer.rs` | 404 | 85.5 | Tokenizer |
+| `parser/objects.rs` | 381 | 88.2 | Object grammar; `MAX_NESTING_DEPTH` |
+| `parser/trailer.rs` | 147 | 84.9 | Trailer + `/XRefStm` hybrid-reference handling |
+| `parser/xref.rs` | 311 | 91.5 | Classic + xref-stream parsing |
+| `parser/inline_image.rs` | 209 | 97.3 | `BI...ID...EI` inline image operator parsing |
+| `parser/recovery.rs` | 367 | 77.2 | Repair-mode object scanning when the xref table is unusable; `MAX_RECOVERED_OBJECTS` |
+| **`editor/`** (19 files, 10,634 LOC) | | | **New since the original audit.** In-place editing of an existing PDF — see §6 |
+| `editor/mod.rs` | 88 | — | `EditableDocument` entry point |
+| `editor/graph.rs` | 481 | 91.8 | Core mutable object graph; `MAX_PAGE_TREE_NODES`, `MAX_REACHABLE_OBJECTS` |
+| `editor/pages.rs` | 710 | 82.9 | Insert/delete/reorder/rotate/split/merge page-tree editing |
+| `editor/forms.rs` | 1,202 | 91.4 | Read/fill/create/flatten AcroForm fields on a loaded document |
+| `editor/annotations.rs` | 779 | 95.2 | Markup annotations (highlight/underline/strikeout/free-text/stamp/ink/note) with generated appearance streams |
+| `editor/outline.rs` | 646 | 91.9 | Document outline (bookmarks) + named destinations |
+| `editor/structure.rs` | 432 | 90.8 | Minimal Tagged PDF logical structure tree (headings/paragraphs/tables/figures) |
+| `editor/redact.rs` | 1,431 | 73.4 | Permanent content redaction (removes underlying content, not just a visual overlay) |
+| `editor/audit.rs` | 339 | 98.2 | Redaction audit trail (documented private extension — ISO 32000 has no native object for this) |
+| `editor/pdfa.rs` | 926 | 79.1 | PDF/A-1b/2b/3b validation + conversion |
+| `editor/pdfx.rs` | 261 | 88.6 | PDF/X colour-space constraint checking (ISO 15930) |
+| `editor/pdfua.rs` | 372 | 98.4 | PDF/UA (ISO 14289-1) Matterhorn-Protocol-style checklist validation |
+| `editor/icc.rs` | 385 | 95.4 | ICC output-intent embedding (used by PDF/A + PDF/X) |
+| `editor/xmp.rs` | 366 | 94.0 | XMP metadata packet generation/embedding |
+| `editor/content_ops.rs` | 331 | 78.0 | Insert/replace text/shapes/images on an existing page; `MAX_CONTENT_STREAM_BYTES` |
+| `editor/content_stream.rs` | 615 | 69.8 | Round-trippable content-stream operator parser (used by content_ops/redact/text_extract) |
+| `editor/text_extract.rs` | 305 | 85.7 | Text extraction from an existing page's content stream |
+| `editor/save.rs` | 726 | 89.6 | Incremental update *or* full compacted rewrite (object streams + xref stream) |
+| `editor/util.rs` | 239 | 94.3 | Shared helpers |
+| **`render/`** (3 files, 849 LOC) | | | **New since the original audit.** Pdfium-FFI page rasterization, `render` feature — see §8 |
+| `render/mod.rs` | 234 | 100.0 | Public API + module-level rationale doc (canonical rendering-decision writeup) |
+| `render/renderer.rs` | 468 | 83.3 | `PdfiumLibrary`/`PdfRenderer`; `ffi_lock` mutex, `ManuallyDrop` close ordering. Coverage/tests here **require** `RUST_PDF_PDFIUM_LIB_DIR=.pdfium/<platform>/lib` to be set (see §8) — the render/tauri test suites *silently skip* (report `ok`, not `FAILED`) rather than exercise this file at all if it isn't, which this refresh initially missed on its first `cargo llvm-cov` run (got 7.9%/6.8% with the env var unset) before re-running with it set and getting the number in this row; see §10's note |
+| `render/cache.rs` | 147 | 100.0 | Bounded LRU thumbnail cache |
+| **`tauri_commands/`** (7 files, 2,865 LOC) | | | **New since the original audit.** Async Tauri desktop command layer, `tauri` feature — see §9 |
+| `tauri_commands/mod.rs` | 112 | — | Module overview |
+| `tauri_commands/commands.rs` | 1,516 | 82.3 | The 9 commands: `open_document`, `render_page`, `extract_text`, `search_text`, `apply_edit`, `save_document`, `fill_form`, `add_annotation`, `sign_document` |
+| `tauri_commands/state.rs` | 254 | 87.3 | Managed app state: open-document registry + worker pool/render actor handles |
+| `tauri_commands/worker.rs` | 217 | 91.7 | CPU-bound work thread pool (parsing/editing/signing off the async executor) |
+| `tauri_commands/render_actor.rs` | 437 | 93.3 | Single dedicated OS thread owning every open `PdfRenderer`; panic containment (see original "RenderActor Panic Resilience" remediation) |
+| `tauri_commands/progress.rs` | 92 | 100.0 | Progress event reporting, decoupled from the `tauri` crate's own types |
+| `tauri_commands/error.rs` | 237 | 75.0 | `CommandError`, structured `Serialize`-able error taxonomy for the command layer |
 
-Public API surface (functions/structs/enums/traits marked `pub`, rough grep count, not counting
-re-exports): **forms/field.rs (129)** > content/graphics.rs (41) > page/mod.rs (39) >
-content/mod.rs (38) > signatures/signer.rs (27) > object/stream.rs (23) ≈ object/name.rs (23) >
-… Total public items across `src/` ≈ 700+. This is a large surface for a 0.1.0 crate; most of
-it (forms, content, graphics) is builder-pattern fluent API and reasonably self-consistent.
+Public API surface (rough grep count of `pub` items, not counting re-exports) is now dominated by
+the newer modules: `forms/field.rs` (100+), `editor/forms.rs`, `editor/redact.rs` and
+`tauri_commands/commands.rs` are all large; a precise total was not recomputed for this refresh
+(the original audit's "≈700+ public items" figure predates ~23,000 lines of subsequent code and
+should not be treated as current).
 
 ## 3. Write path (the part that works)
 
@@ -65,310 +204,168 @@ Page/PageBuilder → content stream (ContentBuilder/GraphicsBuilder/TextBuilder 
 Document::save_to_bytes()/write_to()
   → allocates ObjectIds
   → optionally compresses each stream (Flate, feature "compression")
+  → optionally embeds/subsets fonts (feature "fonts", src/font/{truetype,cid,subset}.rs)
   → optionally encrypts each string/stream (feature "encryption", RC4/AES per EncryptionConfig)
   → PdfWriter serializes objects sequentially, tracks byte offsets
   → writes a classic (%…%%EOF, `xref` keyword, plain trailer) cross-reference table
 ```
 
-This path is exercised by 68 integration tests in `tests/integration_tests.rs` covering text,
-graphics, images, compression, encryption, multi-page documents, and by round-trips through the
-`parser` feature for the crate's *own* output. It produces PDF 1.7/2.0 files that were manually
-spot-checked against `qpdf` in the encryption test suite (`test_verify_against_qpdf_encrypted_pdf`).
+This is unchanged in shape from the original audit; it is now complemented by `editor/save.rs`,
+which can write an **incremental update** or a **full rewrite using object streams and a
+cross-reference stream** for an already-loaded, edited `EditableDocument` (§6) — i.e. the
+"classic xref only" limitation noted in the original audit no longer applies to the edit path,
+only to `Document::save_to_bytes()`'s from-scratch generation path. This distinction was not
+re-verified line-by-line for this refresh beyond confirming `editor/save.rs`'s module doc comment
+states it (quoted verbatim in §2's table).
 
-**Not implemented on the write side:** xref streams (`/Type /XRef`), compressed object streams
-(`/Type /ObjStm`), linearization, embedded fonts (only the 14 standard PostScript fonts are
-supported — no TrueType/OpenType/CFF embedding, no CJK/Unicode text beyond WinAnsi-range glyphs
-implied by Standard-14 metrics), tagged/accessible PDF (no `/StructTree`), optional content
-(layers), or annotations beyond form-field widgets and signature widgets.
+## 4. Read path (`parser` feature)
 
-## 4. Read path (`parser` feature) — detailed findings
+> **Status update (this refresh, spot-checked, not a full re-audit):** the original §4.1 below
+> lists 11 findings from the very first audit (commit `4ed35fe`'s ancestor). A later
+> "Parser Robustness" phase (commit `ba71ea5`, between the original audit and the Rendering
+> Decision phase) appears to have fixed most of the DoS-shaped ones. Verified directly against
+> today's source for this refresh:
+> - Finding **#1** (encrypted PDFs unconditionally rejected) — **still true**, re-verified:
+>   `src/parser/mod.rs` still returns `ParserError::EncryptedPdf` unconditionally.
+> - Finding **#2** (hybrid `/XRefStm` ignored) — **fixed**: `xref_stm_offset()` in
+>   `src/parser/mod.rs` now reads it (ISO 32000-1 §7.5.8.4).
+> - Finding **#3** (`/Prev` cycle → infinite loop) — **fixed**: `MAX_XREF_SECTIONS = 4096` hard
+>   cap, `src/parser/mod.rs`.
+> - Finding **#4** (unbounded object-grammar recursion → stack overflow) — **fixed**:
+>   `MAX_NESTING_DEPTH = 64`, `src/parser/objects.rs`.
+> - Finding **#5** (unbounded xref subsection `count`) — **mitigated**: entries are inserted one
+>   at a time as they're actually parsed out of the real input buffer (no pre-allocation sized by
+>   the untrusted `count`), so a huge claimed count still fails once the input is exhausted rather
+>   than allocating/looping unboundedly; overflow on `first_obj + i` is `checked_add`-guarded.
+> - Finding **#6** (unbounded Flate decompression) — **fixed**: `MAX_DECODED_SIZE` cap, enforced
+>   in both `filter::decode_flate` and `object/stream.rs::decompress()`.
+> - Finding **#7** (unbounded/panicking offset slicing) — **fixed**: `resolve_reference` now uses
+>   `self.data.get(*offset as usize..)?` (bounds-checked) rather than direct indexing.
+> - Finding **#8** (only FlateDecode understood, others silently passthrough) — **fixed for the
+>   `decode_all()` path** (full filter set, `JBIG2Decode`/other-unknown returns `Err`, verified by
+>   `filter::tests::unsupported_filter_is_rejected_not_panicking`); **the legacy
+>   `PdfStream::decompress()` method still silently passes through non-FlateDecode data** — its own
+>   doc comment now explicitly warns callers to prefer `decode_all()` instead (see §2's
+>   `object/stream.rs` row and §13).
+> - Finding **#9** (`object_cache` never populated) — **fixed**: `resolve_reference` writes into
+>   it, and there's a regression test (`test_resolve_reference_populates_get_object_cache`).
+> - Finding **#10** (indirect `/Length` unsupported) — **fixed**: falls back to scanning for
+>   `endstream` when `/Length` doesn't resolve to a direct integer.
+> - Finding **#11** (page count trusted, no tree-well-formedness check) — **partially addressed**:
+>   `MAX_PAGE_TREE_WALK_NODES`/`MAX_PAGE_TREE_WALK_DEPTH` bound the walk so a pathological
+>   `/Kids` structure fails safely instead of hanging, but this is a resource bound, not full
+>   cycle/well-formedness detection — not independently re-verified further.
+>
+> This status update was assembled by grepping for the named constants/functions in today's
+> source, not by re-running the original audit's exact repro steps end-to-end. `docs/
+> THREAT_MODEL.md` §4/§6 is the maintained, current risk register (full `MAX_*` inventory,
+> component-by-component) and takes precedence over anything below if the two disagree.
 
-`PdfReader` (src/parser/mod.rs) is a **from-scratch, hand-rolled** nom parser. It has never been
-exercised against a real-world PDF produced by Acrobat, Chrome, LibreOffice, pdflatex, Word, or
-any scanner/printer driver — every test in the repo that calls `PdfReader::from_bytes` feeds it
-bytes that `rust-pdf`'s own writer just produced (`tests/integration_tests.rs`,
-`src/parser/mod.rs` unit tests). There is **no fixture corpus of third-party PDFs**.
+`PdfReader` (`src/parser/mod.rs`) is a from-scratch, hand-rolled nom parser, now joined by
+`src/parser/recovery.rs` (a "repair mode" object scanner for files whose xref table is unusable —
+not present at the time of the original audit, `MAX_RECOVERED_OBJECTS` bounded). It is still
+mainly exercised against this crate's own writer output plus the self-generated fixtures in
+`tests/render_tests.rs` and the fuzz corpus (`fuzz/fuzz_targets/parse_pdf.rs`,
+`decode_filters.rs`, `parse_inline_image.rs`, `font_load.rs`) — there is still no committed
+corpus of arbitrary third-party producer PDFs.
 
-### 4.1 Confirmed hidden assumptions / spec gaps
+### 4.1 Original findings (historical — see status update above for current truth)
 
 References are to ISO 32000-1:2008 unless noted.
 
-1. **Encrypted PDFs are unconditionally rejected.** `PdfReader::from_bytes` (src/parser/mod.rs:69)
-   returns `ParserError::EncryptedPdf` the moment `trailer.encrypt.is_some()`, with no attempt at
-   even the empty-user-password case (§7.6.4, extremely common for "protect from editing but not
-   from viewing" PDFs). The crypto primitives to derive keys exist in `encryption/key_derivation.rs`
-   (including a working AES-256/R6 hash function verified against a qpdf-encrypted fixture) but
-   are **not wired to the reader** — `verify_user_password` is dead code (`#[warn(dead_code)]`
-   in the build log).
-2. **Hybrid-reference files are not supported.** Per §7.5.8.4, a PDF can have a classic `trailer`
-   dictionary with an `/XRefStm` entry pointing to a supplemental cross-reference *stream* for
-   readers that understand it. `Trailer::from_dictionary` (src/parser/trailer.rs) never looks at
-   `/XRefStm`; only `/Prev` is followed. Files written this way (common for
-   backward-compatibility with pre-1.5 readers) will silently miss any objects only present in
-   the stream.
-3. **No recursion/iteration bound on the `/Prev` chain** (src/parser/mod.rs:109-166,
-   `parse_xref_and_trailer`). A PDF whose trailer chain cycles back on itself (corrupt or
-   adversarial) causes an infinite loop, not an error — the process never returns. This is a DoS
-   vector on untrusted input (rule 2 in the task brief).
-4. **No recursion depth limit in the object grammar.** `parse_object` (src/parser/objects.rs) is
-   directly recursive through `parse_array_object` / `parse_dictionary_or_stream` with no depth
-   counter. A deeply nested array/dictionary (`[[[[[…]]]]]`, megabytes of `[`) will overflow the
-   Rust call stack and abort the process (not a catchable `Result` error). Classic recursive-
-   descent-parser DoS.
-5. **Unbounded `xref` subsection `count` field.** `parse_xref_table`
-   (src/parser/xref.rs:108-141) trusts the `count` value read straight from the file and loops
-   `for i in 0..count` inserting into a `HashMap`, with `first_obj + i as u32` unchecked for
-   overflow. A crafted subsection header claiming a huge count (up to `u32::MAX`) will either
-   panic on integer overflow (debug builds) or attempt to allocate/insert billions of HashMap
-   entries (release builds) before the truncated input causes a parse error — memory/CPU DoS
-   with a tiny input file.
-6. **Zlib decompression has no output-size cap.** `PdfStream::decompress()` (src/object/stream.rs:154)
-   calls `ZlibDecoder::read_to_end` with no limit — a classic decompression-bomb vector (a few KB
-   of input can expand to gigabytes). This code path is reached both from user code calling
-   `decompress()` directly and internally from `parse_xref_stream` /
-   `resolve_compressed_object` while reading a file.
-7. **Unbounded, panicking byte-slicing on offsets taken from the file.** `resolve_reference`
-   (src/parser/mod.rs:365-380) does `&self.data[*offset as usize..]` where `offset` comes
-   verbatim from an xref entry with no bounds check against `self.data.len()`; a corrupt/adversarial
-   offset panics (`slice index out of range`) instead of returning an `Err`. Same pattern in
-   `resolve_compressed_object` (src/parser/mod.rs:388, 419, 443) for the object-stream `First`
-   offset and computed `obj_offset`/`next_offset` bounds. This directly violates the "no panics
-   on untrusted file data" requirement.
-8. **Only `/FlateDecode` is understood; every other filter is silently treated as raw data.**
-   `PdfStream::decompress()` returns `self.data.clone()` unchanged for `ASCIIHexDecode`,
-   `ASCII85Decode`, `LZWDecode`, `RunLengthDecode`, `CCITTFaxDecode`, `DCTDecode`,
-   `JBIG2Decode`, `JPXDecode`, or a `Filter` array (§7.4) — there is no error, so a caller
-   iterating "decompressed" bytes gets silently wrong (still-encoded) data with no signal
-   anything went wrong.
-9. **`PdfReader::get_object()` never returns anything.** `object_cache` (src/parser/mod.rs:47) is
-   populated nowhere in the codebase — `resolve_reference` takes `&self` and never inserts into
-   the cache, so `get_object()` (src/parser/mod.rs:343-352) always returns `None` after
-   construction, and every `resolve_reference` call *re-parses the object from raw bytes from
-   scratch* (no caching despite the cache field existing). This looks like an unfinished
-   refactor, not intentional behavior.
-10. **`Length` must be a direct integer.** `parse_dictionary_or_stream`
-    (src/parser/objects.rs:130-143) errors out if a stream's `/Length` is an indirect reference
-    (`5 0 R`), which is extremely common in real-world PDF producers (Length is written as a
-    reference so it can be patched after the stream is emitted, per the informal convention many
-    writers use). This alone will make many real-world files unparsable, independent of the
-    xref-stream/object-stream gaps above.
-11. **Page count is trusted, not verified.** `get_page_count_from_tree`
-    (src/parser/mod.rs:301-321) reads `/Count` from the immediate `/Pages` dictionary and returns
-    it as-is; it never walks `/Kids` to confirm the tree is well-formed, detect cycles, or handle
-    a `/Type /Pages` intermediate node. There is no page-content or page-tree traversal API at
-    all beyond this single integer.
+1. **Encrypted PDFs are unconditionally rejected.** Still true (re-verified).
+2. Hybrid-reference (`/XRefStm`) support — fixed (re-verified).
+3. `/Prev`-chain infinite loop — fixed (re-verified, `MAX_XREF_SECTIONS`).
+4. Object-grammar recursion depth — fixed (re-verified, `MAX_NESTING_DEPTH`).
+5. Unbounded xref subsection `count` — mitigated (re-verified).
+6. Zlib decompression bomb — fixed (re-verified, `MAX_DECODED_SIZE`).
+7. Unbounded/panicking offset slicing — fixed (re-verified, `.get()`-based bounds checks).
+8. Only FlateDecode understood — fixed for `decode_all()`, legacy `decompress()` still passes
+   through silently (re-verified both).
+9. `object_cache` never populated — fixed (re-verified).
+10. `Length` must be a direct integer — fixed via `endstream`-scan fallback (re-verified).
+11. Page count trusted / tree well-formedness — partially addressed via resource bounds
+    (re-verified the bounds exist; did not re-verify full cycle detection).
 
-### 4.2 What *is* implemented and tested on the read side
+### 4.2 Signing path uses a second, independent, ad-hoc "parser"
 
-Classic (non-stream) xref table parsing, classic trailer parsing (`/Root`, `/Size`, `/Info`,
-`/Encrypt`-detection-only, `/ID`, `/Prev`), the core object grammar (booleans, integers, reals,
-literal/hex strings with escape handling, names, arrays, dictionaries, indirect references,
-`null`), indirect-object framing (`N G obj … endobj`), and a header-version check. Xref-*stream*
-parsing (`parse_xref_stream`) and compressed-object-stream resolution
-(`resolve_compressed_object`) are **implemented** (§4.1 code exists) but have **zero test
-coverage** — no test in the repository constructs or feeds a `/Type /XRef` or `/Type /ObjStm`
-object through the reader, so their correctness against the spec is unverified.
+`src/signatures/signer.rs`'s `IncrementalSigner` still does its own plain-text scanning
+(`String::from_utf8_lossy`, `.find("/Root")`, `.find("{id} 0 obj")`, etc.) of an existing PDF
+buffer rather than using `src/parser/`. This was **not** re-verified for this refresh (it is a
+large, 1,825-line file and re-auditing its current byte-scanning robustness against
+compressed-object-stream files was out of scope for a documentation-inventory refresh). Treat
+the original finding as unconfirmed-but-plausible until someone re-checks it directly.
 
-### 4.3 Signing path uses a second, independent, ad-hoc "parser"
+## 5. Encryption & Signatures
 
-`src/signatures/signer.rs`'s `IncrementalSigner` (used to add a signature to an *existing*,
-externally-supplied PDF byte buffer — as opposed to `DocumentSigner`, which signs a freshly-built
-`Document`) does **not** use `src/parser/` at all. Instead it does its own plain-text scanning of
-`String::from_utf8_lossy(pdf_bytes)` with `.find("/Root")`, `.find("{id} 0 obj")`,
-`.rfind(">>")`, `content.lines().rev()`, etc. (over 20 call sites, e.g.
-src/signatures/signer.rs:216, 249-250, 469, 520, 1015, 1097). This works only for PDFs whose
-catalog/page/AcroForm objects are:
-- plain classic-xref (not xref-stream) files, and
-- **not** stored inside a compressed object stream (`/Type /ObjStm`) — since compressed objects
-  have no `N G obj`/`endobj` markers in the byte stream at all, `content.find("{id} 0 obj")` can
-  never locate them, and
-- pure-ASCII dictionaries without the exact target byte sequence `"{id} 0 obj"` coincidentally
-  appearing inside earlier binary/compressed stream data (which would misdirect the byte-offset
-  scan).
+- **Encryption** (`encryption` feature): unchanged in shape from the original audit — RC4
+  (V1/V2, R2/R3), AES-128 (V4, R4), AES-256 (V5, R6) per ISO 32000-2:2020 Annex C, write-only.
+- **Signatures** (`signatures` feature): detached PKCS#7 (RSA PKCS#1v1.5, ECDSA P-256), hand-rolled
+  minimal DER/PKCS#7 encoder (`signatures/pkcs7.rs`), verified against `openssl cms`
+  (`test_cross_verify_with_openssl_cms`).
+- **Correction to the original audit:** the original §5 stated *"Timestamping (RFC 3161 `/TS`)
+  and Long-Term Validation (`/DSS`, PAdES) are not implemented."* This is **no longer true** — a
+  later "Signature" phase added `src/signatures/timestamp.rs` (RFC 3161 TSP client, PAdES "B-T")
+  and `src/signatures/dss.rs` (Document Security Store embedding, PAdES "B-LT"), with dedicated
+  tests (`test_pades_b_t_rfc3161_timestamp_end_to_end`, `test_dss_embedding_preserves_signature_
+  validity`, `test_pades_b_b_subfilter_and_cross_verify`, `test_pades_level_t_without_timestamp_
+  authority_fails_fast`, `test_two_sequential_signatures_with_pades_timestamp_and_visible_
+  appearance` — all passing, see §10).
+- Still write-only in the same sense as encryption: there is no `Document::open` that decrypts an
+  existing encrypted PDF before verifying/adding a signature to it.
 
-Concretely: `IncrementalSigner` will very likely **fail or silently misbehave** on any PDF
-produced by a modern producer that defaults to compressed cross-reference/object streams (a
-large fraction of PDFs from recent Acrobat, many PDF/A generators, etc.). This is a maintenance
-and correctness risk: two independent, inconsistent implementations of "find object N in this
-PDF" exist in the same crate, and the newer one (signer) is a regression from the structured
-parser rather than building on it. No `.unwrap()` in this file was found to be reachable without
-a preceding existence check (i.e., not an immediate panic risk), but the *logic* itself is
-fragile against real-world files.
+## 6. Editing an existing PDF (`editor/`)
 
-## 5. Encryption & Signatures — what's real
+New top-level module since the original audit (19 files, 10,634 lines — the single largest
+directory in the crate). `EditableDocument` (`editor/mod.rs`/`graph.rs`) loads an existing PDF via
+`parser`, exposes a mutable in-memory object graph bounded by `MAX_PAGE_TREE_NODES`/
+`MAX_REACHABLE_OBJECTS` (see `docs/THREAT_MODEL.md` §6 for the full resource-limit inventory), and
+supports:
 
-- **Encryption** (`encryption` feature): builds `/Encrypt` dictionaries for RC4 (V1/V2, R2/R3),
-  AES-128 (V4, R4) and AES-256 (V5, R6) per the algorithms in ISO 32000-2:2020 Annex C /
-  PDF 2.0 §7.6, with key derivation validated against a real `qpdf`-encrypted fixture
-  (`test_verify_against_qpdf_encrypted_pdf`). This is write-only: there is no `Document::open`
-  that takes a password and decrypts an existing file.
-- **Signatures** (`signatures` feature): builds detached PKCS#7 (`/SubFilter
-  /adbe.pkcs7.detached`) signatures over RSA (PKCS#1v1.5, via `rsa` crate) and ECDSA P-256
-  (via `p256`/`ecdsa`), with a hand-rolled minimal DER/PKCS#7 encoder
-  (`src/signatures/pkcs7.rs`) rather than relying on the `cms`/`der` crates' encoders for the
-  outer structure (those crates are pulled in as dependencies but the PKCS#7 `SignedData` bytes
-  appear to be built manually — worth double-checking against the `cms` crate's own encoder in a
-  later phase for spec fidelity). Verification (`SignatureVerifier`) parses `/ByteRange`,
-  extracts the hex `/Contents`, and validates the signature over the byte range — this part *does*
-  reuse plain byte-offset math rather than a second lossy-string scan, and is covered by
-  `tests/signature_verification_tests.rs` (7 tests, including a tamper-detection test).
-- Timestamping (RFC 3161 `/TS`) and Long-Term Validation (`/DSS`, PAdES) are not implemented.
+- **Structural editing**: page insert/delete/reorder/rotate/split/merge (`pages.rs`), AcroForm
+  field read/fill/create/flatten (`forms.rs`), markup annotations with generated appearance
+  streams (`annotations.rs`), document outline/bookmarks + named destinations (`outline.rs`).
+- **Content editing**: insert/replace text/shapes/images on an existing page (`content_ops.rs`,
+  built on a round-trippable content-stream operator parser in `content_stream.rs`), plus text
+  extraction (`text_extract.rs`).
+- **Standards conformance**: minimal Tagged PDF logical structure (`structure.rs`, ISO 32000-1
+  §14.7/14.8), PDF/A-1b/2b/3b validation+conversion (`pdfa.rs`), PDF/X colour constraint checking
+  (`pdfx.rs`, ISO 15930), PDF/UA Matterhorn-Protocol-style checklist validation (`pdfua.rs`), ICC
+  output-intent embedding (`icc.rs`) and XMP metadata (`xmp.rs`).
+- **Redaction**: permanent (not just visual-overlay) content removal (`redact.rs`, ISO 32000-2
+  §12.5.6.19) with a documented, namespaced audit-trail extension (`audit.rs`) since ISO 32000
+  does not define a native redaction-audit object.
+- **Persistence**: `save.rs` writes either an ISO 32000-1 §7.5.6 incremental update or a full,
+  compacted rewrite using object streams + a cross-reference stream (§7.5.7/7.5.8).
 
-## 6. Test coverage (measured, not estimated)
+Per-file ISO references and scope caveats are documented as module-level rustdoc in each file
+(quoted where relevant in §2's table); this section did not re-derive them independently.
 
-Tool: `cargo-llvm-cov` (installed for this audit; was not previously part of the toolchain).
+## 7. Fonts: embedded/CID/subsetting (`font/`)
 
-```
-cargo llvm-cov --all-features --summary-only
-```
+Extends the original Standard-14-only font module with (gated behind the `fonts` feature):
 
-Aggregate (see full per-file table in the raw output, reproducible with the command above; HTML
-report generated at `target/llvm-cov/html/index.html`, not committed — `target/` is gitignored):
+- `font/truetype.rs`: embedded TrueType/OpenType font *loading* via the `ttf-parser` crate
+  (deliberately not a hand-rolled sfnt parser over untrusted font bytes — see its module doc and
+  `docs/THREAT_MODEL.md` §4.3), bounded by `MAX_FONT_SIZE_BYTES`/`MAX_GLYPH_COUNT`.
+- `font/cid.rs`: Type 0 / CIDFontType2 composite font construction (ISO 32000-1 §9.7) for
+  embedding TrueType/OpenType fonts including CJK text.
+- `font/subset.rs`: font subsetting (glyph remapping/table rebuilding) via the `subsetter` crate,
+  reducing an embedded font program to only the glyphs a document actually uses (ISO 32000-1 §9.9
+  permits this).
+- `font/tounicode.rs`: `/ToUnicode` CMap generation, needed for text extraction and accessibility
+  of embedded/CID fonts, bounded by `MAX_CMAP_BYTES`/`MAX_CMAP_ENTRIES`.
 
-| Metric | Covered / Total | % |
-|---|---|---|
-| Regions | 10,893 / 15,766 | **69.09%** |
-| Functions | 863 / 1,295 | **66.64%** |
-| Lines | 6,259 / 9,220 | **67.89%** |
+The original audit's blanket claim ("no embedded/TrueType/CFF font support... no CJK/Unicode text
+beyond WinAnsi") no longer holds for TrueType/OpenType + CID text; CFF-only (bare, non-OpenType)
+font programs were not confirmed either way for this refresh.
 
-Notably low files (line coverage):
-- `ffi.rs` — **0%** (58/58 lines missed). The C ABI boundary is completely untested.
-- `image/mod.rs` — 26.20% line coverage (17.54% region coverage) — image loading/decoding error
-  paths largely untested.
-- `document/mod.rs` — **30.51%** line coverage on the single largest file (1,674 regions,
-  1,293 lines) — the document-build/write orchestrator, including most encryption/signature
-  integration branches, is under-tested relative to its size.
-- `forms/field.rs` — **37.75%** line coverage on the largest form-field file (129 public items).
-- `parser/mod.rs` — **47.56%** line coverage — and, per §4.3, the *covered* 47% does not include
-  the xref-stream / object-stream code paths at all (those functions do execute during coverage
-  collection only if a test calls them, and none does — meaning their apparent partial coverage,
-  if any, is incidental basic-block overlap, not a real exercise of that logic).
+## 8. Rendering: native-vs-FFI decision (implemented)
 
-Test counts (`cargo test --all-features`): 235 unit tests (`src/`) + 68 integration tests
-(`tests/integration_tests.rs`) + 7 signature-verification tests
-(`tests/signature_verification_tests.rs`) + 2 executed doctests (6 more are `ignore`d) = **312
-passing, 0 failing**.
+*(Unchanged from the original document — this section was already current as of the "Rendering
+Decision" phase and is preserved as-is, only renumbered.)*
 
-## 7. `cargo audit` results
-
-```
-$ cargo audit
-    Fetching advisory database from `https://github.com/RustSec/advisory-db.git`
-      Loaded 1149 security advisories
-    Scanning Cargo.lock for vulnerabilities (102 crate dependencies)
-```
-
-**1 vulnerability, 1 warning:**
-
-| Advisory | Crate | Severity | Detail | Fix available? |
-|---|---|---|---|---|
-| [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071) | `rsa 0.9.10` | Medium (5.9) | "Marvin Attack": potential RSA private-key recovery via timing side channel | **No fixed version exists upstream** as of this audit |
-| [RUSTSEC-2026-0097](https://rustsec.org/advisories/RUSTSEC-2026-0097) (warning, not a vuln) | `rand 0.8.5` (direct dep + transitive via `num-bigint-dig` ← `rsa`) | — | "Rand is unsound with a custom logger using `rand::rng()`" | Not evaluated whether applicable to this crate's usage pattern |
-
-**Implication:** `rsa 0.9.10` (used for RSA PKCS#1v1.5 signing in the `signatures` feature) is the
-only maintained pure-Rust RSA implementation with `cms`/`x509-cert` ecosystem compatibility at
-the time of writing, and it carries a known, currently-unpatched timing side-channel advisory.
-For an enterprise/legal-document-signing product this needs an explicit risk decision (accept +
-document, mitigate with blinding/constant-time key ops if not already default, or swap to an
-HSM/external-signing model where the private key never touches this process). Not evaluated
-further in this phase — flagged for a security-focused follow-up.
-
-## 8. `cargo clippy --all-features --all-targets -- -D warnings`
-
-**Current status: fails (13 distinct lint categories, 0 unsafe-related).** Full log captured
-during this audit; none were fixed (audit phase — "JANGAN ubah kode fungsional di fase ini").
-Plain `cargo clippy --all-features` (warnings not promoted to errors) succeeds with the same 13
-warnings and no build failure — the crate is clippy-clean under default severity, only fails the
-stricter `-D warnings` gate the team wants to enforce going forward. Breakdown:
-
-| Count | Lint | Example location |
-|---|---|---|
-| 5 | `approx_constant` (literal `3.14` flagged as "close to π") | `object/mod.rs`, `parser/lexer.rs`, `parser/objects.rs` (all in `#[test]` code, using 3.14 as an arbitrary test value) |
-| 2 | `derivable_impls` (manual `impl Default` that could be `#[derive(Default)]`) | `signatures/mod.rs:130`, one more |
-| 2 | `manual_is_multiple_of` (`x % 16 != 0` → `!x.is_multiple_of(16)`) | `encryption/key_derivation.rs:310,420` |
-| 1 | `single_match` (`match` used for a single equality check) | `forms/widget.rs:101` |
-| 1 | `needless_borrow` | `writer/mod.rs:130` |
-| 1 | `if_same_then_else` (two identical `if`/`else` arms) | `signatures/pkcs7.rs:382-386` |
-| 1 | `len_zero` (`.len() > 0` → `!.is_empty()`) | `object/stream.rs:318` (test code) |
-| 1 | `unnecessary_unwrap` (`.is_some()` check followed by `.unwrap()` instead of `if let`) | `signatures/signer.rs:1169-1170` |
-| 1 | `unnecessary_cast` (`u8 as u8`) | `parser/lexer.rs:200` |
-| 1 | `unnecessary_cast` (`u32 as u32`) | `parser/xref.rs:133` |
-| 1 | `doc_lazy_continuation` (rustdoc formatting) | — |
-| 2 | `dead_code` (`verify_user_password`, `aes_cbc_decrypt_no_padding` never called — see §4.1 finding #1) | `encryption/key_derivation.rs:375,414` |
-
-None of these are correctness-critical on their own; they are cleanliness/idiom issues plus two
-`dead_code` warnings that corroborate the "encrypted-PDF read path was never finished" finding.
-Recommended to fix in a dedicated lint-cleanup commit before turning on `-D warnings` in CI.
-
-## 9. Untrusted-input risk register (summary)
-
-Per the task's mandatory rule ("semua kode yang menangani input file PDF adalah untrusted
-input"), the following are the concrete, reproducible risk points found in `parser`/`object`
-during this audit (details in §4.1):
-
-| # | Risk | Location | Trigger |
-|---|---|---|---|
-| 1 | Infinite loop | `parser/mod.rs` `parse_xref_and_trailer` | `/Prev` cycle in trailer chain |
-| 2 | Stack overflow (process abort, not `Result::Err`) | `parser/objects.rs` `parse_object`/`parse_array_object`/`parse_dictionary_or_stream` | deeply nested `[`/`<<` |
-| 3 | Unbounded allocation / integer overflow | `parser/xref.rs` `parse_xref_table` | huge subsection `count` |
-| 4 | Decompression bomb (unbounded memory) | `object/stream.rs` `decompress()` | small Flate stream expanding to GBs |
-| 5 | Slice-index panic | `parser/mod.rs` `resolve_reference`, `resolve_compressed_object` | xref offset / object-stream `First`/computed offsets beyond `data.len()` |
-| 6 | Silent wrong data (not a crash, but a correctness/security issue) | `object/stream.rs` `decompress()` | non-FlateDecode filter treated as passthrough |
-
-None of these were fixed in this phase (out of scope per the task's "audit only" instruction);
-they are the primary input for the next hardening phase.
-
-## 10. Gap vs. a mature C/C++ PDF engine (pdfium / MuPDF / poppler / qpdf)
-
-Being explicit per the task brief: reaching feature parity with a mature, battle-tested C/C++
-PDF engine (rendering to raster/vector output, arbitrary third-party file compatibility including
-malformed/repairable files, full filter set, font subsetting/embedding + CJK, tagged PDF,
-annotations, redaction, OCR-adjacent text extraction, incremental-save correctness against every
-producer quirk in the wild) is a **multi-year, multi-person effort**, not a phase or two. Those
-libraries encode roughly two decades of "PDF producers are wrong in every possible way" bug
-fixes that cannot be derived from the spec alone — they were learned from huge real-world test
-corpora (pdfium alone has tens of thousands of regression-test PDFs). Concretely, for
-*this* crate to become "setara Adobe Acrobat" as a read/edit engine (not just write), realistic
-missing pieces include:
-- A real content-stream interpreter + rasterizer/vector-renderer (does not exist at all today —
-  this crate has no rendering code whatsoever, only generation and structural inspection).
-- Font program parsing/subsetting (TrueType/OpenType/CFF/Type1) and embedding, plus a
-  text-layout/shaping engine for anything beyond the 14 standard fonts.
-  Estimated effort: several person-months minimum for a correct embedded-font pipeline alone.
-- A "repair mode" parser tolerant of the many ways real files violate the spec (broken xref,
-  missing `endobj`, wrong `/Length`, byte-offset drift after third-party edits) — qpdf/mupdf
-  invest heavily here; this crate currently has none (§4.1).
-- Filter completeness (LZW, CCITT G3/G4, JBIG2, JPX, ASCII85, RunLength) — currently only
-  FlateDecode.
-- Encrypted-file *opening* (all revisions, empty/owner/user password logic) — currently write-only.
-- Redaction, tagged/accessible PDF, forms with full JavaScript-triggered calculations (AcroForm
-  *data model* exists here; the interactive/calculation engine does not).
-- A rendering surface Tauri could actually put pixels on screen with (this crate produces PDF
-  bytes; something else — pdfium via FFI, or a from-scratch renderer — is needed to *display*
-  a PDF, which is usually the majority of an "Adobe Acrobat-class" desktop app's engineering).
-
-Given the above, a realistic estimate for closing the gap to a genuinely mature, enterprise-grade
-engine (matching, not necessarily exceeding, pdfium/mupdf-class robustness across rendering +
-editing + interop) is **on the order of 12–24+ person-months** of focused work, assuming the
-write-side (already fairly solid) is kept and extended rather than rewritten. Treating this
-crate as "the PDF engine" for a desktop app that must open arbitrary user-supplied PDFs (as
-opposed to only generating/signing documents the app itself created) is the highest-risk framing
-and should be validated against actual product requirements before further investment — it may be
-more realistic to keep `rust-pdf` for generation/signing/forms and use a mature C/C++ engine
-(e.g., pdfium) via FFI for viewing/rendering/interop with arbitrary third-party files, at least
-in the near term.
-
-## 11. What this audit did *not* change
-
-Per the task's explicit "audit phase" scope, no functional source file under `src/` was modified.
-The only artifacts added by this task are this file (`ARCHITECTURE.md`) and local, gitignored
-tooling output (`target/llvm-cov/**`). `cargo-llvm-cov` was installed into the local cargo
-toolchain (`~/.cargo/bin`) to produce the coverage numbers in §6; it was not present before this
-audit.
-
-## 12. Rendering: native-vs-FFI decision (implemented)
-
-This section records the decision for the gap identified in §10 ("a real content-stream
+This section records the decision for the gap identified in §14 ("a real content-stream
 interpreter + rasterizer/vector-renderer... does not exist at all today") and documents what was
 actually built. The full rationale also lives as rustdoc in `src/render/mod.rs` (the canonical,
 versioned copy — read that first; this is a summary for anyone auditing the repo top-down).
@@ -386,8 +383,7 @@ versioned copy — read that first; this is a summary for anyone auditing the re
   with embedded CFF/TrueType/OpenType programs; annotation appearance streams (§12.5.5) and
   AcroForm field appearance generation; and every image filter real documents use, including
   JBIG2 and JPX — for which the Rust ecosystem has **no mature decoder today**, and both are
-  common in scanned enterprise documents. That is a multi-year, multi-person effort (see §10),
-  not a phase.
+  common in scanned enterprise documents. That is a multi-year, multi-person effort, not a phase.
 - Pdfium is the engine behind Google Chrome's PDF viewer: exercised at billions-of-page-views
   scale, fuzzed continuously by Chromium's infrastructure, and tested against tens of thousands
   of real-world regression PDFs accumulated over more than a decade. No from-scratch renderer
@@ -412,70 +408,270 @@ versioned copy — read that first; this is a summary for anyone auditing the re
   comparable real-world compatibility).
 - **Concurrency is the caller's responsibility to serialize, and this crate does so internally.**
   Pdfium's C API is documented upstream as not safe to call concurrently from multiple threads.
-  `pdfium-render`'s `thread_safe` Cargo feature (on by default) only makes the Rust wrapper types
-  satisfy `Send`/`Sync` so they can live in shared/static application state (e.g. a Tauri
-  `State`) — it does **not** add internal locking around FFI calls. This was confirmed
-  empirically while building `tests/render_tests.rs`: running the render test suite with a
-  parallel test harness reliably crashed the process (SIGABRT inside `libpdfium`, not a
-  catchable Rust panic) before a fix was added. A second, related crash (SIGSEGV) was found once
-  the first was fixed: dropping a `PdfRenderer` (which closes its document via
-  `FPDF_CloseDocument`) on one thread while another thread was still rendering also crashed the
-  process, because a naive `Drop` impl runs *after* the lock guard for that scope would already
-  have been released. `src/render/renderer.rs` now (a) serializes every FFI-touching call behind
-  a single process-wide `Mutex` (`ffi_lock`), and (b) wraps `PdfRenderer`'s `PdfDocument` field in
-  `ManuallyDrop` with a custom `Drop` impl that explicitly holds `ffi_lock` while closing it; see
-  the doc comments on `ffi_lock` and that `Drop` impl for details, and
-  `tests/render_tests.rs`/this task's report for the repeated-run evidence this was verified
-  against (stress-run several times under default `cargo test` parallelism with no further
-  crashes). This makes `PdfRenderer`/`PdfiumLibrary` safe to call from multiple
-  threads (e.g. concurrent Tauri command invocations), at the cost of serializing actual
-  rendering work — acceptable for a rendering workload that is CPU-bound per call anyway.
+  `src/render/renderer.rs` serializes every FFI-touching call behind a single process-wide
+  `Mutex` (`ffi_lock`), and wraps `PdfRenderer`'s `PdfDocument` field in `ManuallyDrop` with a
+  custom `Drop` impl that explicitly holds `ffi_lock` while closing it — see the doc comments on
+  `ffi_lock` and that `Drop` impl for details.
 - **We do not, and cannot, verify Pdfium's internal rendering correctness against the spec
   ourselves** — only that this crate's wrapper (a) loads the library safely, (b) validates
-  caller/file-derived inputs *before* they reach the FFI boundary (see below), and (c) converts
-  results faithfully. Bugs inside Pdfium itself are upstream's to fix.
+  caller/file-derived inputs *before* they reach the FFI boundary, and (c) converts results
+  faithfully.
 - **Tiled/viewport rendering re-renders the full page internally and crops it**, rather than
-  using a hand-rolled Pdfium transformation matrix to rasterize only the requested tile
-  (`FPDF_RenderPageBitmapWithMatrix`). This was a deliberate, disclosed scope reduction: this
-  crate could not confirm from the ISO 32000 spec alone how such a custom matrix interacts with
-  Pdfium's internal page-rotation handling, and getting that wrong would silently produce
-  *visually incorrect* tiles — worse than the current, memory-heavier-at-extreme-zoom behavior.
-  See the "Known limitation" subsection of `src/render/mod.rs` for the estimated 1-3
-  engineer-day follow-up to implement genuine partial-bitmap tiling with empirical verification
-  against rotated real-world PDFs.
+  using a hand-rolled Pdfium transformation matrix to rasterize only the requested tile. See
+  `src/render/mod.rs`'s "Known limitation" subsection.
 
 ### What was built
 
-- `src/render/mod.rs`, `src/render/renderer.rs`, `src/render/cache.rs` (new module, gated by the
-  `render` Cargo feature, which also pulls in `images` for the shared `image::RgbaImage` type).
-- Public API: `PdfiumLibrary::bind()` / `bind_from_path()` (process-wide native library loading,
-  documented single-init constraint), `PdfRenderer::open_bytes()` / `open_file()` (with
-  ISO 32000-1 §7.6 password support), `PdfRenderer::render_page(page_index, dpi, viewport) ->
-  Result<RgbaImage, RenderError>`, and `PdfRenderer::render_thumbnail(page_index, max_dimension)`
-  backed by a bounded LRU cache (`src/render/cache.rs`).
-- Untrusted-input handling per this project's mandatory rules: page geometry (`/MediaBox`,
-  ISO 32000-1 §7.7.3.3) comes from the (untrusted) PDF file; combined with a caller-supplied DPI
-  it could otherwise be used to force an unbounded allocation. `render_page`/`render_thumbnail`
-  compute the target pixel count up front and reject anything exceeding
-  `render::MAX_RENDER_PIXELS` (64,000,000 px, ~256 MiB as RGBA8) with `RenderError::OutputTooLarge`
-  *before* asking Pdfium to allocate a bitmap — verified by
-  `tests/render_tests.rs::oversized_dpi_is_rejected_before_allocating`.
+- `src/render/mod.rs`, `src/render/renderer.rs`, `src/render/cache.rs`, gated by the `render`
+  Cargo feature (also pulls in `images`).
+- Public API: `PdfiumLibrary::bind()`/`bind_from_path()`, `PdfRenderer::open_bytes()`/
+  `open_file()` (with ISO 32000-1 §7.6 password support), `PdfRenderer::render_page(page_index,
+  dpi, viewport) -> Result<RgbaImage, RenderError>`, `PdfRenderer::render_thumbnail(page_index,
+  max_dimension)` backed by a bounded LRU cache.
+- Untrusted-input handling: `render_page`/`render_thumbnail` compute the target pixel count up
+  front and reject anything exceeding `render::MAX_RENDER_PIXELS` (64,000,000 px, ~256 MiB as
+  RGBA8) with `RenderError::OutputTooLarge` *before* asking Pdfium to allocate a bitmap.
 - `scripts/fetch_pdfium.sh`: developer/CI convenience script that downloads the correct
-  `bblanchon/pdfium-binaries` release asset for the host platform into `.pdfium/<platform>/`
-  (gitignored — binaries are never committed; a real application bundles this file itself at
-  packaging time, per Tauri's normal resource-bundling mechanism).
-- `tests/render_tests.rs`: builds a self-generated corpus of 9 documents (varying page sizes —
-  A4/Letter/Legal — text/font combinations, vector shapes, and an embedded raster image XObject)
-  totaling 51 pages, renders every page, and asserts correct raster dimensions (exact match to
-  `page_points * dpi / 72`) and non-blank content, plus dedicated tests for tile/viewport
-  cropping correctness (pixel-exact match against a crop of the full-page render), thumbnail
-  caching, and every validation error path (`InvalidDpi`, `InvalidPageIndex`, `EmptyViewport`,
-  `ViewportOutOfBounds`, `OutputTooLarge`, `PasswordRequired`). The corpus is self-generated
-  (deterministic, license-clean, no network dependency at test time) rather than sourced from
-  third-party files — real-world third-party PDF compatibility is exactly the risk this decision
-  delegates to Pdfium rather than re-implementing; a handful of external real-world PDFs were
-  also rendered and visually spot-checked manually during development of this feature (see the
-  task report for this phase, not committed to this repository).
-- These tests are skipped (not failed) with a clear stderr message when the native Pdfium library
-  cannot be loaded (e.g. `scripts/fetch_pdfium.sh` has not been run), so `cargo test --features
-  render` still passes in a bare checkout without the native binary present.
+  `bblanchon/pdfium-binaries` release asset into `.pdfium/<platform>/` (gitignored).
+- `tests/render_tests.rs` (11 tests, all passing — see §10) plus `tests/large_file_render_bench.rs`
+  / `tests/large_file_rss_bench.rs` (opt-in, `#[ignore]`d 2GB/10,000-page fixture benchmarks added
+  in a later "Large-File Render Benchmark" remediation phase, not present at the time this section
+  was first written).
+
+## 9. The Tauri command layer (`tauri_commands/`)
+
+New top-level module since the original audit (7 files, 2,865 lines), gated by the `tauri`
+feature (which pulls in `parser`, `render` and `signatures`). This is the glue between the pure
+Rust library and a Tauri desktop application:
+
+- **Nine async commands** (`tauri_commands/commands.rs`): `open_document`, `render_page`,
+  `extract_text`, `search_text`, `apply_edit`, `save_document`, `fill_form`, `add_annotation`,
+  `sign_document`. Every command follows a `..._impl` (plain async, testable without a live Tauri
+  `AppHandle`) + thin Tauri-wired wrapper shape.
+- **`state.rs`**: Tauri-managed application state — the registry of currently-open documents plus
+  handles to the worker pool and render actor.
+- **`worker.rs`**: a dependency-light thread pool that runs CPU-bound PDF parsing/editing/signing
+  work off of Tauri's own async-command executor threads (verified by
+  `no_blocking_of_a_single_threaded_executor` in `tests/tauri_commands_integration.rs`).
+- **`render_actor.rs`**: a single dedicated OS thread owning every open document's `PdfRenderer`
+  (Pdfium instances are not `Send` across arbitrary threads the way this actor pattern needs —
+  see §8's concurrency trade-offs), with panic containment added in a later "RenderActor Panic
+  Resilience" remediation phase (a panic inside a render call no longer takes down the actor
+  thread or poisons subsequent renders).
+- **`progress.rs`**: progress-event reporting decoupled from the `tauri` crate's own event/window
+  types.
+- **`error.rs`**: `CommandError`, a structured, `Serialize`-able error type every command returns
+  instead of panicking — verified by `every_command_reports_structured_errors_instead_of_
+  panicking` in `tests/tauri_commands_integration.rs`.
+
+## 10. Test coverage (measured, live re-run)
+
+Tool: `cargo-llvm-cov 0.8.7`.
+
+```
+$ RUST_PDF_PDFIUM_LIB_DIR=.pdfium/mac-arm64/lib cargo llvm-cov --release --features full,tauri --summary-only
+```
+
+**Note on `RUST_PDF_PDFIUM_LIB_DIR`:** the `render`/`tauri`-feature test suites (`tests/
+render_tests.rs`, parts of `tests/tauri_commands_integration.rs`) are written to *skip* (report
+`ok`, not `FAILED`) rather than exercise any Pdfium-touching code at all when the native library
+can't be located (§8's "known limitation" — by design, so `cargo test --features render` still
+passes in a checkout without the native binary). This refresh's *first* `cargo llvm-cov` run did
+not set this variable, so all 11 `render_tests` silently skipped despite reporting `ok`, and
+`render/renderer.rs` measured 6.77%/7.93% region/line coverage as a direct result — not a
+reflection of real coverage. Re-running with `RUST_PDF_PDFIUM_LIB_DIR=.pdfium/mac-arm64/lib`
+(after `scripts/fetch_pdfium.sh`, already present in this checkout) set, all 11 tests genuinely
+executed (confirmed via `--nocapture`: `rendered 51 pages across 9 documents`), and the numbers
+below are from that corrected, second run. This is called out at this length because it is
+exactly the kind of "tests report ok but didn't run the code" trap this refresh's own rule 3
+("jalankan sendiri... sertakan output aktual") exists to catch — and it nearly produced a wrong
+number in this very document.
+
+Aggregate (per-file breakdown folded into §2's module table above — every row's `%Ln` column is
+from this same, corrected run, not carried over from the original audit or from the first,
+Pdfium-less run):
+
+| Metric | Covered / Total | % |
+|---|---|---|
+| Regions | 35,443 / 42,314 | **83.76%** |
+| Functions | 2,052 / 2,624 | **78.20%** |
+| Lines | 18,253 / 22,263 | **81.99%** |
+
+This is a large improvement over the original audit's 67.89% line coverage — expected, since most
+of the ~23,000 new lines landed with dedicated test suites (`tests/editor_tests.rs`,
+`tests/font_embedding_tests.rs`, `tests/interactive_features_tests.rs`, `tests/render_tests.rs`,
+`tests/signature_verification_tests.rs`, `tests/tauri_commands_integration.rs`) as part of each
+phase's own DoD, not from this refresh.
+
+Notably low files (line coverage), from this corrected run:
+- `ffi.rs` — **0%** (unchanged from the original audit — no test exercises the C ABI layer).
+- `image/mod.rs` — **26.20%** line coverage (unchanged finding from the original audit).
+- `forms/field.rs` — **51.49%** line coverage (100+ public items, still the largest/least-tested
+  file in `forms/`).
+- `font/mod.rs` — **45.26%**, `font/metrics.rs` — **49.11%**, `filter/dct.rs` — **49.23%**: all
+  three under 50%, none flagged in the original audit (they didn't exist, or `font/mod.rs` was
+  differently shaped, at that time).
+- `document/mod.rs` — **77.75%** — no longer the crate's least-covered large file (that framing
+  in the original audit predates `editor/redact.rs` (73.4%), `signatures/signer.rs` (73.0%,
+  §2/§4.2) and several others now below it).
+
+Test counts (`cargo test --features full,tauri`, same branch, same commit):
+
+| Suite | Passed | Ignored |
+|---|---:|---:|
+| `src/` unit tests | 587 | 0 |
+| `tests/editor_tests.rs` | 7 | 0 |
+| `tests/font_embedding_tests.rs` | 6 | 0 |
+| `tests/integration_tests.rs` | 68 | 0 |
+| `tests/interactive_features_tests.rs` | 7 | 0 |
+| `tests/large_file_render_bench.rs` | 0 | 1 (opt-in, ~2GB fixture) |
+| `tests/large_file_rss_bench.rs` | 0 | 2 (opt-in, ~2GB fixture) |
+| `tests/render_tests.rs` | 11 | 0 |
+| `tests/signature_verification_tests.rs` | 15 | 0 |
+| `tests/tauri_commands_integration.rs` | 2 | 0 |
+| Doctests | 3 | 8 (`ignore`d) |
+| **Total** | **706** | **11** |
+
+0 failing. Up from the original audit's 312 passing / 0 failing — again, this reflects nine
+phases' worth of test suites, not new work in this refresh.
+
+## 11. `cargo audit` results (live re-run)
+
+```
+$ cargo audit
+    Fetching advisory database from `https://github.com/RustSec/advisory-db.git`
+      Loaded 1149 security advisories (from /Users/galihlasahido/.cargo/advisory-db)
+    Updating crates.io index
+    Scanning Cargo.lock for vulnerabilities (535 crate dependencies)
+[... 17 informational (unmaintained/unsound) warnings, listed below ...]
+warning: 17 allowed warnings found
+```
+
+Exit code `0`. **0 vulnerabilities.** 535 total crate dependencies scanned — more than 5× the
+original audit's 102, because that number was measured on a build with no `render`/`tauri`
+feature (hence no `pdfium-render`, no `tauri`/`wry`/`webkit2gtk`/GTK3-binding transitive tree at
+all) compiled in.
+
+A `.cargo/audit.toml` (added by a later "Dependency Audit Triage" remediation phase, not present
+at the original audit) explicitly ignores 5 specific, individually-reviewed advisory IDs with
+documented rationale — each cross-referenced to `docs/THREAT_MODEL.md` §7, which is the
+authoritative source for *why* each is accepted:
+
+| Advisory | Crate | Category | Rationale (see `docs/THREAT_MODEL.md` §7.x for full detail) |
+|---|---|---|---|
+| `RUSTSEC-2023-0071` | `rsa 0.9.10` | vulnerability (timing side channel, "Marvin Attack") | No patched version exists upstream; crate is only used for signing/verifying over already-public hashes, never decrypting attacker-supplied secret data |
+| `RUSTSEC-2026-0192` | `ttf-parser 0.25.1` | unmaintained | Actively used for embedded font loading (§7); the concrete panic-on-malformed-input issue this surfaced was fuzzed and mitigated at the call site (`catch_unwind` in `TrueTypeFont::load`) |
+| `RUSTSEC-2026-0173` | `proc-macro-error2 2.0.1` | unmaintained | Dev-dependency-only edge (`lopdf`→`jiff`→`defmt-macros`), verified via `cargo tree -i` to have no active feature edge |
+| `RUSTSEC-2026-0195` / `RUSTSEC-2026-0194` | `quick-xml 0.39.4` | DoS (memory/CPU exhaustion) | Reachable only via `tauri-codegen`'s build-time `Info.plist` parsing (the downstream app developer's own trusted file), not this crate's PDF/font attacker surface; no patched `quick-xml` is resolvable against `plist 1.9.0`'s constraint |
+
+Beyond those 5 reviewed-and-ignored IDs, this run surfaced **17 not-yet-individually-reviewed
+"informational" warnings** (all `unmaintained` or `unsound`, per `.cargo/audit.toml`'s explicit
+`informational_warnings = ["unmaintained", "unsound", "notice"]`, which is also cargo-audit's own
+default) — every one of them pulled in transitively through `tauri`'s desktop-integration
+dependency tree (specifically: `tauri-runtime-wry` → `wry`/`tao` → the Linux `gtk`/`webkit2gtk`
+GTK3-binding crates `atk`, `atk-sys`, `gdk`, `gdk-sys`, `gdkwayland-sys`, `gdkx11`, `gdkx11-sys`,
+`gtk`, `gtk-sys`, `gtk3-macros` (all `RUSTSEC-2024-041{1..9}`, "gtk-rs GTK3 bindings - no longer
+maintained"), `glib` (`RUSTSEC-2024-0429`, an unsound iterator impl), `proc-macro-error 1.0.4`
+(`RUSTSEC-2024-0370`, distinct from the already-reviewed `proc-macro-error2`), and 5 `unic-*`
+Unicode-identifier crates pulled in via `tauri-utils`'s `urlpattern` dependency
+(`RUSTSEC-2025-0075/0080/0081/0098/0100`). None of these are new to this refresh's re-run — they
+are new to the crate's dependency graph *only* in the sense that the original audit never
+resolved `Cargo.lock` with the `tauri` feature enabled at all, so they were never visible before.
+None has a dedicated `docs/THREAT_MODEL.md` §7.x entry yet; per that document's own stated policy
+("a brand-new, not-yet-reviewed advisory... still surfaces for a human to triage"), that is
+expected, working-as-designed behavior, not a regression — but it does mean these 17 are the
+concrete next candidates for someone to triage into `.cargo/audit.toml` (or fix by, e.g., pinning
+`tao`/`wry` past a version that drops the unmaintained GTK3 bindings, if one exists) in a future
+phase. Out of scope for this documentation-refresh session.
+
+## 12. `cargo clippy` (live re-run)
+
+```
+$ cargo clippy --features full,tauri --all-targets -- -D warnings
+    Checking rust-pdf v0.1.0 (/Users/galihlasahido/RustroverProjects/rust-pdf)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.70s
+```
+
+**Clean — 0 warnings, 0 errors**, re-run with `touch src/lib.rs` immediately beforehand to force
+a real recompile rather than reporting a stale cached pass. This supersedes the original audit's
+finding of "13 distinct lint categories" under `-D warnings` — every one of those (the
+`approx_constant`/`derivable_impls`/`manual_is_multiple_of`/`dead_code` items etc.) has since been
+fixed by an intervening phase; this refresh did not identify which specific phase, only confirmed
+the current clean state.
+
+## 13. Untrusted-input risk register
+
+> **This section is superseded.** `docs/THREAT_MODEL.md` says so explicitly in its own §1: *"This
+> replaces the informal 'risk register' in `ARCHITECTURE.md` §9 [now §13 after this refresh's
+> renumbering]... `ARCHITECTURE.md` §9/§10 are left as-is as historical record of that earlier
+> audit; do not treat them as the current mitigation status."* That cross-reference did not
+> previously exist *in this direction* (this file never linked back to `docs/THREAT_MODEL.md`) —
+> added now so a reader landing here first finds their way to the current document. Consult
+> `docs/THREAT_MODEL.md` §4 (component risk register) and §6 (full `MAX_*` resource-limit
+> inventory, live-grepped and cross-referenced in §6's table here too) for the maintained,
+> current version.
+
+Original findings, preserved for provenance (see §4's status-update callout above for which of
+these are now fixed, re-verified during this refresh):
+
+| # | Risk | Location | Status (this refresh) |
+|---|---|---|---|
+| 1 | Infinite loop on `/Prev` cycle | `parser/mod.rs` | Fixed — `MAX_XREF_SECTIONS` |
+| 2 | Stack overflow on deep nesting | `parser/objects.rs` | Fixed — `MAX_NESTING_DEPTH` |
+| 3 | Unbounded allocation on huge xref `count` | `parser/xref.rs` | Mitigated — see §4 |
+| 4 | Decompression bomb | `object/stream.rs` | Fixed — `MAX_DECODED_SIZE` |
+| 5 | Slice-index panic on file-derived offsets | `parser/mod.rs` | Fixed — `.get()`-based bounds |
+| 6 | Silent wrong data for non-Flate filters | `object/stream.rs` `decompress()` | Legacy method still does this; `decode_all()` (the newer, preferred API) does not |
+
+## 14. Gap vs. a mature C/C++ PDF engine (pdfium / MuPDF / poppler / qpdf)
+
+The original audit's gap list, updated with what has since closed (re-verified via §2's module
+inventory) vs. what has not (not independently re-verified beyond noting the module still doesn't
+exist):
+
+- ~~A real content-stream interpreter + rasterizer/vector-renderer~~ — **closed**: §8, via Pdfium
+  FFI (a deliberate build-vs-buy decision, not a from-scratch interpreter — see §8 for why that
+  distinction still matters for the "setara Adobe Acrobat" framing).
+- ~~Font program parsing/subsetting (TrueType/OpenType) and embedding~~ — **closed** for
+  TrueType/OpenType: §7. CFF/Type1 embedding was not confirmed either way.
+- **Still open, not re-verified this refresh**: a "repair mode" parser tolerant of arbitrary
+  real-world spec violations beyond what `parser/recovery.rs` already does (that module exists
+  now, but its coverage of "every way real files violate the spec" was not assessed here).
+- **Still open, re-verified**: Filter completeness — `filter/` now covers ASCIIHex/ASCII85/
+  RunLength/LZW/Flate(+predictors)/DCT/CCITT, but **JBIG2/JPX remain unsupported** (`decode_filter`
+  explicitly errors on `JBIG2Decode` rather than silently passing it through — see §4 finding #8 —
+  but there is still no decoder for either format; the Rust ecosystem still has no mature one).
+- **Still open, re-verified**: encrypted-file *opening* — §1, §4 finding #1.
+- ~~Redaction, tagged/accessible PDF~~ — **closed**: §6 (`editor/redact.rs`, `editor/structure.rs`,
+  `editor/pdfua.rs`). AcroForm JavaScript-triggered calculations were not investigated (still
+  presumed absent — no `content` field for a calculation script/engine was noticed anywhere in
+  the module inventory).
+- ~~A rendering surface Tauri could put pixels on screen with~~ — **closed**: §8 + §9.
+
+Given how much of this list has closed since the original estimate, the original "12–24+
+person-month" estimate to reach pdfium/mupdf-class robustness is **not re-derived in this
+refresh** — a fresh estimate would need to weigh the closed items above against what's still open
+(chiefly: arbitrary-real-world-file robustness/repair-mode maturity, JBIG2/JPX, encrypted-file
+opening) and is better done by whoever scopes the next phase, with fresh eyes on the current
+module inventory in §2 rather than by extrapolating from a percentage-closed count here.
+
+## 15. Document provenance
+
+- Original audit: commit `4ed35fe`'s ancestor (`f559bc0`, "Audit" phase) through the "Rendering
+  Decision" phase (`4ed35fe`). Wrote §1–§5 (renumbered), §8 (was §12), the original §9/§10 (now
+  §13/§14).
+- Nine phases between `4ed35fe` and `ce36ee9` (Content Editing, Fonts, Interactive Features,
+  Redaction, Standards Conformance, Large File Streaming, Signature, Security Hardening, Tauri
+  Integration, plus later remediation passes: Font Fuzz Crash Fix, Dependency Audit Triage,
+  RenderActor Panic Resilience, Visual Verification, Large-File Render Benchmark) built
+  everything in §2's `editor/`, `filter/`, `render/`, `tauri_commands/` rows and the new `font/`
+  files, added `docs/THREAT_MODEL.md` and `.cargo/audit.toml`, but never updated this file.
+- **This refresh** (2026-07-03, remediation session "ARCHITECTURE.md Refresh"): regenerated §2
+  (module inventory, live LOC), §10 (coverage, live re-run against `--features full,tauri`), §11
+  (`cargo audit`, live re-run), §12 (`cargo clippy`, live re-run); fixed the largest-file claim
+  (`signatures/signer.rs`, not `document/mod.rs`); added §6/§7/§9 for modules that previously had
+  no entry at all; added spot-checked status callouts to §4/§5/§13/§14 where opportunistic
+  verification found a specific old claim superseded. Did **not** perform a full re-audit of every
+  claim in the inherited narrative sections — see the callouts throughout for exactly what was and
+  wasn't re-verified, and consult `docs/THREAT_MODEL.md` for anything security/risk-related that
+  this document doesn't fully resolve.
