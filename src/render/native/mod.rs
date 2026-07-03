@@ -824,9 +824,22 @@ mod tests {
         let out = render_content_stream(content, 200, 200, page(), Some(&resources)).unwrap();
         assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
         // Left column (mask sample 0 -> transparent): background shows.
-        assert_eq!(pixel(&out, 50, 100), (255, 255, 255, 255));
+        // Bicubic filtering (chosen for real-world image quality -- see
+        // `draw_image_pixels`'s doc comment) has a wider sampling kernel
+        // than the `Nearest` this test's exact-equality assertion used to
+        // assume, so a source image this extreme (2 texels stretched
+        // 100x, i.e. a worst case no real-world image resembles) picks up
+        // a little colour bleed from the adjacent opaque-red texel even
+        // at this sample point's block centre -- a real, expected
+        // consequence of higher-quality interpolation, not a transparency
+        // regression. Assert "close to background", not exact.
+        let (r, g, b, a) = pixel(&out, 50, 100);
+        assert_eq!((r, a), (255, 255));
+        assert!(g >= 235 && b >= 235, "expected near-white (bicubic bleed tolerated), got ({r}, {g}, {b}, {a})");
         // Right column (mask sample 255 -> opaque): red paints through.
-        assert_eq!(pixel(&out, 150, 100), (255, 0, 0, 255));
+        let (r, g, b, a) = pixel(&out, 150, 100);
+        assert_eq!((r, a), (255, 255));
+        assert!(g <= 20 && b <= 20, "expected near-pure red (bicubic bleed tolerated), got ({r}, {g}, {b}, {a})");
     }
 
     /// Test 21: Adversarial input: a Form XObject whose own content

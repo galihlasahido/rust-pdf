@@ -1243,7 +1243,18 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
         let paint = tiny_skia::PixmapPaint {
             opacity: state.fill_alpha.clamp(0.0, 1.0),
             blend_mode: state.blend_mode,
-            ..Default::default()
+            // `PixmapPaint::default()`'s quality is `FilterQuality::Nearest`
+            // (tiny-skia's own choice of fastest-over-best default), which
+            // visibly aliases/stair-steps any image XObject that isn't
+            // drawn at exactly 1:1 device-pixel scale -- the overwhelmingly
+            // common case, since a page's declared image resolution rarely
+            // matches its on-page display size at the render DPI. `Bicubic`
+            // matches the visual quality a mainstream viewer (e.g. Preview,
+            // Acrobat) produces for the same file; a single per-image
+            // XObject draw is not a hot path the way per-pixel path-fill
+            // is, so its extra cost over `Nearest` is not a real-world
+            // concern.
+            quality: tiny_skia::FilterQuality::Bicubic,
         };
         let clip = combined_mask(state);
         self.pixmap
