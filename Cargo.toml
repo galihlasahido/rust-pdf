@@ -30,14 +30,18 @@ full = ["compression", "images", "parser", "encryption", "signatures", "html", "
 render = ["dep:pdfium-render", "images"]
 # Pure-Rust content-stream interpreter and 2D rasterizer (no native/FFI
 # dependency at all): graphics-state stack, path construction/painting,
-# clipping, basic ExtGState (alpha/line width/dash),
-# DeviceGray/RGB/CMYK color, and text showing (TrueType/OpenType simple +
-# CID/Type0 fonts via `fonts`'s `ttf-parser`, plus Type3 glyph procedures).
-# See `src/render/native/mod.rs` for the current phase's scope and its
-# explicitly-documented gaps (no images/XObjects, no non-Device color
-# spaces, no JBIG2/JPX, no Type1/bare-CFF font programs, no ICC color
-# management yet -- all fail closed with a structured
-# `NativeRenderError`/`RenderWarning` rather than silently mis-rendering).
+# clipping, ExtGState (alpha/line width/dash/blend mode/soft mask),
+# DeviceGray/RGB/CMYK/Indexed/Separation/DeviceN/ICCBased-approximated
+# color, text showing (TrueType/OpenType simple + CID/Type0 fonts via
+# `fonts`'s `ttf-parser`, plus Type3 glyph procedures), image and Form
+# XObjects (including transparency groups and per-image soft masks), and
+# blend modes (all 16 standard ISO 32000-1 §11.3.5 modes). See
+# `src/render/native/mod.rs` for the exact scope and its
+# explicitly-documented gaps (no JBIG2/JPX, no Type1/bare-CFF font
+# programs, no true ICC color management, no Patterns/shadings, group
+# isolation/knockout and soft-mask `/BC`/`/TR` are approximated -- all
+# fail closed with a structured `NativeRenderError`/`RenderWarning`
+# rather than silently mis-rendering).
 # Coexists with the `render` (Pdfium/FFI) feature during the migration;
 # neither replaces the other in this phase. Pulls in `fonts` (ttf-parser)
 # for glyph outline extraction -- see `src/render/native/font.rs`.

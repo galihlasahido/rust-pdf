@@ -71,6 +71,65 @@
 //! See the `colorspace`/`function`/`image` submodules' docs for full
 //! detail.
 //!
+//! # Current phase: "Transparency & Blend Modes"
+//!
+//! Building on the above, this phase adds ISO 32000-1:2008 Chapter 11
+//! ("Transparency"):
+//!
+//! - **Blend modes** (§11.3.5, `/BM` in an ExtGState): all 16 standard
+//!   blend modes (`Normal`/`Compatible`, `Multiply`, `Screen`, `Overlay`,
+//!   `Darken`, `Lighten`, `ColorDodge`, `ColorBurn`, `HardLight`,
+//!   `SoftLight`, `Difference`, `Exclusion`, and the non-separable `Hue`,
+//!   `Saturation`, `Color`, `Luminosity`) map 1:1 onto
+//!   `tiny_skia::BlendMode`, which implements the same compositing
+//!   formulas the spec defines -- a real implementation, not an
+//!   approximation. Applies to fills, strokes, glyphs and images alike.
+//!   An unrecognised name falls back to `Normal` per the spec's own
+//!   fallback rule, recording [`error::RenderWarning::UnsupportedBlendMode`].
+//! - **Transparency groups** (§11.4, Form XObjects with `/Group
+//!   /S /Transparency`): Form XObjects are now painted at all (previously
+//!   an unconditional gap). A transparency-group Form painted via `Do` is
+//!   rendered into an isolated offscreen buffer (contents composite among
+//!   themselves at full opacity/`Normal` blend), and *that result* is
+//!   composited into the page using the outer `ca`/blend mode -- the
+//!   detail that makes "several overlapping semi-transparent shapes
+//!   forming one semi-transparent group" render correctly instead of each
+//!   overlap darkening further. **Approximation, documented**: every
+//!   group is treated as isolated regardless of its actual `/I` entry,
+//!   and knockout (`/K`) is not implemented.
+//! - **Soft masks** (§11.6): both kinds --
+//!   - An ExtGState `/SMask` (§11.6.4.3/§11.6.5.2) naming a Luminosity- or
+//!     Alpha-type mask group is rendered (once, at `gs` time, against the
+//!     CTM then in effect) into a canvas-sized 8-bit mask and applied to
+//!     every subsequent paint until cleared (`/SMask /None`) or replaced.
+//!     **Approximation, documented**: `/BC` (custom backdrop colour) and
+//!     `/TR` (transfer function) are recognised but ignored (identity
+//!     transfer function; the spec's own Luminosity-is-black/
+//!     Alpha-is-transparent default backdrop is always used), recording
+//!     [`error::RenderWarning::SoftMaskParameterIgnored`].
+//!   - An image XObject's own `/SMask` (§11.6.5.3, a companion DeviceGray
+//!     alpha-channel image) is decoded and applied as that image's
+//!     per-pixel alpha -- previously an unconditional gap ("every image
+//!     is fully opaque"). **Approximation, documented**: resampled with
+//!     nearest-neighbor if dimensions differ from the base image; `/Matte`
+//!     (un-premultiplication of matted colour) is not implemented. A
+//!     decode failure here doesn't fail the whole image -- it paints
+//!     fully opaque instead, recording
+//!     [`error::RenderWarning::ImageSoftMaskDecodeFailed`].
+//! - `ca`/`CA` (constant alpha, ISO 32000-1 §11.3.7.2) were already
+//!   implemented in the prior "Content-Stream Interpreter Core" phase;
+//!   unchanged here.
+//!
+//! Both Form XObject recursion contexts introduced this phase (a
+//! transparency group's own content invoking `Do` again, and an ExtGState
+//! `/SMask`'s group doing the same) are bounded by
+//! [`interpreter::MAX_FORM_XOBJECT_DEPTH`], shared with (not reset across)
+//! the existing Type 3 glyph recursion depth counter, against a
+//! self-referential/mutually-recursive set of Form XObjects (untrusted
+//! input) -- see [`error::RenderWarning::FormXObjectRecursionLimitExceeded`].
+//!
+//! See the `interpreter`/`image` submodules' docs for full detail.
+//!
 //! # Explicit, honest gaps (not implemented, not silently faked)
 //!
 //! The following are **out of scope for this phase** and are recorded as
@@ -117,9 +176,11 @@
 //!   non-clipping counterpart (0-3) but do not add glyph outlines to the
 //!   clip path -- an intentional simplification (see
 //!   `state::TextState::render_mode`'s docs), not silent data loss.
-//! - **Form XObjects** (`Do` naming a `/Subtype /Form` XObject) -- still
-//!   not painted this phase (only *image* XObjects are); recorded as
-//!   [`RenderWarning::FormXObjectUnsupported`].
+//! - **Form XObjects are now painted** (as of the "Transparency & Blend
+//!   Modes" phase above) -- both directly and as transparency groups; only
+//!   an XObject `/Subtype` that's neither `/Image` nor `/Form` (e.g.
+//!   `/PS`) is still unpainted, recorded as
+//!   [`RenderWarning::UnsupportedXObjectSubtype`].
 //! - **Shadings** (`sh`) and **Patterns** -- not painted. `scn`/`SCN`
 //!   naming a Pattern colour records
 //!   [`RenderWarning::PatternColorUnsupported`] and leaves the current
@@ -131,10 +192,13 @@
 //!   contrast, *are* handled -- approximated as their Device equivalent
 //!   with no gamma/white-point calibration applied (a minor, common
 //!   simplification, not separately warned about).
-//! - **No soft-mask (`/SMask`) or explicit-mask (`/Mask`) image
-//!   compositing** -- every image this phase paints is fully opaque (or,
-//!   for `/ImageMask`, binary transparent/opaque); a companion
-//!   soft-mask/alpha image is not applied. See [`image`]'s docs.
+//! - **Image `/SMask` soft masks are now applied** (as of the
+//!   "Transparency & Blend Modes" phase above) -- see [`image`]'s docs.
+//!   The older, pre-`/SMask` explicit-mask mechanism (`/Mask`, ISO
+//!   32000-1 §8.9.6.4: a colour-key array or stencil-image mask) is
+//!   *not* implemented -- every image this phase paints ignores a
+//!   `/Mask` entry. Not specially warned about per-image (would be
+//!   noisy); documented here as a known simplification.
 //! - **ICC color management** -- ICCBased colour spaces are
 //!   *approximated* (resolved to `/Alternate` or an `/N`-based heuristic
 //!   guess -- see [`colorspace`]'s docs), not colour-managed; there is no
@@ -147,8 +211,15 @@
 //!   unimplemented, and is recorded once via
 //!   [`RenderWarning::IccColorApproximated`] whenever an ICCBased space is
 //!   actually used.
-//! - **Transparency groups and blend modes** (ISO 32000-1 Chapter 11)
-//!   beyond flat constant alpha (`ca`/`CA`) -- not implemented.
+//! - **Transparency groups and soft masks are approximated, not
+//!   spec-exact** (see the "Transparency & Blend Modes" phase section
+//!   above for the precise list): every group is treated as isolated
+//!   regardless of `/I`, knockout (`/K`) is not implemented, and an
+//!   ExtGState `/SMask`'s `/BC`/`/TR` entries are ignored. Blend modes
+//!   themselves (`/BM`) *are* fully, accurately implemented (all 16
+//!   standard modes) -- it is specifically group/mask compositing
+//!   *semantics* beyond isolated-groups-with-default-backdrops that are
+//!   approximated here, not the per-pixel blend formulas.
 //! - **Non-uniform-scale/skewed stroke width and dash length** -- this
 //!   phase approximates the CTM's effect on user-space line width/dash
 //!   lengths by its uniform scale factor (`sqrt(|det(CTM)|)`); see
@@ -469,5 +540,294 @@ mod tests {
             .warnings
             .iter()
             .any(|w| matches!(w, RenderWarning::TruncatedContentStream)));
+    }
+
+    // ---- Transparency & blend modes (ISO 32000-1:2008 Chapter 11) ----
+
+    /// Builds an ExtGState dictionary (`/ca`/`/CA`/`/BM`/`/SMask`, whatever
+    /// `configure` sets) named `name` inside `resources`'s `/ExtGState`.
+    fn add_ext_gstate(resources: &mut crate::object::PdfDictionary, name: &str, configure: impl FnOnce(&mut crate::object::PdfDictionary)) {
+        use crate::object::{Object, PdfDictionary};
+        let mut gs = PdfDictionary::new();
+        configure(&mut gs);
+        let mut extgstate = match resources.get("ExtGState").cloned() {
+            Some(Object::Dictionary(d)) => d,
+            _ => PdfDictionary::new(),
+        };
+        extgstate.set(name, Object::Dictionary(gs));
+        resources.set("ExtGState", Object::Dictionary(extgstate));
+    }
+
+    /// Test 14: `/BM /Multiply` (ISO 32000-1 §11.3.5.2): a cyan rectangle
+    /// painted on top of an opaque yellow one with `Multiply` blend mode
+    /// produces green (`Multiply(Cs,Cb) = Cs*Cb`), not cyan (which is what
+    /// plain `Normal` compositing of an opaque source would give).
+    #[test]
+    fn blend_mode_multiply_darkens_overlap() {
+        use crate::object::PdfDictionary;
+
+        let mut resources = PdfDictionary::new();
+        add_ext_gstate(&mut resources, "GSm", |gs| {
+            gs.set("BM", crate::object::Object::Name(crate::object::PdfName::new_unchecked("Multiply")));
+        });
+
+        let content = b"\
+            1 1 0 rg 0 0 200 200 re f \
+            /GSm gs \
+            0 1 1 rg 0 0 200 200 re f";
+        let out = render_content_stream(content, 200, 200, page(), Some(&resources)).unwrap();
+        assert!(out.warnings.is_empty());
+        // Multiply(cyan=(0,255,255), yellow=(255,255,0)) = (0,255,0).
+        assert_eq!(pixel(&out, 100, 100), (0, 255, 0, 255));
+    }
+
+    /// Test 15: `/BM /Screen` (ISO 32000-1 §11.3.5.2):
+    /// `Screen(Cs,Cb) = 255 - (255-Cs)*(255-Cb)/255`. Using
+    /// `Cs=200, Cb=100` gives a lighter result (~222) than either input --
+    /// distinguishing `Screen` from `Multiply`/`Normal`.
+    #[test]
+    fn blend_mode_screen_lightens_overlap() {
+        use crate::object::PdfDictionary;
+
+        let mut resources = PdfDictionary::new();
+        add_ext_gstate(&mut resources, "GSs", |gs| {
+            gs.set("BM", crate::object::Object::Name(crate::object::PdfName::new_unchecked("Screen")));
+        });
+
+        let base = 100.0 / 255.0;
+        let src = 200.0 / 255.0;
+        let content = format!(
+            "{base} {base} {base} rg 0 0 200 200 re f /GSs gs {src} {src} {src} rg 0 0 200 200 re f"
+        );
+        let out = render_content_stream(content.as_bytes(), 200, 200, page(), Some(&resources)).unwrap();
+        assert!(out.warnings.is_empty());
+        let (r, g, b, a) = pixel(&out, 100, 100);
+        let expected: i32 = 255 - ((255 - 200) * (255 - 100)) / 255;
+        assert!((i32::from(r) - expected).abs() <= 2, "r={r} expected~{expected}");
+        assert_eq!(r, g);
+        assert_eq!(g, b);
+        assert_eq!(a, 255);
+        // Screen must lighten past both inputs.
+        assert!(r > 200, "screen result {r} should exceed both inputs (100, 200)");
+    }
+
+    /// Test 16: `/BM /Darken` and `/BM /Lighten` (ISO 32000-1 §11.3.5.2)
+    /// pick the per-channel min/max of source and backdrop respectively.
+    #[test]
+    fn blend_mode_darken_and_lighten_pick_min_max() {
+        use crate::object::PdfDictionary;
+
+        let mut resources = PdfDictionary::new();
+        add_ext_gstate(&mut resources, "GSd", |gs| {
+            gs.set("BM", crate::object::Object::Name(crate::object::PdfName::new_unchecked("Darken")));
+        });
+        add_ext_gstate(&mut resources, "GSl", |gs| {
+            gs.set("BM", crate::object::Object::Name(crate::object::PdfName::new_unchecked("Lighten")));
+        });
+
+        // Left half: backdrop 50 gray, source 180 gray, Darken -> 50.
+        // Right half: backdrop 50 gray, source 180 gray, Lighten -> 180.
+        let content = b"\
+            0.196 0.196 0.196 rg 0 0 100 200 re f \
+            /GSd gs 0.706 0.706 0.706 rg 0 0 100 200 re f \
+            0.196 0.196 0.196 rg 100 0 100 200 re f \
+            /GSl gs 0.706 0.706 0.706 rg 100 0 100 200 re f";
+        let out = render_content_stream(content, 200, 200, page(), Some(&resources)).unwrap();
+        assert!(out.warnings.is_empty());
+        let (r, _, _, _) = pixel(&out, 50, 100);
+        assert!(r <= 55, "Darken should keep the darker backdrop, got {r}");
+        let (r2, _, _, _) = pixel(&out, 150, 100);
+        assert!(r2 >= 175, "Lighten should keep the lighter source, got {r2}");
+    }
+
+    /// Builds a `/Subtype /Form` XObject stream with the given `/BBox` and
+    /// content bytes, optionally marked as a `/Group /S /Transparency`.
+    fn form_xobject(bbox: [f64; 4], content: &[u8], transparency_group: bool) -> crate::object::Object {
+        use crate::object::{Object, PdfArray, PdfDictionary, PdfName, PdfStream};
+
+        let mut dict = PdfDictionary::new();
+        dict.set("Subtype", Object::Name(PdfName::new_unchecked("Form")));
+        dict.set(
+            "BBox",
+            Object::Array(PdfArray::from_objects(bbox.iter().map(|v| Object::Real(*v)).collect())),
+        );
+        if transparency_group {
+            let mut group = PdfDictionary::new();
+            group.set("S", Object::Name(PdfName::new_unchecked("Transparency")));
+            dict.set("Group", Object::Dictionary(group));
+        }
+        Object::Stream(PdfStream::with_dictionary(dict, content.to_vec()))
+    }
+
+    fn set_xobject(resources: &mut crate::object::PdfDictionary, name: &str, xobject: crate::object::Object) {
+        use crate::object::{Object, PdfDictionary};
+        let mut xo = match resources.get("XObject").cloned() {
+            Some(Object::Dictionary(d)) => d,
+            _ => PdfDictionary::new(),
+        };
+        xo.set(name, xobject);
+        resources.set("XObject", Object::Dictionary(xo));
+    }
+
+    /// Test 17: A transparency-group Form XObject (ISO 32000-1 §11.4.5)
+    /// containing a single opaque shape, painted via `Do` under an outer
+    /// `ca` of 0.5, matches flat 50%-alpha compositing exactly (a sanity
+    /// baseline before the "isolation matters" test below).
+    #[test]
+    fn transparency_group_single_shape_matches_flat_alpha() {
+        use crate::object::PdfDictionary;
+
+        let mut resources = PdfDictionary::new();
+        add_ext_gstate(&mut resources, "GSouter", |gs| {
+            gs.set("ca", crate::object::Object::Real(0.5));
+        });
+        set_xobject(
+            &mut resources,
+            "Grp",
+            form_xobject([0.0, 0.0, 200.0, 200.0], b"1 0 0 rg 0 0 200 200 re f", true),
+        );
+
+        let content = b"/GSouter gs /Grp Do";
+        let out = render_content_stream(content, 200, 200, page(), Some(&resources)).unwrap();
+        assert!(out.warnings.is_empty());
+        let (r, g, b, a) = pixel(&out, 100, 100);
+        assert_eq!(r, 255);
+        assert!((126..=129).contains(&g), "unexpected green: {g}");
+        assert_eq!(g, b);
+        assert_eq!(a, 255);
+    }
+
+    /// Test 18: Two overlapping semi-transparent shapes *inside* an
+    /// isolated transparency group composite among themselves first
+    /// (compounding to ~84% coverage), and only *then* does the group as
+    /// a whole get the outer `ca` (0.5) applied -- net ~42% coverage. A
+    /// (non-isolated/naive) implementation that instead applied the outer
+    /// alpha to each shape individually before compositing would produce
+    /// a visibly different (~51%) result. This is the crux of "shapes
+    /// overlap inside a semi-transparent group" from the phase's
+    /// Definition of Done.
+    #[test]
+    fn transparency_group_isolates_internal_alpha_from_outer_alpha() {
+        use crate::object::PdfDictionary;
+
+        let mut resources = PdfDictionary::new();
+        add_ext_gstate(&mut resources, "GSouter", |gs| {
+            gs.set("ca", crate::object::Object::Real(0.5));
+        });
+        add_ext_gstate(&mut resources, "GSinner", |gs| {
+            gs.set("ca", crate::object::Object::Real(0.6));
+        });
+        let group_content = b"\
+            /GSinner gs 1 0 0 rg 0 0 200 200 re f \
+            /GSinner gs 1 0 0 rg 0 0 200 200 re f";
+        set_xobject(&mut resources, "Grp", form_xobject([0.0, 0.0, 200.0, 200.0], group_content, true));
+
+        let content = b"/GSouter gs /Grp Do";
+        let out = render_content_stream(content, 200, 200, page(), Some(&resources)).unwrap();
+        assert!(out.warnings.is_empty());
+        let (r, g, _b, a) = pixel(&out, 100, 100);
+        assert_eq!(r, 255);
+        assert_eq!(a, 255);
+        // Isolated-group-correct expectation: ~42% coverage -> green/blue
+        // channel near 255*(1-0.42) = 147.9. The naive (non-isolated)
+        // alternative would land near 255*(1-0.51) = 124.95 -- comfortably
+        // outside this tolerance, so this test would fail loudly if group
+        // isolation regressed to "apply outer alpha to each inner shape".
+        assert!((140..=156).contains(&g), "expected ~148 for isolated-group compositing, got {g}");
+    }
+
+    /// Test 19: An ExtGState `/SMask` (ISO 32000-1 §11.6.5.2,
+    /// `/S /Luminosity`) restricts subsequent painting to the mask
+    /// group's bright (white) area; the mask group's implicit black
+    /// backdrop hides painting everywhere else.
+    #[test]
+    fn ext_gstate_luminosity_soft_mask_restricts_painting() {
+        use crate::object::{Object, PdfDictionary, PdfName};
+
+        let mut resources = PdfDictionary::new();
+
+        // ISO 32000-1 §11.6.5.2 requires the ExtGState `/SMask` dict's
+        // `/G` to be the group Form XObject stream directly (not a
+        // `/Resources /XObject` name lookup), so this doesn't need to be
+        // registered under `/XObject` at all.
+        let mask_stream = form_xobject([0.0, 0.0, 200.0, 200.0], b"1 1 1 rg 0 0 100 200 re f", false);
+        let mut smask_dict = PdfDictionary::new();
+        smask_dict.set("G", mask_stream);
+        smask_dict.set("S", Object::Name(PdfName::new_unchecked("Luminosity")));
+        let mut gs_mask = PdfDictionary::new();
+        gs_mask.set("SMask", Object::Dictionary(smask_dict));
+        let mut extgstate = match resources.get("ExtGState").cloned() {
+            Some(Object::Dictionary(d)) => d,
+            _ => PdfDictionary::new(),
+        };
+        extgstate.set("GSmask", Object::Dictionary(gs_mask));
+        resources.set("ExtGState", Object::Dictionary(extgstate));
+
+        let content = b"/GSmask gs 1 0 0 rg 0 0 200 200 re f";
+        let out = render_content_stream(content, 200, 200, page(), Some(&resources)).unwrap();
+        assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
+        // Left half (x in [0,100)): mask is white -> fully visible red.
+        assert_eq!(pixel(&out, 50, 100), (255, 0, 0, 255));
+        // Right half: mask backdrop is black -> fully hidden, background
+        // white shows through untouched.
+        assert_eq!(pixel(&out, 150, 100), (255, 255, 255, 255));
+    }
+
+    /// Test 20: An image XObject's own `/SMask` (ISO 32000-1 §11.6.5.3)
+    /// makes half the image transparent (showing the white page
+    /// background) and half opaque, using a 2x1 base image plus a 2x1
+    /// DeviceGray mask (`[0, 255]`).
+    #[test]
+    fn image_smask_makes_left_pixel_transparent() {
+        use crate::object::{Object, PdfDictionary, PdfName, PdfStream};
+
+        let mut mask_dict = PdfDictionary::new();
+        mask_dict.set("Width", Object::Integer(2));
+        mask_dict.set("Height", Object::Integer(1));
+        mask_dict.set("BitsPerComponent", Object::Integer(8));
+        mask_dict.set("ColorSpace", Object::Name(PdfName::new_unchecked("DeviceGray")));
+        let mask_stream = PdfStream::with_dictionary(mask_dict, vec![0u8, 255u8]);
+
+        let mut img_dict = PdfDictionary::new();
+        img_dict.set("Subtype", Object::Name(PdfName::new_unchecked("Image")));
+        img_dict.set("Width", Object::Integer(2));
+        img_dict.set("Height", Object::Integer(1));
+        img_dict.set("BitsPerComponent", Object::Integer(8));
+        img_dict.set("ColorSpace", Object::Name(PdfName::new_unchecked("DeviceRGB")));
+        img_dict.set("SMask", Object::Stream(mask_stream));
+        let img_stream = PdfStream::with_dictionary(img_dict, vec![255, 0, 0, 255, 0, 0]);
+
+        let mut resources = PdfDictionary::new();
+        set_xobject(&mut resources, "Im1", Object::Stream(img_stream));
+
+        let content = b"q 200 0 0 200 0 0 cm /Im1 Do Q";
+        let out = render_content_stream(content, 200, 200, page(), Some(&resources)).unwrap();
+        assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
+        // Left column (mask sample 0 -> transparent): background shows.
+        assert_eq!(pixel(&out, 50, 100), (255, 255, 255, 255));
+        // Right column (mask sample 255 -> opaque): red paints through.
+        assert_eq!(pixel(&out, 150, 100), (255, 0, 0, 255));
+    }
+
+    /// Test 21: Adversarial input: a Form XObject whose own content
+    /// stream invokes itself via `Do` is bounded by
+    /// [`interpreter::MAX_FORM_XOBJECT_DEPTH`], not infinite recursion /
+    /// a stack overflow.
+    #[test]
+    fn self_referential_form_xobject_is_bounded_not_infinite() {
+        use crate::object::PdfDictionary;
+
+        let mut resources = PdfDictionary::new();
+        set_xobject(&mut resources, "Rec", form_xobject([0.0, 0.0, 200.0, 200.0], b"/Rec Do", false));
+
+        let content = b"/Rec Do 0 1 0 rg 0 0 10 10 re f";
+        let out = render_content_stream(content, 200, 200, page(), Some(&resources)).unwrap();
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| matches!(w, RenderWarning::FormXObjectRecursionLimitExceeded)));
+        // The rest of the (top-level) content stream after the
+        // self-referential `Do` still rendered.
+        assert_eq!(pixel(&out, 5, 195), (0, 255, 0, 255));
     }
 }

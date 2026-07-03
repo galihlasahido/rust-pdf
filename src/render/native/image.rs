@@ -35,15 +35,36 @@
 //!   documented limitation), `LZWDecode`, `FlateDecode`, `RunLengthDecode`,
 //!   `ASCII85Decode`/`ASCIIHexDecode`, in any chained combination.
 //!
+//! # Image-level soft masks (`/SMask`, ISO 32000-1 §11.6.5.3)
+//!
+//! An image XObject's own `/SMask` entry (a separate DeviceGray image
+//! stream providing a per-pixel alpha channel for the base image) **is**
+//! decoded and applied -- this is a real implementation, not a
+//! placeholder: the mask image is decoded through the same filter/bit-
+//! unpacking pipeline as any other image, resampled (nearest-neighbor,
+//! not bilinear -- a documented simplification) to the base image's
+//! dimensions if they differ, and its gray sample (post-`/Decode`, so
+//! `/Decode [1 0]` correctly inverts it) becomes that pixel's alpha
+//! (ISO 32000-1's default SMask `/Decode [0 1]`: `0` = transparent, `1` =
+//! opaque). If the `/SMask` stream itself can't be decoded (missing
+//! geometry, `JBIG2Decode`/`JPXDecode`, a non-DeviceGray colour space,
+//! ...), the *base* image still paints, but fully opaque, and
+//! [`super::error::RenderWarning::ImageSoftMaskDecodeFailed`] is recorded
+//! once -- never a hard failure of the whole image over a broken mask.
+//! `/Matte` (pre-blended/"matted" colour un-premultiplication, ISO
+//! 32000-1 §11.6.5.3) is **not** implemented -- a documented, minor gap
+//! (only affects the exact edge colour of a matted image, not whether it
+//! renders).
+//!
 //! # Explicit, honest gaps beyond JBIG2/JPX
 //!
-//! - **No soft-mask (`/SMask`) or explicit-mask (`/Mask`, colour-key or
-//!   stencil-image) compositing.** Every decoded image this phase paints
-//!   is fully opaque (or, for `/ImageMask`, binary 0/255 alpha) --
-//!   partial-alpha transparency from a companion soft-mask image is not
-//!   applied. Not specially warned about per-image (would be noisy for
-//!   the very common "image plus alpha channel" case); documented here as
-//!   a known simplification.
+//! - **No explicit-mask (`/Mask`, colour-key array or stencil-image)
+//!   compositing.** This is the older (pre-`/SMask`) PDF 1.3 masking
+//!   mechanism (ISO 32000-1 §8.9.6.4), distinct from the `/SMask`
+//!   soft-mask entry above (which *is* implemented). Every decoded image
+//!   this phase paints ignores a `/Mask` entry -- not specially warned
+//!   about per-image (would be noisy); documented here as a known
+//!   simplification.
 //! - **No colour-managed CMYK JPEG Adobe-inversion detection** beyond
 //!   whatever the image's own `/Decode` array explicitly requests --
 //!   relies on the PDF producer having set `/Decode [1 0 1 0 1 0 1 0]`
@@ -67,15 +88,22 @@ use super::colorspace::{self, ColorSpace};
 pub(super) const MAX_IMAGE_PIXELS: u64 = 64_000_000;
 
 /// A decoded image ready to paint: straight (non-premultiplied) RGBA8,
-/// row-major, top row first. Alpha is always `0` or `255` this phase (see
-/// the [module docs](self)'s "no soft mask" gap), so treating this buffer
-/// as premultiplied when handing it to `tiny-skia` (which requires
-/// premultiplied data) is safe without an explicit premultiply pass --
-/// `0*c == 0` and `255*c/255 == c` regardless of channel value.
+/// row-major, top row first. Alpha is `0`/`255` unless an `/SMask` was
+/// present and successfully decoded (see the [module docs](self)), in
+/// which case alpha is the mask's per-pixel gray value. Since this is
+/// still *straight* (non-premultiplied) alpha, not premultiplied, the
+/// caller (`interpreter::draw_image_pixels`) must premultiply before
+/// handing it to `tiny-skia::Pixmap::from_vec`, which requires
+/// premultiplied data.
 pub(super) struct DecodedImage {
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) rgba: Vec<u8>,
+    /// Set if this image declared an `/SMask` that could not be decoded
+    /// (see [module docs](self)) -- the base image above is still fully
+    /// opaque in that case, and the caller should surface this as
+    /// [`super::error::RenderWarning::ImageSoftMaskDecodeFailed`].
+    pub(super) smask_warning: Option<String>,
 }
 
 /// The outcome of attempting to decode an image XObject/inline image.
@@ -195,13 +223,17 @@ fn normalize_inline_dict(dict: &PdfDictionary) -> PdfDictionary {
     out
 }
 
+/// Applies `stream`'s `/Filter` chain, if any (reused by
+/// [`super::interpreter`] for decoding a Form XObject's content stream --
+/// the same "already-filter-decoded bytes" contract images need applies
+/// there too).
 #[cfg(feature = "compression")]
-fn decode_all(stream: &PdfStream) -> Result<Vec<u8>, String> {
+pub(super) fn decode_all(stream: &PdfStream) -> Result<Vec<u8>, String> {
     stream.decode_all().map_err(|e| e.to_string())
 }
 
 #[cfg(not(feature = "compression"))]
-fn decode_all(stream: &PdfStream) -> Result<Vec<u8>, String> {
+pub(super) fn decode_all(stream: &PdfStream) -> Result<Vec<u8>, String> {
     if stream.dictionary.get("Filter").is_none() && stream.dictionary.get("F").is_none() {
         Ok(stream.data.clone())
     } else {
@@ -269,9 +301,120 @@ fn decode_pixels(
         return ImageResult::Failed("/Decode array shorter than colour space component count".to_string());
     }
 
-    match unpack_color_rows(width, height, row_bytes, bpc, n_comp, data, &decode, &color_space) {
-        Some(rgba) => ImageResult::Ok(DecodedImage { width, height, rgba }),
-        None => ImageResult::Failed("colour space could not produce a colour for at least one pixel".to_string()),
+    let Some(mut rgba) = unpack_color_rows(width, height, row_bytes, bpc, n_comp, data, &decode, &color_space) else {
+        return ImageResult::Failed("colour space could not produce a colour for at least one pixel".to_string());
+    };
+
+    // ISO 32000-1 §11.6.5.3: an image XObject's own `/SMask` entry (a
+    // separate DeviceGray stream) supplies this image's per-pixel alpha.
+    // A decode failure here doesn't fail the whole image -- it paints
+    // fully opaque instead, with the reason surfaced to the caller (see
+    // [module docs](self)).
+    let smask_warning = match dict.get("SMask") {
+        None => None,
+        Some(Object::Stream(smask_stream)) => apply_image_smask(&mut rgba, width, height, smask_stream).err(),
+        Some(_) => Some("/SMask present but not a stream".to_string()),
+    };
+
+    // Straight-alpha samples above must become premultiplied before
+    // `tiny-skia` (which requires premultiplied RGBA8) sees them. A
+    // no-op whenever alpha is uniformly 255 (no `/SMask`, the common
+    // case), so this is safe to always apply rather than branching.
+    premultiply_rgba(&mut rgba);
+
+    ImageResult::Ok(DecodedImage {
+        width,
+        height,
+        rgba,
+        smask_warning,
+    })
+}
+
+/// Decodes an image XObject's `/SMask` entry (ISO 32000-1 §11.6.5.3) and
+/// applies it as `base_rgba`'s alpha channel, resampling with
+/// nearest-neighbor (a documented simplification, not bilinear) if the
+/// mask's dimensions differ from the base image's. Returns `Err` (leaving
+/// `base_rgba` untouched -- still fully opaque) if the mask can't be
+/// decoded at all.
+fn apply_image_smask(base_rgba: &mut [u8], base_w: u32, base_h: u32, smask_stream: &PdfStream) -> Result<(), String> {
+    if let Some(filter) = unsupported_filter(&smask_stream.dictionary) {
+        return Err(format!("uses unsupported filter {filter}"));
+    }
+    let data = decode_all(smask_stream)?;
+    let (mask_w, mask_h, gray) = decode_gray_mask_samples(&smask_stream.dictionary, &data)?;
+
+    for row in 0..base_h as usize {
+        let my = ((row * mask_h as usize) / base_h as usize).min(mask_h as usize - 1);
+        for col in 0..base_w as usize {
+            let mx = ((col * mask_w as usize) / base_w as usize).min(mask_w as usize - 1);
+            let g = gray[my * mask_w as usize + mx];
+            base_rgba[(row * base_w as usize + col) * 4 + 3] = g;
+        }
+    }
+    Ok(())
+}
+
+/// Decodes a DeviceGray mask image's samples (used by `/SMask`, ISO
+/// 32000-1 §11.6.5.3) into a flat `width*height` array of 0..255 gray
+/// values, applying `/Decode` (default `[0 1]`, so a raw sample of `0`
+/// means fully transparent and the max value means fully opaque -- per
+/// spec's default for this specific entry, the *opposite* sense of
+/// `/ImageMask`'s default). Ignores any `/ColorSpace` entry the mask
+/// stream might carry (ISO 32000-1 requires `/SMask` images be
+/// DeviceGray unconditionally).
+fn decode_gray_mask_samples(dict: &PdfDictionary, data: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    let width = match dict_get_int(dict, "Width", "W") {
+        Some(w) if w > 0 && w <= u32::MAX as i64 => w as u32,
+        other => return Err(format!("missing or invalid /Width: {other:?}")),
+    };
+    let height = match dict_get_int(dict, "Height", "H") {
+        Some(h) if h > 0 && h <= u32::MAX as i64 => h as u32,
+        other => return Err(format!("missing or invalid /Height: {other:?}")),
+    };
+    let total_pixels = u64::from(width) * u64::from(height);
+    if total_pixels == 0 || total_pixels > MAX_IMAGE_PIXELS {
+        return Err(format!("dimensions {width}x{height} rejected (exceeds {MAX_IMAGE_PIXELS} px bound)"));
+    }
+
+    let bpc = match dict_get_int(dict, "BitsPerComponent", "BPC") {
+        Some(v) if [1, 2, 4, 8, 16].contains(&v) => v as u32,
+        Some(v) => return Err(format!("unsupported /BitsPerComponent {v}")),
+        None => 8,
+    };
+    let row_bytes = ((u64::from(width)) * u64::from(bpc)).div_ceil(8) as usize;
+    let expected_len = row_bytes.saturating_mul(height as usize);
+    if data.len() < expected_len {
+        return Err(format!("decoded data too short: {} bytes, need {expected_len}", data.len()));
+    }
+
+    let decode = pairs(dict, "Decode", "D").unwrap_or_default();
+    let (d0, d1) = *decode.first().unwrap_or(&(0.0, 1.0));
+    let max_raw = ((1u64 << bpc) - 1) as f64;
+
+    let mut gray = vec![0u8; width as usize * height as usize];
+    for row in 0..height as usize {
+        let row_data = &data[row * row_bytes..row * row_bytes + row_bytes];
+        let mut reader = BitReader::new(row_data);
+        for col in 0..width as usize {
+            let raw = reader.read_bits(bpc);
+            let v = if max_raw > 0.0 { d0 + f64::from(raw) * (d1 - d0) / max_raw } else { d0 };
+            gray[row * width as usize + col] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+    Ok((width, height, gray))
+}
+
+/// Premultiplies straight-alpha RGBA8 samples in place (`c' = c*a/255`),
+/// required before handing pixel data to `tiny-skia::Pixmap::from_vec`
+/// (which requires premultiplied input). A no-op wherever alpha is
+/// already 255 (the `c*255/255 == c` identity), so it's safe to call
+/// unconditionally rather than only when an `/SMask` was actually applied.
+fn premultiply_rgba(rgba: &mut [u8]) {
+    for px in rgba.chunks_exact_mut(4) {
+        let a = u16::from(px[3]);
+        px[0] = ((u16::from(px[0]) * a) / 255) as u8;
+        px[1] = ((u16::from(px[1]) * a) / 255) as u8;
+        px[2] = ((u16::from(px[2]) * a) / 255) as u8;
     }
 }
 
@@ -354,7 +497,12 @@ fn decode_image_mask(
             // else: leave as the zero-initialized fully transparent pixel.
         }
     }
-    ImageResult::Ok(DecodedImage { width, height, rgba })
+    ImageResult::Ok(DecodedImage {
+        width,
+        height,
+        rgba,
+        smask_warning: None,
+    })
 }
 
 #[cfg(test)]
@@ -489,6 +637,105 @@ mod tests {
             ImageResult::Ok(_) => "Ok".to_string(),
             ImageResult::UnsupportedFilter(f) => format!("UnsupportedFilter({f})"),
             ImageResult::Failed(e) => format!("Failed({e})"),
+        }
+    }
+
+    fn gray_smask_stream(width: i64, height: i64, samples: Vec<u8>) -> Object {
+        let mut dict = PdfDictionary::new();
+        dict.set("Width", Object::Integer(width));
+        dict.set("Height", Object::Integer(height));
+        dict.set("BitsPerComponent", Object::Integer(8));
+        dict.set("ColorSpace", name("DeviceGray"));
+        Object::Stream(PdfStream::with_dictionary(dict, samples))
+    }
+
+    /// ISO 32000-1 §11.6.5.3: a valid `/SMask` becomes this image's
+    /// per-pixel alpha (straight, i.e. matching the raw gray sample once
+    /// scaled to 0..255 -- premultiplication happens afterward).
+    #[test]
+    fn smask_becomes_base_image_alpha() {
+        let mut dict = gray_image_dict(2, 1, 8);
+        // Force a non-gray base colour so premultiplication is visible:
+        // pure red at both pixels.
+        dict.set("ColorSpace", name("DeviceRGB"));
+        dict.set("SMask", gray_smask_stream(2, 1, vec![0, 255]));
+        let stream = PdfStream::with_dictionary(dict, vec![255, 0, 0, 255, 0, 0]);
+        let result = decode_image_xobject(&stream, None, Color::BLACK);
+        match result {
+            ImageResult::Ok(img) => {
+                assert!(img.smask_warning.is_none(), "unexpected smask warning: {:?}", img.smask_warning);
+                // Pixel 0: alpha 0 -> premultiplied to fully transparent black.
+                assert_eq!(&img.rgba[0..4], &[0, 0, 0, 0]);
+                // Pixel 1: alpha 255 -> unchanged opaque red.
+                assert_eq!(&img.rgba[4..8], &[255, 0, 0, 255]);
+            }
+            other => panic!("expected Ok, got {}", describe(&other)),
+        }
+    }
+
+    /// `/SMask` with different dimensions than the base image is
+    /// nearest-neighbor resampled (a documented simplification), not
+    /// rejected.
+    #[test]
+    fn smask_with_mismatched_dimensions_is_resampled() {
+        let mut dict = gray_image_dict(4, 1, 8);
+        dict.set("ColorSpace", name("DeviceRGB"));
+        // A 2x1 mask covering a 4x1 base image: samples [0,255] resample
+        // to columns [0,0,1,1] under nearest-neighbor.
+        dict.set("SMask", gray_smask_stream(2, 1, vec![0, 255]));
+        let stream = PdfStream::with_dictionary(
+            dict,
+            vec![255, 0, 0, /**/ 255, 0, 0, /**/ 255, 0, 0, /**/ 255, 0, 0],
+        );
+        let result = decode_image_xobject(&stream, None, Color::BLACK);
+        match result {
+            ImageResult::Ok(img) => {
+                assert!(img.smask_warning.is_none());
+                assert_eq!(img.rgba[3], 0, "col 0 should map to mask sample 0");
+                assert_eq!(img.rgba[7], 0, "col 1 should map to mask sample 0");
+                assert_eq!(img.rgba[11], 255, "col 2 should map to mask sample 255");
+                assert_eq!(img.rgba[15], 255, "col 3 should map to mask sample 255");
+            }
+            other => panic!("expected Ok, got {}", describe(&other)),
+        }
+    }
+
+    /// Adversarial/corrupt input: an `/SMask` entry that isn't a stream at
+    /// all doesn't fail the whole image -- it paints fully opaque and
+    /// records a reason via `smask_warning`.
+    #[test]
+    fn malformed_smask_entry_falls_back_to_opaque_with_warning() {
+        let mut dict = gray_image_dict(2, 1, 8);
+        dict.set("SMask", Object::Integer(42)); // not a stream
+        let stream = PdfStream::with_dictionary(dict, vec![0x00, 0xFF]);
+        let result = decode_image_xobject(&stream, None, Color::BLACK);
+        match result {
+            ImageResult::Ok(img) => {
+                assert!(img.smask_warning.is_some());
+                assert_eq!(img.rgba[3], 255, "base image should still be fully opaque");
+                assert_eq!(img.rgba[7], 255);
+            }
+            other => panic!("expected Ok, got {}", describe(&other)),
+        }
+    }
+
+    /// Adversarial/corrupt input: an `/SMask` stream with a declared size
+    /// that doesn't match its actual (short) data doesn't panic -- it's
+    /// treated the same as "no usable soft mask" (opaque base image, plus
+    /// a recorded reason).
+    #[test]
+    fn truncated_smask_data_falls_back_to_opaque_with_warning() {
+        let mut dict = gray_image_dict(2, 1, 8);
+        dict.set("SMask", gray_smask_stream(4, 4, vec![0u8; 2])); // needs 16 bytes
+        let stream = PdfStream::with_dictionary(dict, vec![0x00, 0xFF]);
+        let result = decode_image_xobject(&stream, None, Color::BLACK);
+        match result {
+            ImageResult::Ok(img) => {
+                assert!(img.smask_warning.is_some());
+                assert_eq!(img.rgba[3], 255);
+                assert_eq!(img.rgba[7], 255);
+            }
+            other => panic!("expected Ok, got {}", describe(&other)),
         }
     }
 }

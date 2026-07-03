@@ -125,12 +125,16 @@ pub enum RenderWarning {
         /// The resource name that could not be resolved.
         name: String,
     },
-    /// `Do` named an XObject resource whose `/Subtype` is `/Form` (or
-    /// anything other than `/Image`) -- Form XObjects are not painted this
-    /// phase (only image XObjects are; see [`super::image`]'s docs).
-    FormXObjectUnsupported {
+    /// `Do` named an XObject resource whose `/Subtype` is something this
+    /// phase does not paint at all: anything other than `/Image` or
+    /// `/Form` (e.g. a PostScript `/PS` XObject). Form XObjects *are*
+    /// painted this phase (see [`super::interpreter::Interpreter::do_xobject`]);
+    /// this variant is only for subtypes beyond that.
+    UnsupportedXObjectSubtype {
         /// The resource name this applies to.
         name: String,
+        /// The XObject's declared `/Subtype` (or `"(missing)"`).
+        subtype: String,
     },
     /// An image XObject or inline image's filter chain includes
     /// `JBIG2Decode` or `JPXDecode` -- **there is no mature pure-Rust
@@ -216,6 +220,60 @@ pub enum RenderWarning {
     /// input). The glyph is skipped (nothing painted for it) rather than
     /// recursing further.
     Type3RecursionLimitExceeded,
+    /// A Form XObject (directly, or as an ExtGState `/SMask` group, or a
+    /// transparency-group `/Group` used via `Do`) recursed past
+    /// [`super::interpreter::MAX_FORM_XOBJECT_DEPTH`] -- a
+    /// self-referential or mutually-recursive set of Form XObjects
+    /// (untrusted/adversarial input, e.g. a Form whose own content stream
+    /// paints itself via `Do`, or an ExtGState `/SMask` group that selects
+    /// an ExtGState referencing itself). Rendering stops for that branch
+    /// (an empty/transparent result for the offending group) rather than
+    /// recursing further.
+    FormXObjectRecursionLimitExceeded,
+    /// An ExtGState `/BM` (blend mode, ISO 32000-1 §11.3.5) named (as a
+    /// bare name, or every entry of an array) something other than one of
+    /// the 16 standard blend modes this phase maps 1:1 onto
+    /// `tiny_skia::BlendMode` (`Normal`/`Compatible`, `Multiply`,
+    /// `Screen`, `Overlay`, `Darken`, `Lighten`, `ColorDodge`,
+    /// `ColorBurn`, `HardLight`, `SoftLight`, `Difference`, `Exclusion`,
+    /// `Hue`, `Saturation`, `Color`, `Luminosity`). Falls back to `Normal`
+    /// per ISO 32000-1 §11.3.5's "if the viewer does not recognise any of
+    /// the requested blend modes, it shall use `Normal`" rule.
+    UnsupportedBlendMode {
+        /// The unrecognised name (the bare name, or the first array
+        /// element, whichever was encountered).
+        name: String,
+    },
+    /// An ExtGState `/SMask` entry named something other than `/None` or a
+    /// well-formed soft-mask dictionary with a readable `/G` (transparency
+    /// group Form XObject stream) -- e.g. `/G` missing, not a stream, or
+    /// the dictionary itself malformed. Treated as `/SMask /None` (no soft
+    /// mask restriction) for this and subsequent `gs` invocations of the
+    /// same (or any) `ExtGState` until a valid one is set.
+    InvalidSoftMaskGroup,
+    /// An ExtGState `/SMask` soft-mask dictionary carried a `/TR` (transfer
+    /// function) and/or `/BC` (backdrop colour) entry other than the
+    /// identity default -- both are ignored (identity transfer function,
+    /// default backdrop per `/S`'s Luminosity-is-black/Alpha-is-transparent
+    /// convention) rather than applied, a documented simplification (ISO
+    /// 32000-1 §11.6.5.2).
+    SoftMaskParameterIgnored {
+        /// Which entry was ignored: `"TR"` or `"BC"`.
+        parameter: &'static str,
+    },
+    /// An image XObject's `/SMask` (ISO 32000-1 §11.6.5.3: a per-image
+    /// soft-mask, distinct from the ExtGState group soft mask above) could
+    /// not be decoded (missing/invalid geometry, an unsupported filter
+    /// such as `JBIG2Decode`/`JPXDecode`, or a colour space other than
+    /// DeviceGray). The base image still paints, but **fully opaque**
+    /// (the soft mask is skipped entirely) rather than the render failing
+    /// or the base image itself going unpainted.
+    ImageSoftMaskDecodeFailed {
+        /// The resource name (or `"(inline)"`) this applies to.
+        name: String,
+        /// Human-readable failure reason.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for RenderWarning {
@@ -236,8 +294,8 @@ impl std::fmt::Display for RenderWarning {
             RenderWarning::MissingXObjectResource { name } => {
                 write!(f, "Do referenced a missing XObject resource: /{name}")
             }
-            RenderWarning::FormXObjectUnsupported { name } => {
-                write!(f, "Form XObject /{name} unsupported this phase, not painted")
+            RenderWarning::UnsupportedXObjectSubtype { name, subtype } => {
+                write!(f, "XObject /{name} has unsupported /Subtype {subtype}, not painted")
             }
             RenderWarning::UnsupportedImageFilter { name, filter } => {
                 write!(f, "image /{name} uses unsupported filter {filter} (no pure-Rust decoder exists), painted as a placeholder")
@@ -268,6 +326,21 @@ impl std::fmt::Display for RenderWarning {
             }
             RenderWarning::Type3RecursionLimitExceeded => {
                 write!(f, "Type 3 glyph procedure recursion limit exceeded, glyph skipped")
+            }
+            RenderWarning::FormXObjectRecursionLimitExceeded => {
+                write!(f, "Form XObject recursion limit exceeded, group rendering stopped")
+            }
+            RenderWarning::UnsupportedBlendMode { name } => {
+                write!(f, "unrecognised blend mode /{name}, falling back to Normal")
+            }
+            RenderWarning::InvalidSoftMaskGroup => {
+                write!(f, "ExtGState /SMask malformed or /G unreadable, treated as /None")
+            }
+            RenderWarning::SoftMaskParameterIgnored { parameter } => {
+                write!(f, "ExtGState /SMask /{parameter} ignored (not applied)")
+            }
+            RenderWarning::ImageSoftMaskDecodeFailed { name, reason } => {
+                write!(f, "image /{name} /SMask could not be decoded ({reason}), base image painted fully opaque")
             }
         }
     }

@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use tiny_skia::{Color, LineCap, LineJoin, Mask};
+use tiny_skia::{BlendMode, Color, LineCap, LineJoin, Mask};
 
 use crate::types::Matrix;
 
@@ -114,6 +114,22 @@ pub(super) struct GraphicsState {
     pub fill_alpha: f32,
     /// `CA`: constant, stroking alpha.
     pub stroke_alpha: f32,
+    /// `BM` (ISO 32000-1 8.4.5 Table 58, semantics in §11.3.5): the current
+    /// blend mode, applied to every fill/stroke/glyph/image paint. All 16
+    /// standard PDF blend modes (`Normal`/`Compatible` through
+    /// `Luminosity`) map 1:1 onto `tiny_skia::BlendMode`, which implements
+    /// the same separable/non-separable formulas ISO 32000-1 §11.3.5
+    /// specifies -- this is a real, non-approximated implementation, not a
+    /// fallback (see `interpreter::resolve_blend_mode`).
+    pub blend_mode: BlendMode,
+    /// The active soft mask (ISO 32000-1 §11.6.4.3), set by an ExtGState's
+    /// `/SMask` entry naming a Luminosity- or Alpha-type mask group,
+    /// cleared by `/SMask /None`. Resolved once (at `gs` time, against the
+    /// CTM then in effect) into a canvas-sized 8-bit mask, and combined
+    /// with [`Self::clip`] (both must pass) at paint time -- see
+    /// `interpreter::combined_mask`. `None` means no soft mask restricts
+    /// painting (the ISO 32000-1 default).
+    pub soft_mask: Option<Rc<Mask>>,
     /// Line width in *user space* units (ISO 32000-1 8.4.3.2); scaled by
     /// the CTM's approximate uniform scale factor at paint time to get a
     /// device-space stroke width (see `interpreter.rs`'s
@@ -151,6 +167,8 @@ impl GraphicsState {
             stroke_color_space: Rc::new(ColorSpace::DeviceGray),
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
+            blend_mode: BlendMode::SourceOver,
+            soft_mask: None,
             // ISO 32000-1 Table 52 default: 1.0.
             line_width: 1.0,
             line_cap: LineCap::Butt,

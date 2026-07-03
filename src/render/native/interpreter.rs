@@ -10,7 +10,10 @@
 //! - Path construction: `m l c v y h re` (8.5.2)
 //! - Path painting: `f F f* S s B B* b b* n` (8.5.3)
 //! - Clipping: `W W*` (8.5.4)
-//! - Basic ExtGState: `gs` for `ca`/`CA`/`LW`/`D` only (8.4.5)
+//! - ExtGState: `gs` for `ca`/`CA`/`LW`/`D` (8.4.5), plus `BM` (blend
+//!   mode, §11.3.5 -- all 16 standard modes, see [`resolve_blend_mode`])
+//!   and `SMask` (soft mask group, §11.6.4.3/§11.6.5.2 -- see
+//!   [`Interpreter::apply_soft_mask_group`])
 //! - Line style: `w J j M d` (8.4.3)
 //! - Color: `g G rg RG k K` (Device spaces) plus `cs CS sc SC scn SCN`
 //!   (8.6.6-8.6.8: Indexed, Separation, DeviceN, ICCBased-approximated --
@@ -23,20 +26,23 @@
 //!   composite (Type 0/CID) and Type 3 glyph rendering -- see
 //!   [`super::font`] and [`super::glyph`].
 //! - Image XObjects (`Do`, §8.8) and inline images (`BI`/`ID`/`EI`, 8.9.7)
-//!   -- see [`super::image`], including the documented JBIG2/JPX gap.
+//!   -- see [`super::image`], including the documented JBIG2/JPX gap and
+//!   the (now-implemented) per-image `/SMask` soft mask.
+//! - Form XObjects (`Do`, §8.10), including transparency groups (§11.4)
+//!   -- see [`Interpreter::do_form_xobject`].
 //!
-//! Everything else -- Form XObjects (`Do`), `sh` (shadings), Patterns,
-//! marked content -- is recorded as [`RenderWarning::UnsupportedOperator`]
-//! (or a dedicated variant) and skipped as a no-op; it does **not** abort
-//! the render or panic.
+//! Everything else -- `sh` (shadings), Patterns, marked content -- is
+//! recorded as [`RenderWarning::UnsupportedOperator`] (or a dedicated
+//! variant) and skipped as a no-op; it does **not** abort the render or
+//! panic.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use tiny_skia::{Color, FillRule, Mask, Paint, Pixmap, Stroke, StrokeDash, Transform};
+use tiny_skia::{BlendMode, Color, FillRule, Mask, MaskType, Paint, Pixmap, PixmapPaint, Stroke, StrokeDash, Transform};
 
 use crate::editor::content_stream::{parse_content_stream, ContentItem};
-use crate::object::{Object, PdfDictionary};
+use crate::object::{Object, PdfDictionary, PdfStream};
 use crate::parser::InlineImage;
 use crate::types::{Matrix, Rectangle};
 
@@ -52,6 +58,16 @@ use super::state::{GraphicsState, GraphicsStateStack};
 /// Hard cap on `q` nesting depth. See
 /// [`NativeRenderError::GraphicsStateStackOverflow`].
 pub const MAX_GRAPHICS_STATE_DEPTH: usize = 4096;
+
+/// Hard cap on Form XObject recursion -- shared by a Form XObject painted
+/// directly (`Do`), a transparency-group Form used the same way, and a
+/// group referenced by an ExtGState `/SMask`. Guards against a
+/// self-referential or mutually-recursive set of Form XObjects
+/// (untrusted/adversarial input; ISO 32000-1 doesn't forbid a Form's own
+/// content stream from invoking `Do` again, including -- maliciously --
+/// on itself). Deliberately small: legitimate nesting (a group used as a
+/// soft mask for another group, etc.) is rarely more than 2-3 deep.
+pub const MAX_FORM_XOBJECT_DEPTH: usize = 12;
 
 /// Soft cap on the number of [`RenderWarning`]s collected, so a content
 /// stream consisting of millions of unsupported operators can't be used
@@ -141,6 +157,7 @@ pub fn render_content_stream(
             text_line_matrix: Matrix::identity(),
             font_cache: HashMap::new(),
             type3_depth: 0,
+            form_depth: 0,
         };
 
         for item in parse_content_stream(content) {
@@ -198,6 +215,11 @@ struct Interpreter<'res, 'ctx> {
     /// Current Type 3 glyph-procedure recursion depth (0 at the
     /// top-level content stream). See [`font::MAX_TYPE3_DEPTH`].
     type3_depth: usize,
+    /// Current Form XObject recursion depth (0 at the top-level content
+    /// stream). See [`MAX_FORM_XOBJECT_DEPTH`]. Shared (not reset) across
+    /// a Type 3 recursion boundary and vice versa, so a crafted input
+    /// alternating between the two recursion kinds still hits a bound.
+    form_depth: usize,
 }
 
 impl<'res, 'ctx> Interpreter<'res, 'ctx> {
@@ -587,6 +609,120 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
                 }
             }
         }
+
+        self.set_blend_mode_from_dict(dict);
+        self.set_soft_mask_from_dict(dict);
+    }
+
+    /// `/BM` (ISO 32000-1 §11.3.5, Table 58): a bare blend-mode name, or an
+    /// array of names tried in order until one is recognised. All 16
+    /// standard names map onto `tiny_skia::BlendMode` -- a real
+    /// implementation of the spec's compositing formulas, not an
+    /// approximation. An unrecognised name (every entry of an array, or
+    /// the single bare name) falls back to `Normal` per §11.3.5's own
+    /// fallback rule, recording [`RenderWarning::UnsupportedBlendMode`].
+    fn set_blend_mode_from_dict(&mut self, dict: &PdfDictionary) {
+        let Some(bm_value) = dict.get("BM") else { return };
+        let names: Vec<&str> = match bm_value {
+            Object::Name(n) => vec![n.as_str()],
+            Object::Array(arr) => arr
+                .iter()
+                .filter_map(|o| match o {
+                    Object::Name(n) => Some(n.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let resolved = names.iter().find_map(|n| resolve_blend_mode(n));
+        match resolved {
+            Some(bm) => self.gs.current_mut().blend_mode = bm,
+            None => {
+                self.gs.current_mut().blend_mode = BlendMode::SourceOver;
+                if let Some(first) = names.first() {
+                    self.warn(RenderWarning::UnsupportedBlendMode {
+                        name: (*first).to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// `/SMask` (ISO 32000-1 §11.6.4.3): either `/None` (clears the
+    /// active soft mask) or a soft-mask dictionary naming a transparency
+    /// group (`/G`) to render and reduce to a mask (see
+    /// [`Self::apply_soft_mask_group`]). Absent entirely (`dict` has no
+    /// `/SMask` key at all): leaves the current soft mask untouched, since
+    /// `gs` only updates the parameters actually present in the ExtGState
+    /// dictionary (ISO 32000-1 §8.4.5).
+    fn set_soft_mask_from_dict(&mut self, dict: &PdfDictionary) {
+        match dict.get("SMask") {
+            None => {}
+            Some(Object::Name(n)) if n.as_str() == "None" => {
+                self.gs.current_mut().soft_mask = None;
+            }
+            Some(Object::Dictionary(smask_dict)) => {
+                let group = smask_dict.get("G").and_then(|o| match o {
+                    Object::Stream(s) => Some(s),
+                    _ => None,
+                });
+                let luminosity = !matches!(smask_dict.get("S"), Some(Object::Name(n)) if n.as_str() == "Alpha");
+                if smask_dict.get("TR").is_some_and(|o| !matches!(o, Object::Name(n) if n.as_str() == "Identity")) {
+                    self.warn(RenderWarning::SoftMaskParameterIgnored { parameter: "TR" });
+                }
+                if smask_dict.get("BC").is_some() {
+                    self.warn(RenderWarning::SoftMaskParameterIgnored { parameter: "BC" });
+                }
+                match group {
+                    Some(group_stream) => self.apply_soft_mask_group(group_stream, luminosity),
+                    None => {
+                        self.warn(RenderWarning::InvalidSoftMaskGroup);
+                        self.gs.current_mut().soft_mask = None;
+                    }
+                }
+            }
+            Some(_) => {
+                self.warn(RenderWarning::InvalidSoftMaskGroup);
+                self.gs.current_mut().soft_mask = None;
+            }
+        }
+    }
+
+    /// Resolves an ExtGState `/SMask`'s transparency group (ISO 32000-1
+    /// §11.6.5.2) into a canvas-sized 8-bit mask and installs it as the
+    /// current graphics state's [`GraphicsState::soft_mask`]. Rendered
+    /// using the CTM in effect *now* (at `gs` time), per §11.6.4.3 --
+    /// separately from whatever CTM is active later when marks using this
+    /// mask are actually painted.
+    ///
+    /// `luminosity == true` selects `/S /Luminosity` (the default): the
+    /// group is rendered against an opaque **black** backdrop (the
+    /// ISO 32000-1 default absent an explicit `/BC`, which this phase
+    /// doesn't apply -- see [`RenderWarning::SoftMaskParameterIgnored`])
+    /// and each pixel's mask value is that backdrop-composited result's
+    /// luminance (Rec. 709 weights, via `tiny_skia::MaskType::Luminance`).
+    /// `luminosity == false` selects `/S /Alpha`: the group is rendered
+    /// against a fully transparent backdrop and each pixel's mask value is
+    /// simply the resulting alpha.
+    fn apply_soft_mask_group(&mut self, group_stream: &PdfStream, luminosity: bool) {
+        let backdrop = if luminosity {
+            Color::BLACK
+        } else {
+            Color::from_rgba(0.0, 0.0, 0.0, 0.0).expect("0,0,0,0 is a valid color")
+        };
+        let ctm = self.gs.current().ctm;
+        let pixmap = match self.render_group_to_pixmap(group_stream, ctm, backdrop) {
+            Ok(p) => p,
+            Err(_) => {
+                self.warn(RenderWarning::InvalidSoftMaskGroup);
+                self.gs.current_mut().soft_mask = None;
+                return;
+            }
+        };
+        let mask_type = if luminosity { MaskType::Luminance } else { MaskType::Alpha };
+        let mask = Mask::from_pixmap(pixmap.as_ref(), mask_type);
+        self.gs.current_mut().soft_mask = Some(Rc::new(mask));
     }
 
     /// `cs`/`CS` (ISO 32000-1 8.6.8): resolves `name` (a Device name or a
@@ -670,8 +806,10 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
     }
 
     /// `Do` (ISO 32000-1 8.8): resolves `/Resources /XObject /<name>` and
-    /// paints it if it's an image (`/Subtype /Image`) -- Form XObjects
-    /// remain out of scope this phase (see [module docs](super)).
+    /// paints it -- both image (`/Subtype /Image`) and Form
+    /// (`/Subtype /Form`) XObjects are painted this phase; anything else
+    /// (e.g. `/PS`) is recorded as
+    /// [`RenderWarning::UnsupportedXObjectSubtype`] and skipped.
     fn do_xobject(&mut self, name: &str) -> Result<(), NativeRenderError> {
         let xobject = self
             .resources
@@ -687,19 +825,209 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
             return Ok(());
         };
 
-        let is_image = matches!(
-            stream.dictionary.get("Subtype"),
-            Some(Object::Name(n)) if n.as_str() == "Image"
-        );
-        if !is_image {
-            self.warn(RenderWarning::FormXObjectUnsupported { name: name.to_string() });
+        match stream.dictionary.get("Subtype") {
+            Some(Object::Name(n)) if n.as_str() == "Image" => {
+                let fill_color = self.gs.current().fill_color;
+                let result = image::decode_image_xobject(stream, self.resources, fill_color);
+                self.paint_image_result(result, name);
+                Ok(())
+            }
+            Some(Object::Name(n)) if n.as_str() == "Form" => self.do_form_xobject(stream),
+            other => {
+                let subtype = match other {
+                    Some(Object::Name(n)) => n.as_str().to_string(),
+                    _ => "(missing)".to_string(),
+                };
+                self.warn(RenderWarning::UnsupportedXObjectSubtype {
+                    name: name.to_string(),
+                    subtype,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Paints a Form XObject (ISO 32000-1 §8.10). If it declares a
+    /// `/Group /S /Transparency` (§11.4), it is rendered *isolated* --
+    /// contents composite among themselves at full opacity/Normal blend
+    /// into an offscreen buffer, then the finished group as a whole is
+    /// composited into the page using the *outer* `ca`/blend mode (this
+    /// is what makes a semi-transparent overlapping group look right:
+    /// otherwise each overlapping shape's alpha would compound instead of
+    /// the group appearing "as one" at the given alpha). Every group is
+    /// treated as isolated regardless of the actual `/I` entry, and
+    /// knockout (`/K`) is not implemented -- a documented approximation
+    /// (see [module docs](super)).
+    ///
+    /// A Form *without* a transparency `/Group` paints directly onto the
+    /// current pixmap instead (no offscreen buffer/compositing step),
+    /// inheriting the graphics state active at the point of invocation
+    /// (colour, alpha, blend mode, clip, ...) exactly like `q ... Do ...
+    /// Q` -- matching ISO 32000-1 §8.10.2's "the objects painted by the
+    /// form shall be defined with respect to the graphics state in effect
+    /// at the beginning of execution", with none of that state leaking
+    /// back out afterward (a fresh nested `Interpreter`, discarded when
+    /// this method returns, same as `Type3`'s recursion).
+    fn do_form_xobject(&mut self, stream: &PdfStream) -> Result<(), NativeRenderError> {
+        if self.form_depth >= MAX_FORM_XOBJECT_DEPTH {
+            self.warn(RenderWarning::FormXObjectRecursionLimitExceeded);
             return Ok(());
         }
 
-        let fill_color = self.gs.current().fill_color;
-        let result = image::decode_image_xobject(stream, self.resources, fill_color);
-        self.paint_image_result(result, name);
+        let is_transparency_group = matches!(
+            stream.dictionary.get("Group").and_then(|o| o.as_dictionary()).and_then(|g| g.get("S")),
+            Some(Object::Name(n)) if n.as_str() == "Transparency"
+        );
+
+        if is_transparency_group {
+            let state = self.gs.current();
+            let (ctm, fill_alpha, blend_mode) = (state.ctm, state.fill_alpha, state.blend_mode);
+            let mask = combined_mask(state);
+            let transparent = Color::from_rgba(0.0, 0.0, 0.0, 0.0).expect("0,0,0,0 is a valid color");
+            let group_pixmap = self.render_group_to_pixmap(stream, ctm, transparent)?;
+            let paint = PixmapPaint {
+                opacity: fill_alpha.clamp(0.0, 1.0),
+                blend_mode,
+                ..Default::default()
+            };
+            self.pixmap
+                .draw_pixmap(0, 0, group_pixmap.as_ref(), &paint, Transform::identity(), mask.as_deref());
+            Ok(())
+        } else {
+            self.run_form_xobject_inline(stream)
+        }
+    }
+
+    /// Runs a non-group Form XObject's content stream directly against
+    /// `self.pixmap` (no offscreen buffer), applying its `/Matrix` and
+    /// clipping to its `/BBox` (both ISO 32000-1 §8.10.1), inheriting
+    /// every other graphics-state parameter from the point of invocation.
+    fn run_form_xobject_inline(&mut self, stream: &PdfStream) -> Result<(), NativeRenderError> {
+        let base_ctm = self.gs.current().ctm;
+        let form_ctm = form_matrix(&stream.dictionary).multiply(&base_ctm);
+
+        let mut child_state = self.gs.current().clone();
+        child_state.ctm = form_ctm;
+        if let Some(bbox_mask) = form_bbox_mask(&stream.dictionary, form_ctm, self.canvas_w, self.canvas_h) {
+            child_state.clip = Some(Rc::new(match &child_state.clip {
+                Some(existing) => intersect_masks(existing, &bbox_mask),
+                None => bbox_mask,
+            }));
+        }
+
+        let resources = form_resources(&stream.dictionary).or(self.resources);
+        let content = match image::decode_all(stream) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                self.warn(RenderWarning::ImageDecodeFailed {
+                    name: "(form)".to_string(),
+                    reason,
+                });
+                return Ok(());
+            }
+        };
+
+        let mut child = Interpreter {
+            pixmap: &mut *self.pixmap,
+            gs: GraphicsStateStack::new(child_state, MAX_GRAPHICS_STATE_DEPTH),
+            path: PathAccumulator::new(),
+            pending_clip: None,
+            resources,
+            warnings: &mut *self.warnings,
+            canvas_w: self.canvas_w,
+            canvas_h: self.canvas_h,
+            text_matrix: Matrix::identity(),
+            text_line_matrix: Matrix::identity(),
+            font_cache: HashMap::new(),
+            type3_depth: self.type3_depth,
+            form_depth: self.form_depth + 1,
+        };
+
+        for item in parse_content_stream(&content) {
+            match item {
+                ContentItem::Op { operator, operands } => child.exec(&operator, &operands)?,
+                ContentItem::InlineImage(img) => child.show_inline_image(&img),
+                ContentItem::Raw(_) => child.warn(RenderWarning::TruncatedContentStream),
+            }
+        }
         Ok(())
+    }
+
+    /// Renders a transparency-group Form XObject's content into a fresh,
+    /// canvas-sized offscreen [`Pixmap`], seeded with `backdrop` before
+    /// painting -- shared by a genuine `/Group /S /Transparency` Form
+    /// painted via `Do` (transparent backdrop) and by an ExtGState
+    /// `/SMask` group (opaque black or transparent backdrop, depending on
+    /// `/S`; see [`Self::apply_soft_mask_group`]). Group content paints at
+    /// full opacity/Normal blend internally (isolated group semantics);
+    /// the caller composites the *result* with the outer alpha/blend mode
+    /// (for a visible group) or reduces it to a mask (for a soft mask).
+    fn render_group_to_pixmap(
+        &mut self,
+        stream: &PdfStream,
+        base_ctm: Matrix,
+        backdrop: Color,
+    ) -> Result<Pixmap, NativeRenderError> {
+        let mut pixmap = Pixmap::new(self.canvas_w, self.canvas_h).ok_or(NativeRenderError::PixmapAllocationFailed {
+            width: self.canvas_w,
+            height: self.canvas_h,
+        })?;
+        pixmap.fill(backdrop);
+
+        if self.form_depth >= MAX_FORM_XOBJECT_DEPTH {
+            self.warn(RenderWarning::FormXObjectRecursionLimitExceeded);
+            return Ok(pixmap);
+        }
+
+        let form_ctm = form_matrix(&stream.dictionary).multiply(&base_ctm);
+
+        let mut child_state = self.gs.current().clone();
+        child_state.ctm = form_ctm;
+        child_state.fill_alpha = 1.0;
+        child_state.stroke_alpha = 1.0;
+        child_state.blend_mode = BlendMode::SourceOver;
+        child_state.soft_mask = None;
+        child_state.clip = form_bbox_mask(&stream.dictionary, form_ctm, self.canvas_w, self.canvas_h).map(Rc::new);
+
+        let resources = form_resources(&stream.dictionary).or(self.resources);
+        let content = match image::decode_all(stream) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                self.warn(RenderWarning::ImageDecodeFailed {
+                    name: "(form group)".to_string(),
+                    reason,
+                });
+                return Ok(pixmap);
+            }
+        };
+
+        {
+            let mut child = Interpreter {
+                pixmap: &mut pixmap,
+                gs: GraphicsStateStack::new(child_state, MAX_GRAPHICS_STATE_DEPTH),
+                path: PathAccumulator::new(),
+                pending_clip: None,
+                resources,
+                warnings: &mut *self.warnings,
+                canvas_w: self.canvas_w,
+                canvas_h: self.canvas_h,
+                text_matrix: Matrix::identity(),
+                text_line_matrix: Matrix::identity(),
+                font_cache: HashMap::new(),
+                type3_depth: self.type3_depth,
+                form_depth: self.form_depth + 1,
+            };
+
+            for item in parse_content_stream(&content) {
+                match item {
+                    ContentItem::Op { operator, operands } => child.exec(&operator, &operands)?,
+                    ContentItem::InlineImage(img) => child.show_inline_image(&img),
+                    ContentItem::Raw(_) => child.warn(RenderWarning::TruncatedContentStream),
+                }
+            }
+        }
+
+        Ok(pixmap)
     }
 
     /// `BI`/`ID`/`EI` (ISO 32000-1 8.9.7): decodes and paints an inline
@@ -721,7 +1049,15 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
     /// [`super::image`]'s module docs.
     fn paint_image_result(&mut self, result: ImageResult, name: &str) {
         match result {
-            ImageResult::Ok(decoded) => self.draw_image_pixels(decoded),
+            ImageResult::Ok(decoded) => {
+                if let Some(reason) = decoded.smask_warning.clone() {
+                    self.warn(RenderWarning::ImageSoftMaskDecodeFailed {
+                        name: name.to_string(),
+                        reason,
+                    });
+                }
+                self.draw_image_pixels(decoded);
+            }
             ImageResult::UnsupportedFilter(filter) => {
                 self.warn(RenderWarning::UnsupportedImageFilter {
                     name: name.to_string(),
@@ -764,9 +1100,10 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
 
         let paint = tiny_skia::PixmapPaint {
             opacity: state.fill_alpha.clamp(0.0, 1.0),
+            blend_mode: state.blend_mode,
             ..Default::default()
         };
-        let clip = state.clip.clone();
+        let clip = combined_mask(state);
         self.pixmap
             .draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, clip.as_deref());
     }
@@ -796,8 +1133,9 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
         // page background), not black (plausible real content), matching
         // the "broken image" convention most browsers/viewers use.
         paint.set_color(Color::from_rgba8(160, 160, 160, 255));
+        paint.blend_mode = state.blend_mode;
         paint.anti_alias = false;
-        let clip = state.clip.clone();
+        let clip = combined_mask(state);
         self.pixmap
             .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), clip.as_deref());
     }
@@ -983,7 +1321,8 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
         let render_mode = state.text.render_mode;
         let fill_color = paint_color(state.fill_color, state.fill_alpha);
         let stroke_color = paint_color(state.stroke_color, state.stroke_alpha);
-        let clip: Option<Rc<Mask>> = state.clip.clone();
+        let blend_mode = state.blend_mode;
+        let clip = combined_mask(state);
         let stroke_params = StrokeParams::from(state);
 
         // Render modes 4-7 add to the clip path in addition to painting
@@ -993,6 +1332,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
         if mode == 0 || mode == 2 {
             let mut paint = Paint::default();
             paint.set_color(fill_color);
+            paint.blend_mode = blend_mode;
             paint.anti_alias = true;
             self.pixmap
                 .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), clip.as_deref());
@@ -1000,6 +1340,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
         if mode == 1 || mode == 2 {
             let mut paint = Paint::default();
             paint.set_color(stroke_color);
+            paint.blend_mode = blend_mode;
             paint.anti_alias = true;
             let (stroke, _dash_invalid) = stroke_params.build();
             self.pixmap
@@ -1052,6 +1393,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
             text_line_matrix: Matrix::identity(),
             font_cache: HashMap::new(),
             type3_depth: self.type3_depth + 1,
+            form_depth: self.form_depth,
         };
 
         for item in parse_content_stream(proc_bytes) {
@@ -1081,13 +1423,15 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
             let state = self.gs.current();
             let fill_color = paint_color(state.fill_color, state.fill_alpha);
             let stroke_color = paint_color(state.stroke_color, state.stroke_alpha);
-            let clip: Option<Rc<Mask>> = state.clip.clone();
+            let blend_mode = state.blend_mode;
+            let clip = combined_mask(state);
             let stroke_params = StrokeParams::from(state);
 
             match mode {
                 FillMode::Fill(rule) | FillMode::FillStroke(rule) => {
                     let mut paint = Paint::default();
                     paint.set_color(fill_color);
+                    paint.blend_mode = blend_mode;
                     paint.anti_alias = true;
                     self.pixmap
                         .fill_path(path, &paint, rule, Transform::identity(), clip.as_deref());
@@ -1098,6 +1442,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
                 FillMode::Stroke | FillMode::FillStroke(_) => {
                     let mut paint = Paint::default();
                     paint.set_color(stroke_color);
+                    paint.blend_mode = blend_mode;
                     paint.anti_alias = true;
                     let (stroke, dash_invalid) = stroke_params.build();
                     self.pixmap
@@ -1218,6 +1563,121 @@ impl StrokeParams {
 
 fn paint_color(base: Color, alpha: f32) -> Color {
     Color::from_rgba(base.red(), base.green(), base.blue(), alpha.clamp(0.0, 1.0)).unwrap_or(Color::BLACK)
+}
+
+/// Resolves a Form XObject's `/Matrix` (ISO 32000-1 §8.10.1, Table 95),
+/// defaulting to the identity matrix if absent or malformed (untrusted
+/// input: a non-6-element or non-numeric `/Matrix` is treated the same as
+/// "not specified" rather than erroring the whole render).
+fn form_matrix(dict: &PdfDictionary) -> Matrix {
+    let Some(Object::Array(arr)) = dict.get("Matrix") else {
+        return Matrix::identity();
+    };
+    let v: Vec<f64> = arr.iter().filter_map(as_f64).collect();
+    if v.len() != 6 {
+        return Matrix::identity();
+    }
+    Matrix::new(v[0], v[1], v[2], v[3], v[4], v[5])
+}
+
+/// Resolves a Form XObject's own `/Resources` sub-dictionary (ISO 32000-1
+/// §7.8.3), if present -- see the [module docs](super)'s "pre-resolved
+/// `/Resources`" assumption for why this expects an already-dereferenced
+/// dictionary rather than a dangling indirect reference.
+fn form_resources(dict: &PdfDictionary) -> Option<&PdfDictionary> {
+    match dict.get("Resources") {
+        Some(Object::Dictionary(d)) => Some(d),
+        _ => None,
+    }
+}
+
+/// Builds a device-space clip mask from a Form XObject's `/BBox` (ISO
+/// 32000-1 §8.10.1: required by the spec, but treated as "no additional
+/// clip restriction" if absent/malformed rather than failing the render
+/// -- untrusted input).
+fn form_bbox_mask(dict: &PdfDictionary, form_ctm: Matrix, canvas_w: u32, canvas_h: u32) -> Option<Mask> {
+    let Some(Object::Array(arr)) = dict.get("BBox") else {
+        return None;
+    };
+    let v: Vec<f64> = arr.iter().filter_map(as_f64).collect();
+    if v.len() != 4 {
+        return None;
+    }
+    let corners = [
+        form_ctm.transform_point(v[0], v[1]),
+        form_ctm.transform_point(v[2], v[1]),
+        form_ctm.transform_point(v[2], v[3]),
+        form_ctm.transform_point(v[0], v[3]),
+    ]
+    .map(|(x, y)| super::path::sanitize_point(x, y));
+
+    let mut pb = PathAccumulator::new();
+    pb.rect(corners);
+    let path = pb.to_path()?;
+    let mut mask = Mask::new(canvas_w, canvas_h)?;
+    mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+    Some(mask)
+}
+
+/// Combines the active clip and soft mask (ISO 32000-1 §11.6.4.3: a mark
+/// is only painted where *both* the clip path and the soft mask allow
+/// it) into a single mask reference for `tiny-skia`'s painting calls.
+/// Allocates a combined buffer only when both are simultaneously active;
+/// the common case (at most one set) is a cheap `Rc` clone.
+fn combined_mask(state: &GraphicsState) -> Option<Rc<Mask>> {
+    match (&state.clip, &state.soft_mask) {
+        (None, None) => None,
+        (Some(c), None) => Some(c.clone()),
+        (None, Some(m)) => Some(m.clone()),
+        (Some(c), Some(m)) => Some(Rc::new(intersect_masks(c, m))),
+    }
+}
+
+/// Multiplies two same-size masks together (`a*b/255`), used to combine a
+/// clip path with a soft mask, or a Form XObject's `/BBox` clip with
+/// whatever clip was already active. Falls back to cloning `a` if the two
+/// masks aren't the same size (defensive; every mask this interpreter
+/// builds is canvas-sized, so this should never actually trigger).
+fn intersect_masks(a: &Mask, b: &Mask) -> Mask {
+    if a.width() != b.width() || a.height() != b.height() {
+        return a.clone();
+    }
+    let data: Vec<u8> = a
+        .data()
+        .iter()
+        .zip(b.data())
+        .map(|(&x, &y)| ((u16::from(x) * u16::from(y)) / 255) as u8)
+        .collect();
+    let size = tiny_skia::IntSize::from_wh(a.width(), a.height()).expect("same size as an existing valid Mask");
+    Mask::from_vec(data, size).unwrap_or_else(|| a.clone())
+}
+
+/// Maps a PDF blend-mode name (ISO 32000-1 §11.3.5, Table 57) onto
+/// `tiny_skia::BlendMode`. All 16 standard names are supported directly
+/// -- `tiny-skia` implements the same separable/non-separable compositing
+/// formulas the spec defines, so this is a real mapping, not an
+/// approximation. Returns `None` for anything else (a nonstandard/private
+/// blend-mode name), which the caller falls back to `Normal` for.
+fn resolve_blend_mode(name: &str) -> Option<BlendMode> {
+    Some(match name {
+        "Normal" | "Compatible" => BlendMode::SourceOver,
+        "Multiply" => BlendMode::Multiply,
+        "Screen" => BlendMode::Screen,
+        "Overlay" => BlendMode::Overlay,
+        "Darken" => BlendMode::Darken,
+        "Lighten" => BlendMode::Lighten,
+        "ColorDodge" => BlendMode::ColorDodge,
+        "ColorBurn" => BlendMode::ColorBurn,
+        "HardLight" => BlendMode::HardLight,
+        "SoftLight" => BlendMode::SoftLight,
+        "Difference" => BlendMode::Difference,
+        "Exclusion" => BlendMode::Exclusion,
+        "Hue" => BlendMode::Hue,
+        "Saturation" => BlendMode::Saturation,
+        "Color" => BlendMode::Color,
+        "Luminosity" => BlendMode::Luminosity,
+        _ => return None,
+    })
 }
 
 fn line_cap_from_i64(v: i64) -> tiny_skia::LineCap {
