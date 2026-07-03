@@ -80,6 +80,12 @@ mod redact;
 mod save;
 mod structure;
 mod text_extract;
+// Shared, state-free text-run geometry (font-width measurement,
+// text/CTM matrix math) used by both `redact` (redaction-area hit
+// testing) and `text_layout` (selectable text-layer boxes) - see that
+// module's docs for why it exists separately from either.
+mod text_geometry;
+mod text_layout;
 mod util;
 mod watermark;
 pub mod xmp;
@@ -95,4 +101,5 @@ pub use pdfa::{PdfAConversionOptions, PdfAConversionSummary, PdfAFlavor, PdfARep
 pub use pdfua::{PdfUaReport, PdfUaViolation};
 pub use pdfx::{PdfXColorReport, PdfXViolation};
 pub use structure::{StructNode, StructType};
+pub use text_layout::TextRun;
 pub use xmp::{build_xmp_packet, read_pdfaid, read_pdfuaid, XmpFields};

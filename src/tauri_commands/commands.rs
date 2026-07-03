@@ -1745,6 +1745,135 @@ pub async fn get_outline(
     get_outline_impl(&state, request).await
 }
 
+// ===================================================================
+// get_text_layout
+// ===================================================================
+
+/// Arguments for [`get_text_layout`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetTextLayoutRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+    /// A single zero-based page to compute layout for, or `None` for
+    /// every page.
+    pub page_index: Option<usize>,
+}
+
+/// One text-showing run's decoded text and bounding box, plain-data
+/// mirror of [`crate::editor::TextRun`] for IPC. See
+/// [`crate::editor::text_layout`]'s module docs for what a "run" is (one
+/// `Tj`/`'`/`"`/`TJ` operator's worth of text, *not* necessarily one word
+/// or one visual line) and this feature's disclosed approximation
+/// limits (font metrics, ascent/descent, no per-glyph shaping).
+#[derive(Debug, Clone, Serialize)]
+pub struct TextRunResult {
+    pub text: String,
+    /// Lower-left X of the run's box, in the page's own default user
+    /// space (see [`PageTextLayout::page_width`]'s docs for how a
+    /// frontend maps this onto a `render_page` raster).
+    pub x: f64,
+    /// Lower-left Y of the run's box, page default user space (y
+    /// increasing upward, ISO 32000-1 8.3.2.2).
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl From<crate::editor::TextRun> for TextRunResult {
+    fn from(run: crate::editor::TextRun) -> Self {
+        TextRunResult {
+            text: run.text,
+            x: run.x,
+            y: run.y,
+            width: run.width,
+            height: run.height,
+        }
+    }
+}
+
+/// One page's approximate text-layer geometry (see
+/// [`crate::editor::text_layout`]'s module docs), plus the page's own
+/// `/MediaBox` width/height in points (ISO 32000-1 7.7.3.3) a frontend
+/// needs to map `runs`' page-default-user-space coordinates onto a
+/// `render_page` raster rendered at some `dpi`:
+/// `scale = dpi / 72.0`, `pixel_x = run.x * scale`,
+/// `pixel_y_from_top = (page_height - (run.y + run.height)) * scale`
+/// (PDF user space has y increasing upward; a raster's row 0 is its
+/// top, so the run's *top* edge -- `run.y + run.height` -- maps to the
+/// smaller pixel-y). This assumes the page's `/Rotate` is `0`; see
+/// [`crate::editor::text_layout`]'s "Known limitations" for rotated
+/// pages, which this command does not compensate for.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageTextLayout {
+    /// Zero-based page index.
+    pub page_index: usize,
+    pub page_width: f64,
+    pub page_height: f64,
+    pub runs: Vec<TextRunResult>,
+}
+
+fn text_layout_for_pages(doc: &EditableDocument, indices: &[usize]) -> Result<Vec<PageTextLayout>, CommandError> {
+    let mut pages = Vec::with_capacity(indices.len());
+    for &index in indices {
+        let page_id = doc.page_id_at(index).map_err(CommandError::from)?;
+        let media_box = doc.effective_media_box(page_id).map_err(CommandError::from)?;
+        let runs = doc.extract_page_text_layout(page_id).map_err(CommandError::from)?;
+        pages.push(PageTextLayout {
+            page_index: index,
+            page_width: media_box.width(),
+            page_height: media_box.height(),
+            runs: runs.into_iter().map(TextRunResult::from).collect(),
+        });
+    }
+    Ok(pages)
+}
+
+/// Returns the approximate text-layer geometry for one page, or every
+/// page, of an open document -- the data a frontend overlays as
+/// selectable/copyable transparent text atop [`render_page`]'s raster
+/// output. See [`crate::editor::text_layout`]'s module docs for the
+/// algorithm and its disclosed limitations, and [`PageTextLayout`]'s
+/// docs for how to map a run's coordinates onto a rendered raster.
+pub async fn get_text_layout_impl(
+    state: &AppState,
+    request: GetTextLayoutRequest,
+) -> Result<Vec<PageTextLayout>, CommandError> {
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+
+    state
+        .pool
+        .run(move || {
+            let doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let page_count = doc.page_count().map_err(CommandError::from)?;
+            let indices: Vec<usize> = match request.page_index {
+                Some(index) => {
+                    if index >= page_count {
+                        return Err(CommandError::invalid_argument(format!(
+                            "page index {index} out of range (document has {page_count} pages)"
+                        )));
+                    }
+                    vec![index]
+                }
+                None => (0..page_count).collect(),
+            };
+            text_layout_for_pages(&doc, &indices)
+        })
+        .await
+}
+
+/// Tauri command wrapper for [`get_text_layout_impl`].
+#[tauri::command]
+pub async fn get_text_layout(
+    state: tauri::State<'_, AppState>,
+    request: GetTextLayoutRequest,
+) -> Result<Vec<PageTextLayout>, CommandError> {
+    get_text_layout_impl(&state, request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2837,5 +2966,64 @@ mod tests {
         assert_eq!(outline[1].page_index, Some(2));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn get_text_layout_finds_fixture_content_with_a_plausible_box() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let pages = get_text_layout_impl(
+            &state,
+            GetTextLayoutRequest {
+                handle: opened.handle,
+                page_index: None,
+            },
+        )
+        .await
+        .expect("get_text_layout must succeed");
+
+        assert_eq!(pages.len(), 1);
+        let page = &pages[0];
+        assert_eq!(page.page_index, 0);
+        // A4 in points (see `Rectangle::a4`).
+        assert!((page.page_width - 595.0).abs() < 1.0);
+        assert!((page.page_height - 842.0).abs() < 1.0);
+
+        assert_eq!(page.runs.len(), 1);
+        let run = &page.runs[0];
+        assert_eq!(run.text, "Hello, rust-pdf tests!");
+        // Fixture places the baseline at y=700 (see `sample_pdf_path`);
+        // the box must straddle it and stay within the page.
+        assert!(run.y < 700.0 && run.y + run.height > 700.0);
+        assert!(run.x >= 0.0 && run.x + run.width <= page.page_width);
+    }
+
+    #[tokio::test]
+    async fn get_text_layout_rejects_out_of_range_page() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let result = get_text_layout_impl(
+            &state,
+            GetTextLayoutRequest {
+                handle: opened.handle,
+                page_index: Some(5),
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_text_layout_rejects_unknown_handle() {
+        let state = test_state();
+        let result = get_text_layout_impl(
+            &state,
+            GetTextLayoutRequest {
+                handle: 999_999,
+                page_index: None,
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
     }
 }
