@@ -476,6 +476,15 @@ no separate single-thread "actor" is needed, since `PdfRenderer` (built
 on `EditableDocument`) is a plain `Send + Sync` value rather than a
 handle into a native library.
 
+To see the underlying `..._impl` functions actually run end to end (no
+Tauri window needed) — including how a frontend would branch on a
+structured `CommandError`'s `ErrorCode` for a failure case — run
+[`examples/tauri_commands_example.rs`](examples/tauri_commands_example.rs):
+
+```bash
+cargo run --example tauri_commands_example --features full,tauri
+```
+
 ### Reading existing PDFs
 
 Requires `features = ["parser"]`. Full, run source at
@@ -625,6 +634,7 @@ Runnable, `cargo run`-verified examples in [`examples/`](examples/):
 | `digital_signature_example` | `signatures` | Signing with a certificate/private key, single and multi-signature |
 | `encryption_demo` | `encryption` | AES-256 password protection |
 | `read_existing_pdf_demo` | `parser` | Read-only `PdfReader` API (page count, version, trailer, catalog) |
+| `tauri_commands_example` | `full tauri` | Calls the `tauri_commands` layer's `..._impl` functions directly (`open_document`, `render_page`, `extract_text`, `search_text`, `apply_edit`, `add_annotation`, `save_document`) with no Tauri app/window, plus structured `CommandError`/`ErrorCode` handling for an unknown handle and an out-of-range page index |
 | `c_example.c`, `rust_ffi_example/`, `python_example.py`, `node_example.js`, `go_example.go`, `ruby_example.rb` | (dylib) | FFI usage from other languages (see below) |
 
 ## Dynamic Library Distribution (FFI)
