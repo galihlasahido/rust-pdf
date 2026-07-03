@@ -1672,6 +1672,79 @@ pub async fn add_watermark(
     add_watermark_impl(&state, request).await
 }
 
+// ===================================================================
+// get_outline
+// ===================================================================
+
+/// Arguments for [`get_outline`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetOutlineRequest {
+    /// Handle returned by [`open_document`].
+    pub handle: u64,
+}
+
+/// One node of the document outline (bookmark) tree, plain-data mirror of
+/// [`crate::editor::BookmarkNode`] for IPC: `id` is dropped (an outline
+/// item's object id is an internal editing handle for
+/// [`crate::editor::EditableDocument::remove_bookmark`]/`add_bookmark`,
+/// not something a read-only reader UI needs) and `dest` is collapsed to
+/// the single field a page-jumping frontend actually wants -- a
+/// destination page index, when the item's destination resolved to one
+/// (see [`crate::editor::Destination`]; `None` covers both "no
+/// destination" and a destination form this crate does not resolve to a
+/// page, e.g. an unresolvable named destination).
+#[derive(Debug, Clone, Serialize)]
+pub struct OutlineNodeResult {
+    pub title: String,
+    pub page_index: Option<usize>,
+    pub children: Vec<OutlineNodeResult>,
+}
+
+fn convert_bookmark_node(node: crate::editor::BookmarkNode) -> OutlineNodeResult {
+    OutlineNodeResult {
+        title: node.title,
+        page_index: node.dest.map(|d| match d {
+            crate::editor::Destination::FitPage { page_index } => page_index,
+            crate::editor::Destination::Xyz { page_index, .. } => page_index,
+        }),
+        children: node.children.into_iter().map(convert_bookmark_node).collect(),
+    }
+}
+
+/// Returns an open document's outline (bookmark) tree, in document order,
+/// via [`crate::editor::EditableDocument::list_bookmarks`]. An empty
+/// `Vec` means the document defines no outline at all (not an error --
+/// most PDFs have none), which a frontend should render as a "no
+/// bookmarks" message rather than an empty tree.
+pub async fn get_outline_impl(
+    state: &AppState,
+    request: GetOutlineRequest,
+) -> Result<Vec<OutlineNodeResult>, CommandError> {
+    let handle = DocumentHandle(request.handle);
+    let entry = state.get_document(handle)?;
+
+    state
+        .pool
+        .run(move || {
+            let doc = entry
+                .doc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let bookmarks = doc.list_bookmarks().map_err(CommandError::from)?;
+            Ok(bookmarks.into_iter().map(convert_bookmark_node).collect())
+        })
+        .await
+}
+
+/// Tauri command wrapper for [`get_outline_impl`].
+#[tauri::command]
+pub async fn get_outline(
+    state: tauri::State<'_, AppState>,
+    request: GetOutlineRequest,
+) -> Result<Vec<OutlineNodeResult>, CommandError> {
+    get_outline_impl(&state, request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2674,5 +2747,95 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_outline_returns_empty_for_document_without_bookmarks() {
+        let state = test_state();
+        let opened = open_sample(&state).await;
+        let outline = get_outline_impl(&state, GetOutlineRequest { handle: opened.handle })
+            .await
+            .expect("get_outline must succeed even when the document has no bookmarks");
+        assert!(outline.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_outline_rejects_unknown_handle() {
+        let state = test_state();
+        let result = get_outline_impl(&state, GetOutlineRequest { handle: 999_999 }).await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_outline_returns_nested_bookmarks_in_document_order() {
+        use crate::editor::Destination;
+        use crate::prelude::*;
+
+        let state = test_state();
+
+        // Build a small multi-page fixture, mirroring
+        // `editor::outline`'s own tests, then open it through the normal
+        // command path so `get_outline_impl` exercises the same handle
+        // every other command uses.
+        let content = ContentBuilder::new().text("F1", 12.0, 72.0, 750.0, "Page");
+        let mut builder = DocumentBuilder::new();
+        for _ in 0..3 {
+            let page = PageBuilder::a4()
+                .font("F1", Standard14Font::Helvetica)
+                .content(content.clone())
+                .build();
+            builder = builder.page(page);
+        }
+        let bytes = builder
+            .build()
+            .expect("building the outline fixture must not fail")
+            .save_to_bytes()
+            .expect("serializing the outline fixture must not fail");
+        let path = std::env::temp_dir().join(format!(
+            "rust_pdf_get_outline_test_{}_{}.pdf",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, &bytes).expect("writing the outline fixture must not fail");
+
+        let opened = open_document_impl(
+            &state,
+            OpenDocumentRequest {
+                path: path.to_string_lossy().into_owned(),
+                password: None,
+            },
+        )
+        .await
+        .expect("opening the outline fixture must succeed");
+
+        {
+            let entry = state
+                .get_document(DocumentHandle(opened.handle))
+                .expect("just-opened document");
+            let mut doc = entry.doc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let parent = doc
+                .add_bookmark(None, "Part I", Destination::fit(0))
+                .expect("add top-level bookmark");
+            doc.add_bookmark(Some(parent), "Section 1.1", Destination::fit(1))
+                .expect("add nested bookmark");
+            doc.add_bookmark(None, "Part II", Destination::fit(2))
+                .expect("add second top-level bookmark");
+        }
+
+        let outline = get_outline_impl(&state, GetOutlineRequest { handle: opened.handle })
+            .await
+            .expect("get_outline must succeed");
+
+        assert_eq!(outline.len(), 2);
+        assert_eq!(outline[0].title, "Part I");
+        assert_eq!(outline[0].page_index, Some(0));
+        assert_eq!(outline[0].children.len(), 1);
+        assert_eq!(outline[0].children[0].title, "Section 1.1");
+        assert_eq!(outline[0].children[0].page_index, Some(1));
+        assert!(outline[0].children[0].children.is_empty());
+        assert_eq!(outline[1].title, "Part II");
+        assert_eq!(outline[1].page_index, Some(2));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

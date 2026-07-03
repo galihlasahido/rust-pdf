@@ -24,6 +24,10 @@
 //! - [`commands::split_document`]
 //! - [`commands::add_watermark`]
 //!
+//! plus one more added for a reader-UI phase (thumbnail/outline sidebar):
+//!
+//! - [`commands::get_outline`]
+//!
 //! all `async fn`s registerable directly with `tauri::generate_handler!`,
 //! backed by a single dedicated worker thread pool ([`worker::WorkerPool`])
 //! so that none of them ever block Tauri's own async-command executor
@@ -111,6 +115,7 @@
 //!             commands::merge_documents,
 //!             commands::split_document,
 //!             commands::add_watermark,
+//!             commands::get_outline,
 //!         ])
 //!         .run(tauri::generate_context!())
 //!         .expect("error while running tauri application");
