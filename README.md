@@ -8,11 +8,17 @@ desktop app's async command layer.
 
 This README describes what is **actually implemented in `src/` today** —
 every function/type named below was verified against the source while
-writing this document, and every code block is either a real `cargo run`
-example checked into `examples/` or a compiled doctest. For the full,
-warts-and-all technical account (module-by-module inventory, migration
-history, measured performance, `cargo audit`/`clippy` results, and an
-exhaustive "known gaps" list), see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+writing this document, and every fenced Rust code block was extracted
+and compiled (most also executed) against this exact revision of the
+crate before being committed: either as one of the `examples/*.rs` files
+linked next to it (run with the given `cargo run --features ... --example
+...` command), or as a self-contained fragment built with the same
+feature flags noted in its section (the one exception, noted inline, is
+the Tauri wiring snippet, which needs a consuming app's own
+`tauri.conf.json`/build script to compile, not just this crate). For the
+full, warts-and-all technical account (module-by-module inventory,
+migration history, measured performance, `cargo audit`/`clippy` results,
+and an exhaustive "known gaps" list), see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 For the security trust-boundary analysis (what an attacker who controls a
 PDF/font/ICC-profile can do, and what mitigates it), see
 **[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)**.
@@ -215,6 +221,14 @@ Requires `features = ["parser", "fonts", "render"]`. Full, run source at
 use rust_pdf::editor::{Destination, StructType};
 use rust_pdf::prelude::*;
 
+// Build a small source document (see the Hello World quick start above),
+// then re-open it for structural editing.
+let content = ContentBuilder::new()
+    .text("F1", 18.0, 72.0, 760.0, "Quarterly Report")
+    .text("F1", 12.0, 72.0, 700.0, "Confidential customer id: CUST-004821");
+let page = PageBuilder::a4().font("F1", Standard14Font::Helvetica).content(content).build();
+let source_pdf_bytes = DocumentBuilder::new().title("Quarterly Report").page(page).build()?.save_to_bytes()?;
+
 let mut doc = EditableDocument::from_bytes(source_pdf_bytes)?;
 
 // Outline/bookmark (ISO 32000-1 12.3.3).
@@ -312,9 +326,31 @@ fuller demo cross-checked against the real veraPDF CLI):
 use rust_pdf::editor::{PdfAConversionOptions, PdfAFlavor};
 use rust_pdf::prelude::*;
 
+// A minimal, syntactically valid ICC.1 header -- enough to exercise the
+// `/OutputIntent` embedding mechanics. This crate deliberately never
+// bundles or synthesizes a real profile for production use; a real app
+// should embed a real vendored one (e.g. `sRGB2014.icc`).
+fn synthetic_srgb_icc_profile() -> Vec<u8> {
+    let mut data = vec![0u8; 200];
+    let size = (data.len() as u32).to_be_bytes();
+    data[0..4].copy_from_slice(&size);
+    data[12..16].copy_from_slice(b"mntr");
+    data[16..20].copy_from_slice(b"RGB ");
+    data[20..24].copy_from_slice(b"XYZ ");
+    data[36..40].copy_from_slice(b"acsp");
+    data
+}
+
+let page = PageBuilder::a4()
+    .font("F1", Standard14Font::Helvetica)
+    .content(ContentBuilder::new().text("F1", 14.0, 72.0, 760.0, "Archival copy"))
+    .build();
+let source_pdf_bytes = DocumentBuilder::new().page(page).build()?.save_to_bytes()?;
+
 let mut doc = EditableDocument::from_bytes(source_pdf_bytes)?;
+let icc_profile = synthetic_srgb_icc_profile(); // see note above -- use a real profile in production
 let options = PdfAConversionOptions {
-    icc_profile,       // real ICC profile bytes -- this crate never bundles one
+    icc_profile: &icc_profile,
     icc_identifier: "sRGB IEC61966-2.1",
     icc_condition: "sRGB",
     title: Some("Archival copy"),
@@ -345,6 +381,11 @@ see "Known limitations":
 ```rust
 use rust_pdf::prelude::*;
 
+let page = PageBuilder::a4()
+    .font("F1", Standard14Font::Helvetica)
+    .content(ContentBuilder::new().text("F1", 14.0, 72.0, 760.0, "Confidential"))
+    .build();
+
 let doc = DocumentBuilder::new()
     .encrypt(
         EncryptionConfig::aes256()
@@ -362,9 +403,12 @@ let doc = DocumentBuilder::new()
 
 ### Digital signatures
 
-Requires `features = ["signatures"]`. Verified against the real, running
+Requires `features = ["signatures"]`. The core signing call
+(`Certificate`/`PrivateKey`/`DocumentSigner`) matches the real, running
 [`examples/digital_signature_example.rs`](examples/digital_signature_example.rs)
-(`cargo run --example digital_signature_example --features signatures`):
+(`cargo run --example digital_signature_example --features signatures`),
+which additionally shell out to `openssl` to generate `cert.pem`/`key.pem`
+for the demo -- in your own app, supply your own certificate/key files:
 
 ```rust
 use rust_pdf::prelude::*;
@@ -373,6 +417,10 @@ use rust_pdf::signatures::{Certificate, PrivateKey, DocumentSigner};
 let cert = Certificate::from_pem_file("cert.pem")?;
 let key = PrivateKey::from_pem_file("key.pem")?;
 
+let page = PageBuilder::a4()
+    .font("F1", Standard14Font::Helvetica)
+    .content(ContentBuilder::new().text("F1", 14.0, 72.0, 760.0, "Signed document"))
+    .build();
 let doc = DocumentBuilder::new().page(page).build()?;
 
 let signed_pdf = DocumentSigner::new(doc)
@@ -390,7 +438,13 @@ std::fs::write("signed.pdf", signed_pdf)?;
 Requires the `tauri` feature (pulls in `parser`, `render`, `signatures`).
 See [`src/tauri_commands/mod.rs`](src/tauri_commands/mod.rs) for full
 module docs, architecture diagram, and error-handling/progress-reporting
-conventions.
+conventions. The nine command function paths below (`commands::*`) and
+`state::AppState::new()` were checked against `src/tauri_commands/`; this
+snippet is wiring code for *your* Tauri app's `main.rs`/`lib.rs`, so
+`tauri::generate_context!()` only compiles inside a real Tauri app
+scaffold (a `tauri.conf.json` plus a build script calling
+`tauri_build::build()`) — it is not a standalone `examples/` binary in
+this crate:
 
 ```rust
 use rust_pdf::tauri_commands::{state::AppState, commands};
@@ -457,6 +511,9 @@ The library includes all 14 PDF standard fonts:
 ```rust
 use rust_pdf::prelude::*;
 
+let content = ContentBuilder::new()
+    .text("F1", 14.0, 72.0, 760.0, "Standard 14 fonts demo");
+
 let page = PageBuilder::a4()
     .font("F1", Standard14Font::Helvetica)
     .font("F2", Standard14Font::TimesBold)
@@ -487,7 +544,7 @@ use rust_pdf::prelude::*;
 
 let a4 = PageBuilder::a4();
 let letter = PageBuilder::letter();
-let custom = PageBuilder::new(400.0, 600.0); // points, 72pt = 1 inch
+let custom = PageBuilder::custom(400.0, 600.0); // points, 72pt = 1 inch
 ```
 
 ## Running Tests
