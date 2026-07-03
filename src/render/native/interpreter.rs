@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use tiny_skia::{BlendMode, Color, FillRule, Mask, MaskType, Paint, Pixmap, PixmapPaint, Stroke, StrokeDash, Transform};
 
@@ -52,7 +53,7 @@ use super::error::{NativeRenderError, RenderWarning};
 use super::font::{self, FontProgram, ResolvedFont};
 use super::glyph::glyph_outline_path;
 use super::image::{self, ImageResult};
-use super::path::PathAccumulator;
+use super::path::{PathAccumulator, PathReserve, MAX_PATH_POINTS_PER_PATH};
 use super::state::{GraphicsState, GraphicsStateStack};
 
 /// Hard cap on `q` nesting depth. See
@@ -73,6 +74,86 @@ pub const MAX_FORM_XOBJECT_DEPTH: usize = 12;
 /// stream consisting of millions of unsupported operators can't be used
 /// to force unbounded `Vec` growth (untrusted input).
 const MAX_WARNINGS: usize = 1000;
+
+/// Hard cap on the *total* number of content-stream items (operators
+/// *and* inline images) interpreted for one call to
+/// [`render_content_stream`] -- summed across the top-level content stream
+/// and every nested Form XObject / Type 3 glyph procedure /
+/// transparency-group content stream it triggers, via one shared
+/// [`RenderBudget`] threaded through every recursion level. This is a
+/// distinct attack shape from the per-recursion-level depth caps above
+/// ([`MAX_GRAPHICS_STATE_DEPTH`], [`MAX_FORM_XOBJECT_DEPTH`],
+/// [`font::MAX_TYPE3_DEPTH`]): none of those bound a content stream that
+/// is never nested/recursive at all but simply *very long* (e.g. millions
+/// of flat, non-nested `q Q` pairs, or millions of path-construction
+/// operators each individually cheap) -- exactly the "operator soup" input
+/// class this crate's fuzzing of the interpreter directly (as opposed to
+/// via full document parsing) is meant to explore. See
+/// [`NativeRenderError::OperatorBudgetExceeded`].
+pub const MAX_OPERATOR_COUNT: usize = 2_000_000;
+
+/// Hard wall-clock budget for one call to [`render_content_stream`],
+/// checked alongside [`MAX_OPERATOR_COUNT`] on every content-stream item.
+/// This is the backstop for input whose *cost per operator* (rather than
+/// operator *count*) is what makes it pathological -- e.g. a legally
+/// modest operator count that nonetheless does expensive per-operator work
+/// (very large paths approaching [`MAX_PATH_POINTS_PER_PATH`], deeply
+/// layered-but-within-limits transparency groups each allocating a
+/// canvas-sized offscreen buffer). See
+/// [`NativeRenderError::RenderTimeBudgetExceeded`].
+///
+/// Deliberately generous: large enough that no legitimate page (even a
+/// slow one on modest hardware) should ever hit it, small enough that an
+/// adversarial input cannot hang a caller indefinitely.
+pub const MAX_RENDER_DURATION: Duration = Duration::from_secs(20);
+
+/// Tracks the resource budget shared by every [`Interpreter`] at every
+/// recursion level (top-level content stream, and every nested Form
+/// XObject / Type 3 glyph procedure / transparency-group render it
+/// triggers) for a single call to [`render_content_stream`] --
+/// analogous to how `pixmap`/`warnings` are reborrowed (not copied) across
+/// that same recursion, so a crafted input alternating between "wide"
+/// (many flat operators) and "deep" (nested recursion) attack shapes still
+/// hits one combined bound rather than each recursion level getting its
+/// own fresh budget.
+pub(super) struct RenderBudget {
+    max_operators: usize,
+    op_count: usize,
+    max_duration: Duration,
+    deadline: Instant,
+}
+
+impl RenderBudget {
+    fn new(max_operators: usize, max_duration: Duration) -> Self {
+        Self {
+            max_operators,
+            op_count: 0,
+            max_duration,
+            deadline: Instant::now() + max_duration,
+        }
+    }
+
+    /// Called once per content-stream item (operator or inline image),
+    /// at every recursion level. Returns `Err` the *first* time either
+    /// bound is crossed; the caller propagates that as a hard render
+    /// failure (unlike the soft [`RenderWarning`]s elsewhere in this
+    /// module, an exhausted budget aborts the whole render rather than
+    /// skipping just the offending construct -- by this point the render
+    /// has already proven itself pathological, so continuing to spend
+    /// more operators/time on it serves no one).
+    fn tick(&mut self) -> Result<(), NativeRenderError> {
+        self.op_count += 1;
+        if self.op_count > self.max_operators {
+            return Err(NativeRenderError::OperatorBudgetExceeded { max: self.max_operators });
+        }
+        if Instant::now() >= self.deadline {
+            return Err(NativeRenderError::RenderTimeBudgetExceeded {
+                max_millis: self.max_duration.as_millis() as u64,
+            });
+        }
+        Ok(())
+    }
+}
 
 /// The result of [`super::render_content_stream`]: the rasterized page
 /// plus a (possibly empty) list of recoverable conditions encountered
@@ -110,6 +191,27 @@ pub fn render_content_stream(
     media_box: Rectangle,
     resources: Option<&PdfDictionary>,
 ) -> Result<NativeRenderOutput, NativeRenderError> {
+    render_content_stream_with_limits(content, width, height, media_box, resources, MAX_OPERATOR_COUNT, MAX_RENDER_DURATION)
+}
+
+/// As [`render_content_stream`], but with the operator-count/wall-clock
+/// resource limits ([`MAX_OPERATOR_COUNT`]/[`MAX_RENDER_DURATION`])
+/// overridable rather than fixed at their crate-wide defaults. `pub(super)`
+/// only -- this exists so this module's own tests can exercise
+/// [`NativeRenderError::OperatorBudgetExceeded`]/
+/// [`NativeRenderError::RenderTimeBudgetExceeded`] deterministically (a
+/// tiny `max_operators`, or a `max_duration` of zero) without either
+/// waiting out the real, generous production defaults or lowering them for
+/// everyone.
+pub(super) fn render_content_stream_with_limits(
+    content: &[u8],
+    width: u32,
+    height: u32,
+    media_box: Rectangle,
+    resources: Option<&PdfDictionary>,
+    max_operators: usize,
+    max_duration: Duration,
+) -> Result<NativeRenderOutput, NativeRenderError> {
     if width == 0 || height == 0 {
         return Err(NativeRenderError::InvalidDimensions { width, height });
     }
@@ -142,6 +244,7 @@ pub fn render_content_stream(
     let mut pixmap = Pixmap::new(width, height).ok_or(NativeRenderError::PixmapAllocationFailed { width, height })?;
     pixmap.fill(Color::WHITE);
     let mut warnings = Vec::new();
+    let mut budget = RenderBudget::new(max_operators, max_duration);
 
     {
         let mut interp = Interpreter {
@@ -151,6 +254,7 @@ pub fn render_content_stream(
             pending_clip: None,
             resources,
             warnings: &mut warnings,
+            budget: &mut budget,
             canvas_w: width,
             canvas_h: height,
             text_matrix: Matrix::identity(),
@@ -160,13 +264,7 @@ pub fn render_content_stream(
             form_depth: 0,
         };
 
-        for item in parse_content_stream(content) {
-            match item {
-                ContentItem::Op { operator, operands } => interp.exec(&operator, &operands)?,
-                ContentItem::InlineImage(img) => interp.show_inline_image(&img),
-                ContentItem::Raw(_) => interp.warn(RenderWarning::TruncatedContentStream),
-            }
-        }
+        interp.run_content(content)?;
     }
 
     Ok(NativeRenderOutput { pixmap, warnings })
@@ -189,6 +287,12 @@ struct Interpreter<'res, 'ctx> {
     pending_clip: Option<FillRule>,
     resources: Option<&'res PdfDictionary>,
     warnings: &'ctx mut Vec<RenderWarning>,
+    /// Shared operator-count/wall-clock budget for this entire render call
+    /// (see [`RenderBudget`]) -- reborrowed (not copied) across every
+    /// recursion level exactly like `pixmap`/`warnings`, so nested Form
+    /// XObject / Type 3 / transparency-group work all draws against the
+    /// same combined limit.
+    budget: &'ctx mut RenderBudget,
     canvas_w: u32,
     canvas_h: u32,
     /// Text matrix (ISO 32000-1 9.4.2): maps text space to the CTM in
@@ -229,6 +333,25 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
         }
     }
 
+    /// Parses and interprets `content` end to end, ticking the shared
+    /// [`RenderBudget`] once per item (operator or inline image) *before*
+    /// dispatching it -- the single choke point every content-stream loop
+    /// in this module goes through, whether it's the top-level page
+    /// content stream, a Form XObject's, a transparency group's, or a
+    /// Type 3 glyph procedure's (see [`Self::run_form_xobject_inline`],
+    /// [`Self::render_group_to_pixmap`], [`Self::run_type3_glyph`]).
+    fn run_content(&mut self, content: &[u8]) -> Result<(), NativeRenderError> {
+        for item in parse_content_stream(content) {
+            self.budget.tick()?;
+            match item {
+                ContentItem::Op { operator, operands } => self.exec(&operator, &operands)?,
+                ContentItem::InlineImage(img) => self.show_inline_image(&img),
+                ContentItem::Raw(_) => self.warn(RenderWarning::TruncatedContentStream),
+            }
+        }
+        Ok(())
+    }
+
     fn exec(&mut self, operator: &str, operands: &[Object]) -> Result<(), NativeRenderError> {
         match operator {
             "q" => {
@@ -253,50 +376,62 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
 
             "m" => {
                 if let Some(v) = nums(operands, 2) {
-                    let (x, y) = self.to_device(v[0], v[1]);
-                    self.path.move_to(x, y);
+                    if self.check_path_budget(1) {
+                        let (x, y) = self.to_device(v[0], v[1]);
+                        self.path.move_to(x, y);
+                    }
                 }
             }
             "l" => {
                 if let Some(v) = nums(operands, 2) {
-                    let (x, y) = self.to_device(v[0], v[1]);
-                    self.path.line_to(x, y);
+                    if self.check_path_budget(1) {
+                        let (x, y) = self.to_device(v[0], v[1]);
+                        self.path.line_to(x, y);
+                    }
                 }
             }
             "c" => {
                 if let Some(v) = nums(operands, 6) {
-                    let (x1, y1) = self.to_device(v[0], v[1]);
-                    let (x2, y2) = self.to_device(v[2], v[3]);
-                    let (x3, y3) = self.to_device(v[4], v[5]);
-                    self.path.cubic_to(x1, y1, x2, y2, x3, y3);
+                    if self.check_path_budget(3) {
+                        let (x1, y1) = self.to_device(v[0], v[1]);
+                        let (x2, y2) = self.to_device(v[2], v[3]);
+                        let (x3, y3) = self.to_device(v[4], v[5]);
+                        self.path.cubic_to(x1, y1, x2, y2, x3, y3);
+                    }
                 }
             }
             "v" => {
                 if let Some(v) = nums(operands, 4) {
-                    let (x2, y2) = self.to_device(v[0], v[1]);
-                    let (x3, y3) = self.to_device(v[2], v[3]);
-                    let (x1, y1) = self.path.current_point().unwrap_or((x2, y2));
-                    self.path.cubic_to(x1, y1, x2, y2, x3, y3);
+                    if self.check_path_budget(2) {
+                        let (x2, y2) = self.to_device(v[0], v[1]);
+                        let (x3, y3) = self.to_device(v[2], v[3]);
+                        let (x1, y1) = self.path.current_point().unwrap_or((x2, y2));
+                        self.path.cubic_to(x1, y1, x2, y2, x3, y3);
+                    }
                 }
             }
             "y" => {
                 if let Some(v) = nums(operands, 4) {
-                    let (x1, y1) = self.to_device(v[0], v[1]);
-                    let (x3, y3) = self.to_device(v[2], v[3]);
-                    self.path.cubic_to(x1, y1, x3, y3, x3, y3);
+                    if self.check_path_budget(2) {
+                        let (x1, y1) = self.to_device(v[0], v[1]);
+                        let (x3, y3) = self.to_device(v[2], v[3]);
+                        self.path.cubic_to(x1, y1, x3, y3, x3, y3);
+                    }
                 }
             }
             "h" => self.path.close(),
             "re" => {
                 if let Some(v) = nums(operands, 4) {
-                    let (x, y, w, h) = (v[0], v[1], v[2], v[3]);
-                    let corners = [
-                        self.to_device(x, y),
-                        self.to_device(x + w, y),
-                        self.to_device(x + w, y + h),
-                        self.to_device(x, y + h),
-                    ];
-                    self.path.rect(corners);
+                    if self.check_path_budget(4) {
+                        let (x, y, w, h) = (v[0], v[1], v[2], v[3]);
+                        let corners = [
+                            self.to_device(x, y),
+                            self.to_device(x + w, y),
+                            self.to_device(x + w, y + h),
+                            self.to_device(x, y + h),
+                        ];
+                        self.path.rect(corners);
+                    }
                 }
             }
 
@@ -570,6 +705,24 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
     fn to_device(&self, x: f64, y: f64) -> (f32, f32) {
         let (dx, dy) = self.gs.current().ctm.transform_point(x, y);
         super::path::sanitize_point(dx, dy)
+    }
+
+    /// Reserves `points` against the current path object's
+    /// [`MAX_PATH_POINTS_PER_PATH`] budget (see
+    /// [`super::path::PathAccumulator::reserve_points`]) and returns
+    /// whether the caller should go ahead and actually add that geometry.
+    /// Emits [`RenderWarning::PathPointBudgetExceeded`] exactly once, the
+    /// first call that crosses the limit; every call after that for the
+    /// same path object returns `false` silently (already warned).
+    fn check_path_budget(&mut self, points: usize) -> bool {
+        match self.path.reserve_points(points) {
+            PathReserve::Ok => true,
+            PathReserve::JustExceeded => {
+                self.warn(RenderWarning::PathPointBudgetExceeded { max: MAX_PATH_POINTS_PER_PATH });
+                false
+            }
+            PathReserve::AlreadyOver => false,
+        }
     }
 
     fn apply_ext_gstate(&mut self, name: &str) {
@@ -934,6 +1087,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
             pending_clip: None,
             resources,
             warnings: &mut *self.warnings,
+            budget: &mut *self.budget,
             canvas_w: self.canvas_w,
             canvas_h: self.canvas_h,
             text_matrix: Matrix::identity(),
@@ -943,14 +1097,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
             form_depth: self.form_depth + 1,
         };
 
-        for item in parse_content_stream(&content) {
-            match item {
-                ContentItem::Op { operator, operands } => child.exec(&operator, &operands)?,
-                ContentItem::InlineImage(img) => child.show_inline_image(&img),
-                ContentItem::Raw(_) => child.warn(RenderWarning::TruncatedContentStream),
-            }
-        }
-        Ok(())
+        child.run_content(&content)
     }
 
     /// Renders a transparency-group Form XObject's content into a fresh,
@@ -1009,6 +1156,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
                 pending_clip: None,
                 resources,
                 warnings: &mut *self.warnings,
+                budget: &mut *self.budget,
                 canvas_w: self.canvas_w,
                 canvas_h: self.canvas_h,
                 text_matrix: Matrix::identity(),
@@ -1018,13 +1166,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
                 form_depth: self.form_depth + 1,
             };
 
-            for item in parse_content_stream(&content) {
-                match item {
-                    ContentItem::Op { operator, operands } => child.exec(&operator, &operands)?,
-                    ContentItem::InlineImage(img) => child.show_inline_image(&img),
-                    ContentItem::Raw(_) => child.warn(RenderWarning::TruncatedContentStream),
-                }
-            }
+            child.run_content(&content)?;
         }
 
         Ok(pixmap)
@@ -1387,6 +1529,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
             pending_clip: None,
             resources,
             warnings: &mut *self.warnings,
+            budget: &mut *self.budget,
             canvas_w: self.canvas_w,
             canvas_h: self.canvas_h,
             text_matrix: Matrix::identity(),
@@ -1396,14 +1539,7 @@ impl<'res, 'ctx> Interpreter<'res, 'ctx> {
             form_depth: self.form_depth,
         };
 
-        for item in parse_content_stream(proc_bytes) {
-            match item {
-                ContentItem::Op { operator, operands } => child.exec(&operator, &operands)?,
-                ContentItem::InlineImage(img) => child.show_inline_image(&img),
-                ContentItem::Raw(_) => child.warn(RenderWarning::TruncatedContentStream),
-            }
-        }
-        Ok(())
+        child.run_content(proc_bytes)
     }
 
     /// Finalizes the current path object (ISO 32000-1 8.5.3): paints it
@@ -1740,5 +1876,102 @@ mod tests {
         assert_eq!(line_cap_from_i64(1), tiny_skia::LineCap::Round);
         assert_eq!(line_cap_from_i64(2), tiny_skia::LineCap::Square);
         assert_eq!(line_cap_from_i64(99), tiny_skia::LineCap::Butt);
+    }
+
+    fn page() -> Rectangle {
+        Rectangle::new(0.0, 0.0, 200.0, 200.0)
+    }
+
+    /// Adversarial: a content stream consisting of a long, *flat* (never
+    /// nested) run of cheap operators exceeds a tiny operator budget and
+    /// fails with a structured [`NativeRenderError::OperatorBudgetExceeded`]
+    /// rather than running to completion (or, with the real production
+    /// default, than being unbounded) -- exactly the "very long but never
+    /// deeply nested" attack shape [`MAX_GRAPHICS_STATE_DEPTH`]/
+    /// [`MAX_FORM_XOBJECT_DEPTH`]/[`font::MAX_TYPE3_DEPTH`] don't bound.
+    #[test]
+    fn operator_budget_exceeded_is_a_structured_error_not_a_hang() {
+        let content = b"q Q ".repeat(1000);
+        let err = render_content_stream_with_limits(&content, 16, 16, page(), None, 10, MAX_RENDER_DURATION)
+            .expect_err("a content stream with 2000 operators must exceed a 10-operator budget");
+        assert_eq!(err, NativeRenderError::OperatorBudgetExceeded { max: 10 });
+    }
+
+    /// A content stream comfortably inside the operator budget still
+    /// renders normally (the budget is not so tight it breaks legitimate,
+    /// modestly-sized content).
+    #[test]
+    fn operator_budget_not_exceeded_renders_normally() {
+        let content = b"1 0 0 rg 10 10 20 20 re f";
+        let out = render_content_stream_with_limits(content, 16, 16, page(), None, 10_000, MAX_RENDER_DURATION)
+            .expect("well within budget");
+        assert!(out.warnings.is_empty());
+    }
+
+    /// Adversarial: even a content stream that would stay under the
+    /// operator-count budget can still be bounded by the wall-clock
+    /// budget -- a near-zero time budget must trip
+    /// [`NativeRenderError::RenderTimeBudgetExceeded`] rather than the
+    /// render running unbounded.
+    #[test]
+    fn render_time_budget_exceeded_is_a_structured_error_not_a_hang() {
+        let content = b"q Q ".repeat(100);
+        let err = render_content_stream_with_limits(&content, 16, 16, page(), None, MAX_OPERATOR_COUNT, Duration::from_nanos(1))
+            .expect_err("a near-zero time budget must be exceeded almost immediately");
+        assert!(matches!(err, NativeRenderError::RenderTimeBudgetExceeded { .. }));
+    }
+
+    /// A self-referential Form XObject (see the dedicated definition-of-
+    /// done test in `native::mod`'s test suite for the full scenario)
+    /// hitting [`MAX_FORM_XOBJECT_DEPTH`] does not, by itself, exhaust the
+    /// *operator* budget too -- the two limits are independent and this
+    /// confirms the recursion-depth guard alone is what stops it well
+    /// before millions of operators would need to run.
+    #[test]
+    fn form_xobject_recursion_guard_does_not_need_the_operator_budget_to_stop_it() {
+        use crate::object::{Object, PdfArray, PdfDictionary, PdfName, PdfStream};
+
+        let mut form_dict = PdfDictionary::new();
+        form_dict.set("Subtype", Object::Name(PdfName::new_unchecked("Form")));
+        form_dict.set(
+            "BBox",
+            Object::Array(PdfArray::from_objects(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(200.0),
+                Object::Real(200.0),
+            ])),
+        );
+        let form_stream = PdfStream::with_dictionary(form_dict, b"/Rec Do".to_vec());
+
+        let mut xobjects = PdfDictionary::new();
+        xobjects.set("Rec", Object::Stream(form_stream));
+        let mut resources = PdfDictionary::new();
+        resources.set("XObject", Object::Dictionary(xobjects));
+
+        let content = b"/Rec Do";
+        // A tight operator budget that would be exceeded if the
+        // recursion guard *weren't* what stopped this first: each `Do`
+        // invocation is one operator, and `MAX_FORM_XOBJECT_DEPTH` (12)
+        // is far below this budget of 1000.
+        let out = render_content_stream_with_limits(content, 16, 16, page(), Some(&resources), 1000, MAX_RENDER_DURATION)
+            .expect("recursion depth guard must stop this well within the operator budget");
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| matches!(w, RenderWarning::FormXObjectRecursionLimitExceeded)));
+    }
+
+    /// Fuzz-found regression (`render_interpreter` cargo-fuzz target, see
+    /// `path::MAX_COORDINATE_MAGNITUDE`'s docs): a path with one
+    /// finite-but-absurdly-large coordinate no longer trips `tiny-skia`'s
+    /// internal panic on out-of-range magnitude -- it renders successfully
+    /// (the huge coordinate is clamped in device space, so the resulting
+    /// shape is degenerate but the render itself completes normally).
+    #[test]
+    fn extreme_finite_path_coordinate_does_not_panic() {
+        let content = b"0 0 m 0 16666666660 l 10 10 l f";
+        let out = render_content_stream(content, 32, 32, page(), None).expect("must not panic on an extreme finite coordinate");
+        assert!(out.warnings.is_empty());
     }
 }

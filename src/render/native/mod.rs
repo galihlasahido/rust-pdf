@@ -268,10 +268,27 @@
 //!   of millions of unsupported operators can't itself force unbounded
 //!   allocation;
 //! - sanitizes non-finite (`NaN`/`Infinity`) coordinates to a finite
-//!   fallback before they reach the rasterizer (see
-//!   `path::sanitize_point`); `tiny-skia` itself additionally refuses
-//!   (logs and no-ops, does not panic) to rasterize path geometry whose
-//!   magnitude would overflow its internal math.
+//!   fallback, **and** clamps any finite-but-absurdly-large coordinate
+//!   magnitude, before either reaches the rasterizer (see
+//!   `path::sanitize_point`/`path::MAX_COORDINATE_MAGNITUDE`). The
+//!   magnitude clamp exists because -- contrary to what this section
+//!   previously (incorrectly) claimed -- `tiny-skia` does **not** always
+//!   gracefully refuse geometry whose magnitude overflows its internal
+//!   math: the "Security Hardening" phase's `render_interpreter`
+//!   cargo-fuzz target found a small content stream with one huge-but-
+//!   finite path coordinate that trips an internal `assert!` in
+//!   `tiny_skia::scan::path::fill_path_impl` and aborts the process. See
+//!   `path::MAX_COORDINATE_MAGNITUDE`'s docs and `docs/THREAT_MODEL.md`
+//!   for the full account of that finding and this crate's defensive
+//!   clamp (in this crate's own code, not a patch to `tiny-skia` itself)
+//!   that closes it;
+//! - bounds the total operator/inline-image count and wall-clock time
+//!   spent interpreting one render
+//!   ([`interpreter::MAX_OPERATOR_COUNT`]/[`interpreter::MAX_RENDER_DURATION`])
+//!   against a content stream that is very long but never deeply nested
+//!   (so none of the recursion-depth caps above would otherwise bound it),
+//!   and bounds the number of points a single path object may accumulate
+//!   (`path::MAX_PATH_POINTS_PER_PATH`) independent of that operator count.
 //!
 //! # Example
 //!

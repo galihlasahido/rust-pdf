@@ -13,7 +13,11 @@ libfuzzer-sys = "0.4"
 [dependencies.rust-pdf]
 path = ".."
 default-features = false
-features = ["parser", "fonts"]
+# `native-render` (pure-Rust content-stream interpreter/rasterizer, no
+# native/FFI dependency) is needed by the `render_interpreter` target;
+# pulling it in here does not change the other targets' behavior (Cargo
+# feature unification is additive within one crate's dependency graph).
+features = ["parser", "fonts", "native-render"]
 
 [[bin]]
 name = "parse_pdf"
@@ -39,6 +43,13 @@ bench = false
 [[bin]]
 name = "font_load"
 path = "fuzz_targets/font_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "render_interpreter"
+path = "fuzz_targets/render_interpreter.rs"
 test = false
 doc = false
 bench = false

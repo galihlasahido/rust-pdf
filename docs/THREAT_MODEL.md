@@ -191,6 +191,46 @@ documented warning or placeholder, never a panic or a silently blank/
 wrong render -- see `src/render/native/mod.rs`'s "Explicit, honest gaps"
 section for the exhaustive, currently-accurate list.
 
+**Note for reviewers auditing this document against an older copy:** an
+earlier version of this section had a row/entry for `ffi_lock`, the
+process-wide `Mutex` the old Pdfium binding required (Pdfium's C API was
+not safe to call concurrently) plus the `ManuallyDrop`/custom `Drop`
+ordering built around it. That entry is **removed, not merely reworded**
+-- it no longer describes anything that exists in this crate. There is no
+process-wide native-library lock of any kind in the current renderer (see
+the bolded paragraph above): every `PdfRenderer` instance is a plain,
+independent, `Send + Sync` Rust value with its own state, and concurrent
+renders across multiple instances need no synchronization this crate
+imposes. `ARCHITECTURE.md` §8/§8c is the historical record of that earlier
+design (per this document's own scope note in §1) and is intentionally
+left describing `ffi_lock` as it was; this document, describing the
+*current* system, must not.
+
+#### 4.6a Content-stream interpreter attack surface (Security Hardening phase)
+
+**Why this is new attack surface, not just a relocation of Pdfium's old
+one.** Pdfium is Google Chrome's PDF engine, fuzzed continuously at Google
+for years before this crate ever linked it; whatever this crate's
+`render` feature exercised through Pdfium inherited that history. This
+crate's own content-stream interpreter (`render::native::interpreter`,
+§4.6 above) has none of it -- it is new code, parsing/executing the exact
+same untrusted, attacker-controlled operator stream (ISO 32000-1:2008
+7.8.2) Pdfium used to, but with only as much adversarial testing as this
+crate's own fuzzing has given it so far. This subsection is the risk
+register specifically for *that* surface: an attacker who can embed a
+crafted content stream (a page's own, or a Form XObject's, or a Type 3
+glyph procedure's) into a PDF this process opens for rendering.
+
+| Risk | Mitigation | Residual risk |
+|---|---|---|
+| Deeply-nested `q`/`Q` save/restore forcing unbounded graphics-state-stack growth | `MAX_GRAPHICS_STATE_DEPTH = 4096` (`interpreter.rs`), enforced on every `q`; returns `NativeRenderError::GraphicsStateStackOverflow` | None known |
+| Self-referential or mutually-recursive Form XObjects (a Form's content stream invoking itself, or a cycle of several, via `Do`) | `MAX_FORM_XOBJECT_DEPTH = 12` (`interpreter.rs`), shared across direct `Do`, transparency-group, and ExtGState `/SMask` group recursion; recorded as `RenderWarning::FormXObjectRecursionLimitExceeded`, that branch's rendering stops rather than recursing further | None known -- covered by both a unit test (`self_referential_form_xobject_is_bounded_not_infinite`) and, this phase, the `render_interpreter` fuzz target's fixed hostile `/Resources` (mutually-recursive `/RecA`/`/RecB` Form XObjects, see §5) |
+| Self-referential Type 3 glyph procedure (a `CharProc` showing text with its own font, directly or through a cycle) | `MAX_TYPE3_DEPTH = 6` (`font.rs`), independent counter from the Form depth above but checked at every glyph paint; `RenderWarning::Type3RecursionLimitExceeded` | None known -- `type3_self_referential_charproc_is_bounded_not_infinite` unit test, plus the fuzz target's self-referential `/T3` font |
+| A content stream that is very long but *never* nested/recursive at all (e.g. millions of flat `q Q` pairs, or millions of path-construction operators), which none of the three depth caps above bound since depth never actually grows | **New this phase:** `MAX_OPERATOR_COUNT = 2_000_000` (`interpreter.rs`), a running total shared across the top-level content stream and every nested Form XObject/Type 3/transparency-group render (one `RenderBudget`, reborrowed through the recursion the same way `pixmap`/`warnings` are); exceeding it aborts the render with `NativeRenderError::OperatorBudgetExceeded` rather than continuing indefinitely | None known -- `operator_budget_exceeded_is_a_structured_error_not_a_hang` unit test |
+| Input whose *cost per operator*, not operator count, is what makes it pathological (e.g. a legal, modest operator count that nonetheless does expensive per-operator work) | **New this phase:** `MAX_RENDER_DURATION = 20s` wall-clock budget (`interpreter.rs`), checked alongside the operator count on every content-stream item; `NativeRenderError::RenderTimeBudgetExceeded` | Coarser than the other bounds by nature (wall-clock, not a deterministic count) -- generous enough that no legitimate render should hit it, but a heavily-loaded host process could in principle see it trip closer to the margin than on idle hardware; accepted, since the alternative (no time bound at all) is strictly worse |
+| A single path object (between one path-painting operator and the next) accumulating unbounded points from a long run of `l`/`c` construction operators with no intervening paint | **New this phase:** `MAX_PATH_POINTS_PER_PATH = 1_000_000` (`path.rs`), reserved incrementally per path object and reset at the next path-painting operator; further construction on an over-budget path is dropped (not the whole render), `RenderWarning::PathPointBudgetExceeded` recorded once | None known |
+| **Found during this phase** via the `render_interpreter` fuzz target: a path with one finite-but-absurdly-large coordinate (reachable from an ordinary content stream via a huge literal operand, or a `cm` scale factor applied to an ordinary one) trips an internal `assert!` in `tiny_skia::scan::path::fill_path_impl` (`edges[curr_idx].last_y >= curr_y as i32`) and aborts the process -- **`tiny-skia` itself does not always gracefully refuse out-of-range geometry**, contradicting what this crate's own `render::native` module docs previously (incorrectly) claimed | `path::sanitize_point` now clamps every device-space coordinate's magnitude to `MAX_COORDINATE_MAGNITUDE = 1_000_000.0` (empirically well below the confirmed-safe `1e10` and confirmed-crashing `1e11` from bisecting this finding), in addition to its pre-existing `NaN`/`Infinity` sanitization -- same architecture as the `ttf-parser` `catch_unwind` mitigation in §4.3: a defensive clamp in this crate's own code at the boundary into a dependency, not a patch to the dependency itself. Regression test: `extreme_finite_path_coordinate_does_not_panic` (interpreter-level) and `sanitize_point_clamps_extreme_finite_magnitude` (unit-level) | **Medium, accepted for now, same posture as the `ttf-parser` entry in §4.3.** `tiny-skia`'s own internal fixed-point/scanline conversion evidently has other undocumented magnitude limits beyond the one bisected here; the clamp closes the *specific* reachable path (device-space coordinates from content-stream operands/CTM), but a coordinate reaching `tiny-skia` through some other, not-yet-audited path in this crate (e.g. a glyph outline scaled by an extreme `/FontMatrix`, or an extreme image transform) could in principle still exceed a similar internal limit through a code path this pass didn't specifically re-verify against the clamp. Re-review trigger: any further `render_interpreter` fuzz crash inside `tiny-skia` itself (as opposed to this crate's own code) should get its coordinate source added to `sanitize_point`'s call sites (already used by `to_device`, glyph outline conversion, `paint_placeholder_rect`, and `form_bbox_mask` -- see `path.rs`'s call sites) or, if genuinely unreachable through that helper, its own dedicated clamp |
+
 ### 4.7 Signatures / encryption (`src/signatures/*`, `src/encryption/*`)
 
 `MAX_CHAIN_DEPTH = 16` (certificate chain, `signatures/chain.rs:38`),
@@ -206,7 +246,7 @@ version exists).
 
 ## 5. Fuzzing
 
-Four permanent `cargo fuzz` targets live in `fuzz/fuzz_targets/`, each
+Five permanent `cargo fuzz` targets live in `fuzz/fuzz_targets/`, each
 gated to the minimal feature set it needs (`fuzz/Cargo.toml`):
 
 | Target | Exercises | Corpus |
@@ -215,6 +255,7 @@ gated to the minimal feature set it needs (`fuzz/Cargo.toml`):
 | `parse_inline_image` | Inline-image (`BI`/`ID`/`EI`) content-stream operator parsing | `fuzz/corpus/parse_inline_image/` |
 | `decode_filters` | `filter::decode_filter` over all supported filter names/params | `fuzz/corpus/decode_filters/` |
 | `font_load` | `font::truetype::TrueTypeFont::load` (added this phase) | `fuzz/corpus/font_load/` |
+| `render_interpreter` | `render::native::render_content_stream` (`native-render` feature) -- the content-stream interpreter itself, driven directly rather than via full-document parsing, against a fixed hostile `/Resources` (mutually-recursive Form XObjects, a self-referential Type 3 font, a self-referential ExtGState `/SMask` group) so fuzzer-mutated bytes can reach every recursive construct without wasting mutation budget on dictionary syntax `parse_pdf` already covers. Added in the "Security Hardening" phase specifically because this interpreter is new attack surface Pdfium's own fuzzing history never covered (see §4.6a) | `fuzz/corpus/render_interpreter/` |
 
 Run locally (requires nightly, already installed in this environment):
 
@@ -223,7 +264,7 @@ cargo +nightly fuzz build <target>          # smoke-check it still compiles
 cargo +nightly fuzz run <target> -- -max_total_time=<seconds>
 ```
 
-All four targets were confirmed to build cleanly during this phase. Running
+All five targets were confirmed to build cleanly during this phase. Running
 `font_load` for even ~20 seconds reproduced a real crash (§4.3), which is
 exactly the intended purpose of "permanent" fuzz targets: they are meant to
 be re-run periodically (not just built once), since new inputs keep
@@ -234,11 +275,26 @@ given crash triage takes human judgement) fuzz job into CI is recommended
 follow-up but out of scope for this pass (no `.github/workflows/` exists in
 this repository at all yet).
 
+`render_interpreter` also reproduced a real crash within its first ~5,700
+executions of its first run (a finite-but-absurdly-large path coordinate
+tripping an internal `tiny-skia` panic, §4.6a) -- fixed and covered by a
+regression test the same phase it was found. A follow-up run of a clean
+250,000 iterations (`cargo +nightly fuzz run render_interpreter --
+-runs=250000 -max_len=65536 -timeout=25`, corpus seeded with hand-written
+examples of every attack shape named in this phase's task: deep `q`/`Q`
+nesting, path-operator floods, `Do`/`Tf`/`gs` invocations of the hostile
+resources) completed with **`Done 250000 runs in 145 second(s)`, zero
+crashes, zero timeouts, zero new artifacts** after that fix landed --
+satisfying this phase's "≥200,000 iterations, no crash" definition of
+done. Corpus coverage grew to 5637 edges / 2391 corpus entries over that
+run, per libFuzzer's own coverage counters.
+
 Crash triage process: a crash found by any target should (1) get a minimal
 reproducer via `cargo fuzz tmin`, (2) get a regression test added at the
-library level (see `malformed_ttc_offset_overflow_does_not_panic` and
-`tiff_predictor_huge_declared_columns_does_not_bomb` for the pattern), (3)
-get a one-line mention added to this document's §4 if it reveals a new
+library level (see `malformed_ttc_offset_overflow_does_not_panic`,
+`tiff_predictor_huge_declared_columns_does_not_bomb`, and (this phase)
+`extreme_finite_path_coordinate_does_not_panic` for the pattern), (3) get a
+one-line mention added to this document's §4 if it reveals a new
 residual-risk category rather than reconfirming an existing one.
 
 ## 6. Resource limits — full inventory
@@ -272,6 +328,14 @@ depths in this crate, as of this phase (`grep -rn "^pub const MAX_\|^const MAX_"
 | `MAX_AUDIT_LOG_BYTES` / `MAX_AUDIT_ENTRIES` / `MAX_FIELD_BYTES` | 8 MiB / 100,000 / 64 KiB | `editor/audit.rs` |
 | `MAX_CID_WIDTH_RANGE` / `MAX_CID_WIDTH_ENTRIES` | 70,000 / 500,000 | `editor/redact.rs` |
 | `MAX_RENDER_PIXELS` | 64,000,000 | `render/mod.rs` |
+| `MAX_GRAPHICS_STATE_DEPTH` | 4096 | `render/native/interpreter.rs` |
+| `MAX_FORM_XOBJECT_DEPTH` | 12 | `render/native/interpreter.rs` |
+| `MAX_TYPE3_DEPTH` | 6 | `render/native/font.rs` |
+| `MAX_WARNINGS` | 1000 | `render/native/interpreter.rs` |
+| `MAX_OPERATOR_COUNT` | 2,000,000 (new this phase) | `render/native/interpreter.rs` |
+| `MAX_RENDER_DURATION` | 20s wall-clock (new this phase) | `render/native/interpreter.rs` |
+| `MAX_PATH_POINTS_PER_PATH` | 1,000,000 (new this phase) | `render/native/path.rs` |
+| `MAX_COORDINATE_MAGNITUDE` | 1,000,000.0 device-space units (new this phase, fuzz-found) | `render/native/path.rs` |
 | `MAX_CHAIN_DEPTH` | 16 | `signatures/chain.rs` |
 | `MAX_DSS_OBJECTS` | 4096 | `signatures/dss.rs` |
 | `MAX_SIGNATURE_SIZE` / `MAX_RESPONSE_LEN` | 1 MiB / 1 MiB | `signatures/signer.rs`, `signatures/timestamp.rs` |

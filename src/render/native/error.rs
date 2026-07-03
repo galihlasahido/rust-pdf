@@ -67,6 +67,40 @@ pub enum NativeRenderError {
         /// The configured maximum depth.
         max: usize,
     },
+
+    /// The total number of content-stream operators/inline-images
+    /// executed by this render -- summed across the top-level content
+    /// stream *and* every Form XObject / Type 3 glyph procedure /
+    /// transparency-group recursion it triggers (they all share one
+    /// running counter, see [`super::interpreter::RenderBudget`]) --
+    /// exceeded [`super::interpreter::MAX_OPERATOR_COUNT`]. A well-formed
+    /// page's content stream, even a genuinely complex one, has no
+    /// business anywhere near this many operators; this bounds a crafted
+    /// content stream's ability to hang the interpreter with an
+    /// operator-count-based attack that never overflows any single stack
+    /// depth (e.g. a very long, but never deeply-nested, flood of `q Q`
+    /// or path-construction operators).
+    #[error(
+        "content-stream operator budget exceeded {max} (crafted/corrupt content stream?)"
+    )]
+    OperatorBudgetExceeded {
+        /// The configured maximum operator count.
+        max: usize,
+    },
+
+    /// Wall-clock time spent interpreting this render exceeded
+    /// [`super::interpreter::MAX_RENDER_DURATION`]. This is the backstop
+    /// for pathological inputs that are *not* well-described by any of the
+    /// other bounded counters above -- e.g. a content stream that is
+    /// legal and under every other limit, but combines several expensive
+    /// operations (large paths, many glyphs, deep-but-legal transparency
+    /// nesting) in a way whose *wall-clock cost*, not any single count, is
+    /// what actually matters to a caller with a render-time SLA.
+    #[error("render exceeded its {max_millis}ms time budget (crafted/corrupt or pathologically expensive content stream?)")]
+    RenderTimeBudgetExceeded {
+        /// The configured maximum render duration, in milliseconds.
+        max_millis: u64,
+    },
 }
 
 /// A recoverable condition encountered while interpreting a content
@@ -274,6 +308,22 @@ pub enum RenderWarning {
         /// Human-readable failure reason.
         reason: String,
     },
+    /// A single path object (ISO 32000-1 8.5.2: everything since the last
+    /// path-painting operator) accumulated more points than
+    /// [`super::path::MAX_PATH_POINTS_PER_PATH`] -- e.g. a content stream
+    /// consisting of an enormous run of `l`/`c` operators with no
+    /// intervening painting operator (untrusted/adversarial input; a
+    /// well-formed page's single path object never needs anywhere near
+    /// this many points). Recorded once per offending path object; every
+    /// further construction call against that same path object is
+    /// silently dropped (the path keeps whatever geometry it had
+    /// accumulated up to the limit and is still painted/clipped normally
+    /// with that truncated geometry when a painting operator eventually
+    /// runs, rather than the whole render aborting).
+    PathPointBudgetExceeded {
+        /// The configured maximum point count for one path object.
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for RenderWarning {
@@ -341,6 +391,9 @@ impl std::fmt::Display for RenderWarning {
             }
             RenderWarning::ImageSoftMaskDecodeFailed { name, reason } => {
                 write!(f, "image /{name} /SMask could not be decoded ({reason}), base image painted fully opaque")
+            }
+            RenderWarning::PathPointBudgetExceeded { max } => {
+                write!(f, "path object exceeded {max} points, further construction on it dropped")
             }
         }
     }
