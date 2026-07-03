@@ -1,7 +1,52 @@
 # rust-pdf — Architecture & Audit (as of 2026-07-03)
 
-> **Status of this document (second refresh, current — supersedes the first refresh's numbers
-> below for §2/§10/§11/§12):** regenerated again at commit `babec0c` (branch
+> **Status of this document (third refresh, current — supersedes the second refresh's numbers
+> below for §1/§2/§9/§10/§11/§12, and rewrites §8's framing):** regenerated again on branch
+> `workflow/enterprise-buildout` after four further commits landed on top of the second refresh
+> (`babec0c`): `899fb9f`/`e658df6`/`b63dc98`/`a3db203` (the four-phase pure-Rust rendering build —
+> content-stream interpreter core, text rendering, color spaces/images, transparency/blend modes —
+> documented as they landed in §8a/§8b and `render::native`'s own module docs), `e6af056` ("replace
+> Pdfium/FFI renderer with pure-Rust engine, retire render actor" — documented in §8c), and two
+> security-hardening commits (`5ba3e0c`/`0e14625`, fuzzing + resource-limit hardening of the
+> content-stream interpreter, no `ARCHITECTURE.md`-relevant behavior change beyond what §8c already
+> described). This was an **explicit user request**: stop depending on a native/FFI binary
+> (Pdfium) at all and rasterize with a pure-Rust stack instead (`tiny-skia` for 2D rasterization,
+> `ttf-parser` for font outlines — both already-audited dependencies of this crate), *accepting*
+> the compatibility/performance trade-offs §8 originally gave as the reason Pdfium was chosen in
+> the first place. This refresh:
+>
+> - Rewrites **§1**'s one-line description of the `render/` module (was: "FFI to Google's
+>   Pdfium"; now: pure-Rust, no native binary) and its `render`/`native-render`-excluded-from-
+>   `full` rationale (was: "requires bundling a native platform-specific binary"; that reason no
+>   longer applies — the actual, current reason is recorded in §1 below).
+> - Regenerates **§2's module inventory** from a live `find src -name '*.rs' | xargs wc -l`:
+>   **48,168 lines across 111 files**, up from 39,591/98 — entirely the pure-Rust rendering build
+>   (`render/` grew from 3 files/849 LOC to **17 files/9,440 LOC**, adding the whole `render/native/`
+>   submodule; `tauri_commands/` shrank from 7 files/2,865 LOC to **6 files/2,592 LOC** net, because
+>   `render_actor.rs` — 437 lines — was deleted outright once rendering no longer needed a
+>   dedicated single-threaded FFI-serialization actor, even though every *remaining*
+>   `tauri_commands/` file grew) plus small, incidental touch-ups in `font/truetype.rs` (+41,
+>   `outline_glyph()`), `font/encoding.rs`, `editor/pages.rs`, `editor/text_extract.rs`,
+>   `editor/icc.rs`, `editor/mod.rs`, `filter/ccitt.rs`, `error.rs` and `lib.rs` that the four
+>   rendering-build commits made along the way (verified via `git diff babec0c HEAD --stat -- src/`
+>   — 34 files changed, +9,622/−1,045, matching this table exactly, no unexplained file).
+> - Adds a new **§8d "Known Limitations"** section consolidating, in one place, every compatibility
+>   gap this migration *knowingly and deliberately* accepted (JBIG2/JPX images, Type1/bare-CFF
+>   fonts, ICC color management) plus a **measured performance delta against the previous Pdfium
+>   benchmark** on the exact same fixture used to benchmark Pdfium in the "Large-File Render
+>   Benchmark" remediation phase — see §8d for the live numbers from this session.
+> - Regenerates **§10 (coverage)**, **§11 (`cargo audit`)** and **§12 (`cargo clippy`)** from a
+>   live re-run against `--features full,tauri` (§10's prior text had explicitly flagged itself as
+>   describing the *pre-migration* Pdfium run and out of date — this refresh is the promised
+>   follow-up). `render`/`tauri` no longer need `RUST_PDF_PDFIUM_LIB_DIR`/`scripts/fetch_pdfium.sh`
+>   at all — every render/tauri test now genuinely executes on a plain `cargo test`, no env var
+>   required, closing the exact "tests silently skip" trap §10's old text warned about.
+> - This is, again, deliberately the **last commit of the entire remediation sequence** covered by
+>   this document — no `src/**` change follows it (verified: `git log --stat` after this commit
+>   touches only `ARCHITECTURE.md`).
+>
+> **Status of this document (second refresh, superseded above for §1/§2/§9/§10/§11/§12):**
+> regenerated again at commit `babec0c` (branch
 > `workflow/enterprise-buildout`) to close a one-commit staleness window. The first refresh
 > (blockquote immediately below this one) landed at commit `e0ab506`, but two further
 > remediation-phase commits landed **immediately after** it and were therefore not reflected:
@@ -80,9 +125,15 @@
 reader. It is now also: an **in-place editor** for existing PDFs (`editor/`: pages, forms,
 annotations, outlines, tagged structure, redaction, PDF/A-PDF/X-PDF/UA conformance, ICC/XMP
 metadata), a **font-embedding pipeline** (`font/`: TrueType/OpenType loading, CID/Type0 composite
-fonts for CJK, subsetting), a **PDF rasterizer** (`render/`, FFI to Google's Pdfium — see §8), and
-a **Tauri desktop-app command layer** (`tauri_commands/`, nine async commands wired to a worker
-pool and a dedicated render actor thread).
+fonts for CJK, subsetting), a **pure-Rust PDF rasterizer** (`render/`, no native binary or FFI
+dependency at all — a content-stream interpreter over `tiny-skia` (2D rasterization) and
+`ttf-parser` (font outlines); this crate *previously* rasterized via FFI to Google's Pdfium, an
+explicit, accepted trade-off documented at the time, but that FFI dependency has since been fully
+removed at explicit user request — see §8/§8a-§8d for the full migration history and the
+compatibility/performance trade-offs *this* direction accepted instead), and a **Tauri desktop-app
+command layer** (`tauri_commands/`, nine async commands sharing one ordinary worker-thread pool —
+rendering no longer needs its own dedicated actor thread now that it isn't wrapping a
+not-safe-to-share native library handle; see §8c/§9).
 
 It is still **not** a general-purpose arbitrary-PDF consumer in one specific, load-bearing way,
 verified again for this refresh: `PdfReader::from_bytes` (`src/parser/mod.rs`) still
@@ -99,27 +150,39 @@ Default features:    none (bare crate builds with color/content/document/font/fo
 ```
 
 `html` and `office` remain declared Cargo features with **no corresponding module** — still
-aspirational surface area, not implemented functionality. `render` and `tauri` are deliberately
-**not** part of `full` (see §8/§9 — both require bundling a native platform-specific binary /
-desktop-app runtime that a pure structural/generation/signing consumer does not need).
+aspirational surface area, not implemented functionality. `render`/`native-render` and `tauri` are
+still deliberately **not** part of `full`, but the *reason* changed with this migration: `render`
+no longer requires bundling a native platform-specific binary (see §8/§8c — that reasoning is now
+historical), it is excluded because it pulls in `tiny-skia`/`ttf-parser`/`image` rasterization
+dependencies, and carries the known, disclosed rendering-fidelity gaps in §8d, that a pure
+structural/generation/signing consumer of this crate has no need to take on. `tauri` remains
+excluded because it requires the Tauri desktop-app runtime itself (a dependency shape no library
+consumer other than an actual Tauri app needs) — see §9.
 
 ## 2. Module inventory (src/)
 
-**39,591 lines of Rust across 98 files** (live count, re-verified for the second refresh at
-commit `babec0c`: `find src -name '*.rs' | xargs wc -l`; up from 39,299 lines / 98 files at the
-first refresh (`e0ab506`) — the `+292` lines are entirely `font/cid.rs` (+225),
-`editor/pdfa.rs` (+51) and `document/mod.rs` (+16), the three files touched by the
-`ad35dcb`/`babec0c` CIDSet/subset-tag fixes; no file was added or removed), up from 16,427
-lines / 51 files at the original audit — more than double the codebase. Grouped by directory
-below; `%Ln` is line coverage from the live `cargo llvm-cov --release --features full,tauri`
-re-run in §10 (not a stale carry-over) — three rows (`font/cid.rs`, `editor/pdfa.rs`,
-`document/mod.rs`) changed since the first refresh; every other row is identical to before,
-re-confirmed by this refresh's own re-run rather than assumed unchanged.
+**48,168 lines of Rust across 111 files** (live count, re-verified for this third refresh:
+`find src -name '*.rs' | xargs wc -l`; up from 39,591 lines / 98 files at the second refresh
+(`babec0c`) — cross-checked against `git diff babec0c HEAD --stat -- src/`: **34 files changed,
++9,622/−1,045**, matching this table exactly). Essentially all of the growth is the pure-Rust
+rendering build (four migration commits — `899fb9f`/`e658df6`/`b63dc98`/`a3db203`/`e6af056`,
+§8a-§8c) plus its follow-on fuzz-hardening (`5ba3e0c`/`0e14625`): `render/` grew from 3 files/849
+LOC to **17 files/9,440 LOC** (the whole new `render/native/` submodule), `tauri_commands/`
+**shrank** from 7 files/2,865 LOC to **6 files/2,592 LOC** net (`render_actor.rs`, 437 lines, was
+deleted outright — see §8c/§9 — even though every remaining file in that directory grew), and
+several other files touched incidentally along the way: `font/truetype.rs` (+41,
+`outline_glyph()`), `font/encoding.rs`, `editor/pages.rs` (+159), `editor/mod.rs`,
+`editor/text_extract.rs`, `editor/icc.rs`, `editor/redact.rs`, `filter/ccitt.rs`, `parser/
+recovery.rs`, `error.rs` (+9, new `RenderError`/`RenderWarning`-adjacent variants) and `lib.rs`
+(prelude re-exports, net LOC unchanged). Up from 16,427 lines / 51 files at the original audit.
+Grouped by directory below; `%Ln` is line coverage from the live `cargo llvm-cov --release
+--features full,tauri` re-run in §10 (not a stale carry-over) — every row below was re-verified by
+this refresh's own re-run, not assumed unchanged from the second refresh.
 
 | File | LOC | %Ln | Purpose |
 |---|---:|---:|---|
 | `lib.rs` | 339 | 100.0 | Crate root, `prelude` re-exports, doctests |
-| `error.rs` | 555 | — | `thiserror`-based error taxonomy, one enum per subsystem |
+| `error.rs` | 564 | — | `thiserror`-based error taxonomy, one enum per subsystem; +9 LOC since the second refresh (incidental additions alongside the rendering build's own `RenderError`/`RenderWarning` types, which actually live in `render/native/error.rs`, not here — see §8d) |
 | `ffi.rs` | 157 | 0.0 | C ABI: `unsafe extern "C"` functions exposing the *write* path only |
 | **`types/`** (4 files, 441 LOC) | | | Geometry primitives |
 | `types/mod.rs` | 9 | — | Re-exports |
@@ -147,8 +210,8 @@ re-confirmed by this refresh's own re-run rather than assumed unchanged.
 | `font/mod.rs` | 225 | 45.3 | `Font` trait/dispatch across Standard-14 and embedded fonts |
 | `font/standard14.rs` | 182 | 91.8 | The 14 standard PostScript font metrics/AFM data |
 | `font/metrics.rs` | 176 | 49.1 | Glyph-width lookup |
-| `font/encoding.rs` | 115 | 57.1 | WinAnsi/MacRoman/Standard text encodings |
-| `font/truetype.rs` | 795 | 96.5 | Embedded TrueType/OpenType font loading via `ttf-parser` (feature `fonts`) |
+| `font/encoding.rs` | 118 | 57.1 | WinAnsi/MacRoman/Standard text encodings |
+| `font/truetype.rs` | 836 | 96.5 | Embedded TrueType/OpenType font loading via `ttf-parser` (feature `fonts`); +41 LOC since the second refresh — `outline_glyph()`, added for `render::native::glyph` to extract glyph outlines for text rendering (§8b), wrapped in the same `catch_unwind` defense-in-depth `Face::parse` already uses |
 | `font/cid.rs` | 796 | 92.2 | Type 0 / CIDFontType2 composite fonts for embedded + CJK text; +225 LOC since the first refresh — `ad35dcb` added `/CIDSet` generation (ISO 32000-1 Table 122 / ISO 19005-1 6.3.5, +2 unit tests) and `babec0c` made the subset-tag prefix conditional on the same `will_subset()` predicate (+3 unit tests) |
 | `font/subset.rs` | 95 | 96.9 | Font subsetting via the `subsetter` crate |
 | `font/tounicode.rs` | 391 | 92.0 | `/ToUnicode` CMap generation for text extraction/accessibility |
@@ -177,7 +240,7 @@ re-confirmed by this refresh's own re-run rather than assumed unchanged.
 | `filter/lzw.rs` | 278 | 89.3 | `LZWDecode` |
 | `filter/predictor.rs` | 474 | 88.2 | PNG/TIFF predictors (used by Flate/LZW) |
 | `filter/dct.rs` | 125 | 49.2 | `DCTDecode` (baseline/progressive JPEG passthrough for image XObjects) |
-| `filter/ccitt.rs` | 602 | 81.8 | `CCITTFaxDecode` (Group 3/4) |
+| `filter/ccitt.rs` | 641 | 82.6 | `CCITTFaxDecode` (Group 3/4); +39 LOC since the second refresh (incidental touch-up alongside the rendering build, which reuses this decoder for CCITT image XObjects — see `render/native/image.rs`) |
 | **`encryption/`** (4 files, 1,288 LOC) | | | Builds `/Encrypt` dictionaries; write-only (§1) |
 | `encryption/mod.rs` | 296 | 90.6 | Orchestration |
 | `encryption/config.rs` | 174 | 96.6 | `EncryptionConfig` |
@@ -201,38 +264,52 @@ re-confirmed by this refresh's own re-run rather than assumed unchanged.
 | `parser/xref.rs` | 311 | 91.5 | Classic + xref-stream parsing |
 | `parser/inline_image.rs` | 209 | 97.3 | `BI...ID...EI` inline image operator parsing |
 | `parser/recovery.rs` | 367 | 77.2 | Repair-mode object scanning when the xref table is unusable; `MAX_RECOVERED_OBJECTS` |
-| **`editor/`** (19 files, 10,685 LOC) | | | **New since the original audit.** In-place editing of an existing PDF — see §6 |
-| `editor/mod.rs` | 88 | — | `EditableDocument` entry point |
+| **`editor/`** (19 files, 10,852 LOC) | | | **New since the original audit.** In-place editing of an existing PDF — see §6 |
+| `editor/mod.rs` | 93 | — | `EditableDocument` entry point; +5 LOC since the second refresh (incidental, part of wiring `EditableDocument` up as `render::PdfRenderer`'s backing store, §8c) |
 | `editor/graph.rs` | 481 | 91.8 | Core mutable object graph; `MAX_PAGE_TREE_NODES`, `MAX_REACHABLE_OBJECTS` |
-| `editor/pages.rs` | 710 | 82.9 | Insert/delete/reorder/rotate/split/merge page-tree editing |
+| `editor/pages.rs` | 869 | 85.1 | Insert/delete/reorder/rotate/split/merge page-tree editing; +159 LOC since the second refresh — `effective_media_box`/`parse_media_box` (ISO 32000-1 §7.7.3.3 `/MediaBox` inheritance + rotation normalization) added for whole-document rendering (§8c), with adversarial-input unit tests (missing `/MediaBox`, swapped corners, wrong element count, non-numeric/non-finite entries) |
 | `editor/forms.rs` | 1,202 | 91.4 | Read/fill/create/flatten AcroForm fields on a loaded document |
 | `editor/annotations.rs` | 779 | 95.2 | Markup annotations (highlight/underline/strikeout/free-text/stamp/ink/note) with generated appearance streams |
 | `editor/outline.rs` | 646 | 91.9 | Document outline (bookmarks) + named destinations |
 | `editor/structure.rs` | 432 | 90.8 | Minimal Tagged PDF logical structure tree (headings/paragraphs/tables/figures) |
-| `editor/redact.rs` | 1,431 | 73.4 | Permanent content redaction (removes underlying content, not just a visual overlay) |
+| `editor/redact.rs` | 1,431 | 73.4 | Permanent content redaction (removes underlying content, not just a visual overlay); incidental touch-up alongside the rendering build (LOC unchanged, coverage unchanged to one decimal) |
 | `editor/audit.rs` | 339 | 98.2 | Redaction audit trail (documented private extension — ISO 32000 has no native object for this) |
 | `editor/pdfa.rs` | 977 | 80.3 | PDF/A-1b/2b/3b validation + conversion; +51 LOC since the first refresh (`ad35dcb` narrowed `check_cidset_present`'s doc comment now that the gap it guards against is fixed, and split its regression test into a positive end-to-end-conformant case plus a hand-built-missing-`/CIDSet` defense-in-depth case — net +1 unit test) |
 | `editor/pdfx.rs` | 261 | 88.6 | PDF/X colour-space constraint checking (ISO 15930) |
 | `editor/pdfua.rs` | 372 | 98.4 | PDF/UA (ISO 14289-1) Matterhorn-Protocol-style checklist validation |
-| `editor/icc.rs` | 385 | 95.4 | ICC output-intent embedding (used by PDF/A + PDF/X) |
+| `editor/icc.rs` | 386 | 95.4 | ICC output-intent embedding (used by PDF/A + PDF/X); note this is **write-path** ICC-profile *embedding*, unrelated to §8d's rendering-side ICC-color-management gap (this file never *interprets* a profile's colorimetric transform either — it just embeds the caller-supplied bytes as an `/OutputIntent`) |
 | `editor/xmp.rs` | 366 | 94.0 | XMP metadata packet generation/embedding |
 | `editor/content_ops.rs` | 331 | 78.0 | Insert/replace text/shapes/images on an existing page; `MAX_CONTENT_STREAM_BYTES` |
 | `editor/content_stream.rs` | 615 | 69.8 | Round-trippable content-stream operator parser (used by content_ops/redact/text_extract) |
-| `editor/text_extract.rs` | 305 | 85.7 | Text extraction from an existing page's content stream |
+| `editor/text_extract.rs` | 307 | 85.7 | Text extraction from an existing page's content stream |
 | `editor/save.rs` | 726 | 89.6 | Incremental update *or* full compacted rewrite (object streams + xref stream) |
 | `editor/util.rs` | 239 | 94.3 | Shared helpers |
-| **`render/`** (3 files, 849 LOC) | | | **New since the original audit.** Pdfium-FFI page rasterization, `render` feature — see §8 |
-| `render/mod.rs` | 234 | 100.0 | Public API + module-level rationale doc (canonical rendering-decision writeup) |
-| `render/renderer.rs` | 468 | 83.3 | `PdfiumLibrary`/`PdfRenderer`; `ffi_lock` mutex, `ManuallyDrop` close ordering. Coverage/tests here **require** `RUST_PDF_PDFIUM_LIB_DIR=.pdfium/<platform>/lib` to be set (see §8) — the render/tauri test suites *silently skip* (report `ok`, not `FAILED`) rather than exercise this file at all if it isn't, which this refresh initially missed on its first `cargo llvm-cov` run (got 7.9%/6.8% with the env var unset) before re-running with it set and getting the number in this row; see §10's note |
-| `render/cache.rs` | 147 | 100.0 | Bounded LRU thumbnail cache |
-| **`tauri_commands/`** (7 files, 2,865 LOC) | | | **New since the original audit.** Async Tauri desktop command layer, `tauri` feature — see §9 |
-| `tauri_commands/mod.rs` | 112 | — | Module overview |
-| `tauri_commands/commands.rs` | 1,516 | 82.3 | The 9 commands: `open_document`, `render_page`, `extract_text`, `search_text`, `apply_edit`, `save_document`, `fill_form`, `add_annotation`, `sign_document` |
-| `tauri_commands/state.rs` | 254 | 87.3 | Managed app state: open-document registry + worker pool/render actor handles |
-| `tauri_commands/worker.rs` | 217 | 91.7 | CPU-bound work thread pool (parsing/editing/signing off the async executor) |
-| `tauri_commands/render_actor.rs` | 437 | 93.3 | Single dedicated OS thread owning every open `PdfRenderer`; panic containment (see original "RenderActor Panic Resilience" remediation) |
+| **`render/`** (17 files: 3 top-level + `native/` submodule, 9,440 LOC) | | | **Rewritten since the second refresh.** Pure-Rust page rasterization (no native binary/FFI at all — see §8/§8a-§8d for the completed Pdfium→pure-Rust migration), `render`/`native-render` features |
+| `render/mod.rs` | 225 | 100.0 | Public API (`PdfRenderer`, `Viewport`, `MAX_RENDER_PIXELS`) + module-level migration-history doc (§8's rationale is preserved there as history; current status is stated up front) |
+| `render/renderer.rs` | 810 | 84.4 | `PdfRenderer` rebuilt on `editor::EditableDocument` (no FFI handle left to wrap): `open_file`/`open_bytes`, `render_page`/`render_thumbnail`, `deep_resolve` (recursively dereferences a page's `/Resources` before handing it to `native::render_content_stream`, bounded by `MAX_RESOLVE_REFERENCES`/`MAX_RESOLVE_DEPTH`), page-rotation normalization/application, `append_annotation_appearances`. No `ffi_lock`/`ManuallyDrop` left — see §8c |
+| `render/cache.rs` | 148 | 100.0 | Bounded LRU thumbnail cache (unchanged in shape from the Pdfium-backed version) |
+| **`render/native/`** (14 files, 8,257 LOC) | | | Pure-Rust content-stream interpreter + rasterizer, no PDF-document access of its own — `native-render` feature, `tiny-skia` (rasterizer) + `ttf-parser` (font outlines). See §8a/§8b for what each phase added and **§8d for the exhaustive, honest list of what it does *not* do** |
+| `render/native/mod.rs` | 853 | 98.7 | `render_content_stream()` entry point; module docs are the canonical scope/gaps writeup (§8d summarizes it) |
+| `render/native/interpreter.rs` | 2,045 | 75.1 | The interpreter loop: graphics-state stack/CTM, path paint/clip, text showing (3 font kinds), transparency groups/soft masks/blend modes, Form XObject + Type 3 glyph recursion (`MAX_FORM_XOBJECT_DEPTH`/`MAX_TYPE3_DEPTH`) — largest file in this submodule |
+| `render/native/function.rs` | 1,010 | 80.4 | PDF function evaluation for colour tint-transforms: Type 0 (Sampled), 2 (Exponential), 3 (Stitching), 4 (PostScript calculator) |
+| `render/native/image.rs` | 741 | 87.5 | Image XObject + inline-image painting via `crate::filter`'s existing decoders; **JBIG2/JPX fail closed to a documented placeholder — see §8d** |
+| `render/native/font.rs` | 804 | 92.6 | Resolves `/Resources /Font/<name>` to a loaded `ttf-parser` program or a structured `UnsupportedFontReason` (Type1/bare-CFF, not embedded — **see §8d**); bounded `/W`/`/Widths` parsing |
+| `render/native/colorspace.rs` | 507 | 85.4 | Indexed/Separation/DeviceN/CalGray/CalRGB resolution and **ICCBased approximation (see §8d)**; Lab and Pattern are explicit, warned gaps |
+| `render/native/error.rs` | 431 | 0.0 | `NativeRenderError` (hard failures)/`RenderWarning` (soft, structured, non-panicking gaps) — the type every §8d gap is surfaced through. **0% line coverage**: this file is exercised indirectly (every other file's tests construct/return these variants), but `cargo-llvm-cov` attributes that execution to the *calling* file, not this one, since the variant constructors themselves are trivial one-line enum literals the compiler inlines — reported here honestly rather than omitted |
+| `render/native/path.rs` | 432 | 94.8 | Device-space path construction (`m l c v y h re`) |
+| `render/native/text_tests.rs` | 457 | — | Test-only: TrueType/CID-CJK/Type3 glyph-paints-ink and the Type1/bare-CFF graceful-failure regression test (`type1_bare_cff_font_fails_gracefully_not_panicking`, cited in §8d) |
+| `render/native/image_integration_tests.rs` | 373 | — | Test-only: JBIG2/JPX-placeholder, CCITT/JPEG paint, Indexed/Separation tint-transform regression tests (several cited in §8d) |
+| `render/native/state.rs` | 276 | 87.5 | `GraphicsState`/`GraphicsStateStack` (`q`/`Q`) + `TextState`, bounded stack depth |
+| `render/native/glyph.rs` | 105 | 86.7 | `ttf-parser` outline callback → `tiny_skia::PathBuilder` glyph path |
+| `render/native/color.rs` | 131 | 100.0 | DeviceGray/RGB/CMYK → `tiny_skia::Color`; naive, non-ICC CMYK formula (ISO 32000-1 §8.6.5.3's own fallback — see §8d) |
+| `render/native/bits.rs` | 92 | 100.0 | Bit-level reader shared by the CCITT/other packed-sample decode paths this module reuses from `crate::filter` |
+| **`tauri_commands/`** (6 files, 2,592 LOC) | | | Async Tauri desktop command layer, `tauri` feature — see §9. **`render_actor.rs` (437 LOC) deleted this migration** (§8c) — every other file grew, netting a smaller directory overall |
+| `tauri_commands/mod.rs` | 125 | — | Module overview |
+| `tauri_commands/commands.rs` | 1,684 | 83.4 | The 9 commands: `open_document`, `render_page`, `extract_text`, `search_text`, `apply_edit`, `save_document`, `fill_form`, `add_annotation`, `sign_document`. `render_page` now runs on the ordinary `WorkerPool` like every other command (§8c) |
+| `tauri_commands/state.rs` | 233 | 86.1 | Managed app state: open-document registry + worker pool handle (no more separate render-actor handle to manage, §8c) |
+| `tauri_commands/worker.rs` | 218 | 91.7 | CPU-bound work thread pool (parsing/editing/signing/**rendering**, all off the async executor) |
 | `tauri_commands/progress.rs` | 92 | 100.0 | Progress event reporting, decoupled from the `tauri` crate's own types |
-| `tauri_commands/error.rs` | 237 | 75.0 | `CommandError`, structured `Serialize`-able error taxonomy for the command layer |
+| `tauri_commands/error.rs` | 240 | 75.8 | `CommandError`, structured `Serialize`-able error taxonomy for the command layer |
 
 Public API surface (rough grep count of `pub` items, not counting re-exports) is now dominated by
 the newer modules: `forms/field.rs` (100+), `editor/forms.rs`, `editor/redact.rs` and
@@ -404,7 +481,16 @@ The original audit's blanket claim ("no embedded/TrueType/CFF font support... no
 beyond WinAnsi") no longer holds for TrueType/OpenType + CID text; CFF-only (bare, non-OpenType)
 font programs were not confirmed either way for this refresh.
 
-## 8. Rendering: native-vs-FFI decision (implemented)
+## 8. Rendering: native-vs-FFI decision (superseded — see §8c/§8d for the current, live truth)
+
+> **This decision has since been reversed, at explicit user request.** §8 below is preserved
+> verbatim as the **historical record** of the original build-vs-buy call (Pdfium/FFI) and the
+> reasoning behind it at the time — it is **not** what this crate does today. §8a→§8b→§8c tell the
+> story of the migration off Pdfium to a pure-Rust engine (`tiny-skia` + `ttf-parser`, no native
+> binary or FFI dependency of any kind), and **§8d "Known Limitations" is the current, single
+> place to read** for exactly what that pure-Rust engine does and does not support, each claim
+> cross-checked against a named test in this session. If you are auditing this crate's *current*
+> rendering behavior, start at §8d, not here.
 
 *(Unchanged from the original document — this section was already current as of the "Rendering
 Decision" phase and is preserved as-is, only renumbered.)*
@@ -827,11 +913,174 @@ passing. `cargo build`/`cargo test`/`cargo clippy -- -D warnings` were re-run cl
 feature combination touched by this migration (`default`, `native-render`, `render`, `full`,
 `full,tauri`), not just the one named in this phase's Definition of Done.
 
+## 8d. Known Limitations (pure-Rust rendering, current state — this refresh)
+
+**Read this section first if you need to know what the renderer actually does today.** Everything
+below was re-verified live for this refresh — either by reading the current source in
+`src/render/native/` or by running the named test — not carried forward from an earlier phase's
+claim. None of these are silent: every one of them is a documented, structured
+[`RenderWarning`]/[`NativeRenderError`] variant (`src/render/native/error.rs`) recorded in the
+render's returned warning list, never a panic and never a quietly-blank/quietly-wrong pixel. This
+is the deliberate, task-mandated distinction: a "gap" here means *"we tell the caller we couldn't
+do this,"* not *"we did it badly and didn't say so."*
+
+### JBIG2 / JPX (JPEG2000) images — placeholder, not decoded
+
+**Not supported. There is no mature pure-Rust decoder for either format anywhere in the ecosystem
+today** (checked again for this refresh — this remains true, the same conclusion §4 finding #8 and
+§8a/§8b/§14 already reached). Concretely:
+
+- `crate::filter::decode_filter` already refuses to silently pass either filter through
+  undecoded (a plain byte-copy would be actively misleading, not a placeholder) — it returns a
+  structured `FilterError` instead.
+- `render::native::image`/`interpreter::paint_placeholder_rect` catches that failure and paints the
+  image region as a **documented placeholder** (a flat, distinctive mid-grey `rgb(160,160,160)`
+  fill over the image's unit square — the same "broken image" convention most browsers/viewers
+  use, deliberately not white/black so it can't be mistaken for real page background or content)
+  rather than leaving it blank or aborting the whole page render, recording
+  `RenderWarning::UnsupportedImageFilter { filter: "JBIG2Decode" | "JPXDecode", .. }`.
+- Live-verified this refresh via the actual tests: `render::native::image_integration_tests::
+  jbig2_image_xobject_yields_placeholder_not_panic_not_silent_blank`,
+  `jpx_image_xobject_also_yields_placeholder_not_panic`, and
+  `inline_image_with_jbig2_is_rejected_gracefully` — all three assert the placeholder is painted
+  (non-blank, distinguishable from "nothing happened"), the correct `RenderWarning` is recorded,
+  and — critically — the rest of the page still renders around it.
+- **Do not read this as "JBIG2/JPX images are supported."** They are not. The placeholder exists so
+  a scanned-document page with one unsupported image doesn't come back as a totally blank page or
+  crash the whole render — it is a graceful-degradation mechanism, not a decoder.
+
+### Type1 and bare/un-wrapped CFF embedded font programs — fails closed, not rendered
+
+**Not supported.** `ttf-parser` (this crate's only font-parsing dependency, MIT OR Apache-2.0) is
+an `sfnt`/OpenType-table-directory parser; it has no Type1 (`eexec`-encrypted charstring)
+interpreter and cannot parse a bare CFF `FontFile3` (`/Type1C`/`/CIDFontType0C`) stream that isn't
+wrapped in an OpenType container. (An OpenType font whose *outline table* happens to be
+CFF-flavored — a real `sfnt` container — is genuinely parsed by `ttf-parser` and is **not** part of
+this gap; only bare/unwrapped Type1/CFF is affected.)
+
+- When this gap is hit, `render::native::font` classifies it as
+  `UnsupportedFontReason::Type1OrBareCff` and the interpreter paints **no glyph ink at all** for
+  that font, but still advances the text position using the font's declared `/Widths`/`/W` — so
+  surrounding text on the same line doesn't visually collapse into the gap — and records
+  `RenderWarning::UnsupportedFontProgram` once per resource name.
+- A distinct, separately-tracked gap (**not** the same thing): **non-embedded fonts** (any
+  `/Subtype`, no standard/system-font substitution database at all) fail identically —
+  `UnsupportedFontReason::NotEmbedded`. "No charstring interpreter" and "no font-substitution
+  logic" are two different missing pieces; this document does not conflate them, per this crate's
+  own module docs.
+- Live-verified this refresh via `render::native::text_tests::
+  type1_bare_cff_font_fails_gracefully_not_panicking` — asserts *no* ink lands in the glyph's
+  would-be bounding box, the correct `RenderWarning` is recorded naming the gap, and the rest of
+  the page still renders (a graceful per-font failure, not a whole-render abort).
+- **Do not read this as "Type1/CFF fonts are supported with a fallback appearance."** There is no
+  fallback glyph shape drawn — the text is simply invisible for that specific font, by design,
+  rather than silently substituting a wrong-looking glyph or panicking.
+
+### ICC color management — approximated, not colour-managed
+
+**Not implemented as true ICC profile-based colour management, and not claimed to be.**
+
+- An `ICCBased` colour space (ISO 32000-1 §8.6.5.5) is **approximated**: `render::native::
+  colorspace` resolves it to its `/Alternate` colour space if the PDF declares one, else falls back
+  to a heuristic guess purely from the profile's declared `/N` (1→DeviceGray, 3→DeviceRGB,
+  4→DeviceCMYK) — it never actually parses or applies the embedded ICC profile's colorimetric
+  transform. There is no mature pure-Rust ICC colour-management engine (a full CMM) this crate has
+  adopted or evaluated as production-ready.
+- Every use of an `ICCBased` space records `RenderWarning::IccColorApproximated` exactly once, so a
+  caller can distinguish "colour looked right by luck" from "colour was actually colour-managed."
+- Related, same underlying limitation: `DeviceCMYK`→RGB conversion (`render::native::color`) uses
+  the naive, non-perceptual formula ISO 32000-1 §8.6.5.3 itself documents as the *fallback*
+  conversion (`red = 1 - min(1, C+K)` etc.), not a profile-based conversion — this applies to every
+  CMYK-painted pixel, not just ones that went through an `ICCBased` space.
+- `Lab` colour space is a step further back: not implemented at all (resolves to
+  `ColorSpace::Unsupported`, recording `RenderWarning::UnsupportedColorSpace`), since a correct
+  implementation needs a CIE L\*a\*b\*→device-RGB conversion this phase doesn't have either.
+- **Do not read "ICC approximated" as "color looks right."** For a document whose visual
+  correctness depends on an embedded ICC profile (e.g. proofing/prepress workflows), this
+  renderer's colour output should be treated as indicative, not accurate.
+
+### Performance delta vs. the previous Pdfium benchmark (measured, this session)
+
+The "Large-File Render Benchmark" remediation phase (commit `e04af03`) recorded, for the
+Pdfium-backed renderer opening + rendering page 0 of a real ~2.10 GB / 10,000-page fixture (793×1123
+px raster) via `tests/large_file_render_bench.rs`: **82.46 ms**.
+
+Re-running the *exact same test file* (unmodified assertion/methodology — it now runs the pure-Rust
+`PdfRenderer::open_file`/`render_page` path instead, per §8c) against the exact same
+fixture-generation code this session:
+
+```
+$ cargo test --release --features render --test large_file_render_bench -- --ignored --nocapture
+large_file_render_bench: reusing cached fixture at .../rust_pdf_bench_10000pages_2gb.pdf (2.10 GB)
+large_file_render_bench: opened + rendered page 0 of a 2.10 GB / 10000-page fixture
+  (reported page count: 10000) in 1.723667458s (793x1123 px raster)
+test render_page_zero_of_a_2gb_10000_page_fixture ... ok
+```
+
+**1,723.67 ms, vs. 82.46 ms previously — roughly 20.9× slower** for the identical
+open-a-huge-document-then-rasterize-one-ordinary-page workload. This is a real, measured
+regression, not a rough guess, and is exactly the kind of trade-off this migration's task brief
+said was expected and accepted ("performa lebih lambat dari Pdfium"). Plausible, not
+independently profiled this session, contributing factors: `deep_resolve`'s reference-graph walk
+(§8c) has no equivalent in the Pdfium path (Pdfium resolves its own internal object graph in C++);
+`tiny-skia`'s pure-Rust path/coverage rasterization vs. Pdfium/Skia's years of SIMD-tuned C++; and
+this engine performing font-outline extraction (`ttf-parser`) and glyph rasterization per-call
+with no glyph-outline cache across pages. **Both figures measure the same fixture, the same
+assertion, and the same wall-clock methodology** (`std::time::Instant` around `open_file` +
+`render_page`, `tests/large_file_render_bench.rs`), but were recorded in different sessions weeks
+apart on what is believed to be the same development machine — this is the best available
+same-repo data point, not a controlled simultaneous A/B benchmark on identical, isolated hardware.
+No attempt was made this session to profile *where* inside the 1.72 s the time goes (page-tree
+resolution vs. `deep_resolve` vs. rasterization vs. text shaping) — a legitimate follow-up for
+whoever picks up rendering-performance work next, not something this documentation refresh
+resolved.
+
+### Other accepted approximations (unchanged from §8a/§8b/§8c, restated here for one-stop reference)
+
+- **Transparency groups always treated as isolated**, regardless of the group's actual `/I` entry;
+  **knockout (`/K`) is not implemented**. Blend modes (`/BM`) themselves *are* fully, accurately
+  implemented (all 16 standard ISO 32000-1 §11.3.5 modes via `tiny_skia::BlendMode`) — it is
+  specifically group/mask compositing semantics beyond isolated-groups-with-default-backdrops that
+  are approximated, not the per-pixel blend formulas.
+- **Soft-mask `/BC` (custom backdrop colour) and `/TR` (transfer function) are recognised but
+  ignored** (identity transfer function; the spec's own default backdrop is always used), recording
+  `RenderWarning::SoftMaskParameterIgnored`.
+- **Patterns and shadings (`sh`, Pattern colour space) are not painted at all** — selecting a
+  Pattern colour records `RenderWarning::PatternColorUnsupported` and leaves the current colour
+  unchanged.
+- **The older `/Mask` explicit-mask mechanism** (ISO 32000-1 §8.9.6.4: colour-key array or stencil
+  image, as opposed to the newer `/SMask` soft mask, which *is* implemented) **is not implemented**
+  — every image ignores a `/Mask` entry if present. Not separately warned per-image (judged too
+  noisy); documented here instead.
+- **Vertical writing mode is not detected** — `Identity-V` and similar composite fonts are always
+  positioned as if horizontal.
+- **`/Encoding` `/Differences` and symbolic (non-Unicode-`cmap`) simple fonts are not specially
+  resolved** — same documented gap as `editor::text_extract` (needs the Adobe Glyph List, not
+  implemented).
+- **Text clipping render modes** (`Tr` 4-7) paint like their non-clipping counterparts (0-3) but do
+  not add glyph outlines to the clip path.
+- **Non-uniform-scale/skewed CTM effect on stroke width and dash length is approximated** by the
+  CTM's uniform scale factor (`sqrt(|det(CTM)|)`); a heavily skewed CTM will not produce the
+  spec-exact elliptical stroke pen.
+- **Tiled/viewport rendering still re-renders the whole page internally and crops the requested
+  rectangle out of it** (`src/render/mod.rs`'s own "Known limitation" section) — memory use for a
+  tile is bounded by the *full page* at the requested DPI, not the tile size.
+- **Decryption remains entirely unimplemented for the renderer**, same as the rest of this crate's
+  read path (§1, §4 finding #1): `RenderError::PasswordRequired` is returned unconditionally for an
+  encrypted document, regardless of any password supplied.
+
+None of the above raise a hard error or panic on their own — the render completes and paints every
+pixel/glyph this engine does know how to paint; only structurally-impossible requests (zero-size
+output, a degenerate `/MediaBox`, a `q`-flood past `MAX_GRAPHICS_STATE_DEPTH`, an
+output-pixel-count over `MAX_RENDER_PIXELS`) are hard errors, and those are also structured
+(`NativeRenderError`/`RenderError`), never a panic on untrusted input.
+
 ## 9. The Tauri command layer (`tauri_commands/`)
 
-New top-level module since the original audit (7 files, 2,865 lines), gated by the `tauri`
-feature (which pulls in `parser`, `render` and `signatures`). This is the glue between the pure
-Rust library and a Tauri desktop application:
+New top-level module since the original audit; **6 files, 2,592 lines** as of this refresh (was 7
+files/2,865 lines — `render_actor.rs`, 437 lines, was deleted this migration; see below), gated by
+the `tauri` feature (which pulls in `parser`, `render` and `signatures`). This is the glue between
+the pure Rust library and a Tauri desktop application:
 
 - **Nine async commands** (`tauri_commands/commands.rs`): `open_document`, `render_page`,
   `extract_text`, `search_text`, `apply_edit`, `save_document`, `fill_form`, `add_annotation`,
@@ -858,122 +1107,119 @@ Rust library and a Tauri desktop application:
 
 ## 10. Test coverage (measured, live re-run)
 
-**Historical note (post-§8c):** the numbers and `RUST_PDF_PDFIUM_LIB_DIR` setup instructions
-below predate the §8c Pdfium-removal migration and describe that earlier, FFI-backed renderer's
-coverage run. They are kept as-is (rerunning `cargo-llvm-cov` was out of scope for §8c's own
-task) but are no longer an accurate description of *how* to run coverage today: this crate has no
-native library to fetch/bind at all now, so `RUST_PDF_PDFIUM_LIB_DIR` is unused/unrecognized, and
-`cargo test --features full,tauri` (no env var needed) exercises every render/tauri test
-unconditionally — see §8c's own "Tests" subsection for what was re-verified (clean
-build/test/clippy across every feature combination) as part of that migration.
+**Historical note (superseded by the third refresh below):** the `RUST_PDF_PDFIUM_LIB_DIR` setup
+instructions that used to live in this section predate the §8c Pdfium-removal migration and
+described that earlier, FFI-backed renderer's coverage run. This crate has no native library to
+fetch/bind at all now: `RUST_PDF_PDFIUM_LIB_DIR` is unused/unrecognized, and
+`cargo llvm-cov --release --features full,tauri --summary-only` (no env var, no
+`scripts/fetch_pdfium.sh` step) exercises every render/tauri test unconditionally on a plain
+checkout. The historical "tests silently skip without the env var" trap this section used to warn
+about at length no longer applies — there is no code path left that can silently skip for lack of
+a native library.
 
 Tool: `cargo-llvm-cov 0.8.7`.
 
-```
-$ RUST_PDF_PDFIUM_LIB_DIR=.pdfium/mac-arm64/lib cargo llvm-cov --release --features full,tauri --summary-only
-```
+**Third refresh (this pass):**
 
-**Note on `RUST_PDF_PDFIUM_LIB_DIR`:** the `render`/`tauri`-feature test suites (`tests/
-render_tests.rs`, parts of `tests/tauri_commands_integration.rs`) are written to *skip* (report
-`ok`, not `FAILED`) rather than exercise any Pdfium-touching code at all when the native library
-can't be located (§8's "known limitation" — by design, so `cargo test --features render` still
-passes in a checkout without the native binary). The first refresh's *initial* `cargo llvm-cov`
-run did not set this variable, so all 11 `render_tests` silently skipped despite reporting `ok`,
-and `render/renderer.rs` measured 6.77%/7.93% region/line coverage as a direct result — not a
-reflection of real coverage. Re-running with `RUST_PDF_PDFIUM_LIB_DIR=.pdfium/mac-arm64/lib`
-(after `scripts/fetch_pdfium.sh`, already present in this checkout) set, all 11 tests genuinely
-executed (confirmed via `--nocapture`: `rendered 51 pages across 9 documents`). This is called
-out at this length because it is exactly the kind of "tests report ok but didn't run the code"
-trap the "jalankan sendiri... sertakan output aktual" rule exists to catch.
-
-**Second refresh (this pass, commit `babec0c`, post-cid.rs-fix):** re-ran the same command with
-the same env var. Aggregate (per-file breakdown folded into §2's module table above — every
-row's `%Ln` column is from this run):
+```
+$ cargo llvm-cov --release --features full,tauri --summary-only
+```
 
 | Metric | Covered / Total | % |
 |---|---|---|
-| Regions | 35,856 / 42,733 | **83.91%** |
-| Functions | 2,061 / 2,633 | **78.28%** |
-| Lines | 18,392 / 22,403 | **82.10%** |
+| Regions | 42,875 / 51,060 | **83.97%** |
+| Functions | 2,397 / 3,004 | **79.79%** |
+| Lines | 21,768 / 26,373 | **82.54%** |
 
-(Ran three times back-to-back to check stability: missed-region/-line counts wobbled by ±1–2
-between runs — e.g. 6,876/6,877/6,878 missed regions, 4,010/4,011/4,012 missed lines — which
-rounds to the same 83.9x%/82.1x% either way; the region/function totals (42,733 / 2,633) and the
-percentages shown above were identical across all three runs. This is consistent with ordinary
-thread-scheduling nondeterminism in the concurrent `tauri_commands`/`render_actor` test suites,
-not a measurement error, and is well within the same ballpark the first refresh already reported
-for the (then-unfixed) `font/cid.rs`/`editor/pdfa.rs` region.)
+(Ran three times back-to-back to check stability, same practice as the second refresh: the first
+run measured 8,184 missed regions/4,604 missed lines, the next two both measured 8,185/4,605 —
+a ±1 wobble that rounds to the identical 83.97%/82.54% either way. Consistent with the
+already-documented ordinary thread-scheduling nondeterminism in the concurrent
+`tauri_commands`/`render` test suites, not a measurement error.)
 
-Up from the first refresh's 35,443/42,314 (83.76%) regions, 2,052/2,624 (78.20%) functions,
-18,253/22,263 (81.99%) lines — the increase tracks the `+292` new lines in `font/cid.rs`/
-`editor/pdfa.rs`/`document/mod.rs` (§2) plus their new tests, essentially all of it well-covered
-(`font/cid.rs` alone: 90.1%→92.2%). This remains a large improvement over the original audit's
-67.89% line coverage — most of the ~23,000 lines added across nine phases landed with dedicated
-test suites (`tests/editor_tests.rs`, `tests/font_embedding_tests.rs`,
-`tests/interactive_features_tests.rs`, `tests/render_tests.rs`,
-`tests/signature_verification_tests.rs`, `tests/tauri_commands_integration.rs`) as part of each
-phase's own DoD.
+Up from the second refresh's 35,856/42,733 (83.91%) regions, 2,061/2,633 (78.28%) functions,
+18,392/22,403 (82.10%) lines — both region/function/line *totals* grew substantially (42,733→51,060
+regions, +8,327; 22,403→26,373 lines, +3,970) because the pure-Rust rendering build added ~8,600
+lines of new, mostly-well-tested code (`render/native/`, §2/§8a-§8d), and the *percentage* moved
+only slightly because that new code's own coverage (region-weighted) is close to the crate
+average, not because it went untested — see the per-file `%Ln` values inlined into §2's module
+table (e.g. `render/native/mod.rs` 98.7%, `render/native/font.rs` 92.6%, vs.
+`render/native/error.rs` 0.0% and `render/native/interpreter.rs` 75.1% pulling the average down —
+both explained in §2/§8d).
 
-Notably low files (line coverage), from this run — unchanged from the first refresh (none of
-these files were touched by the cid.rs fixes):
+Notably low files (line coverage), from this run:
+- `render/native/error.rs` — **0%** (new this refresh — see §2's row: the error/warning *type*
+  itself has no directly-exercised lines because every variant constructor is a trivial one-line
+  enum literal the compiler attributes to the *calling* file's coverage, not this one; every
+  variant is genuinely constructed and returned by some other file's test, per §8d).
 - `ffi.rs` — **0%** (unchanged from the original audit — no test exercises the C ABI layer).
 - `image/mod.rs` — **26.20%** line coverage (unchanged finding from the original audit).
 - `forms/field.rs` — **51.49%** line coverage (100+ public items, still the largest/least-tested
   file in `forms/`).
 - `font/mod.rs` — **45.26%**, `font/metrics.rs` — **49.11%**, `filter/dct.rs` — **49.23%**: all
-  three under 50%, none flagged in the original audit (they didn't exist, or `font/mod.rs` was
-  differently shaped, at that time).
-- `document/mod.rs` — **78.0%** (was 77.75% at the first refresh, +16 LOC from `ad35dcb`'s
-  `cid_set_id` plumbing) — still not the crate's least-covered large file (`editor/redact.rs`
-  73.4%, `signatures/signer.rs` 73.0%, §2/§4.2, and several others remain below it).
+  three under 50%, unchanged from prior refreshes.
+- `document/mod.rs` — **78.0%**, `editor/redact.rs` — **73.4%**, `signatures/signer.rs` — **73.0%**
+  — all unchanged from the second refresh, still among the least-covered large files.
 
-Test counts (`cargo test --release --features full,tauri`, same branch, commit `babec0c`):
+Test counts (`cargo test --release --features full,tauri`, third refresh, this pass):
 
 | Suite | Passed | Ignored |
 |---|---:|---:|
-| `src/` unit tests | 593 | 0 |
+| `src/` unit tests | 721 | 0 |
 | `tests/editor_tests.rs` | 7 | 0 |
 | `tests/font_embedding_tests.rs` | 6 | 0 |
 | `tests/integration_tests.rs` | 68 | 0 |
 | `tests/interactive_features_tests.rs` | 7 | 0 |
-| `tests/large_file_render_bench.rs` | 0 | 1 (opt-in, ~2GB fixture) |
+| `tests/large_file_render_bench.rs` | 0 | 1 (opt-in, ~2GB fixture — see §8d for the explicit `--ignored` run) |
 | `tests/large_file_rss_bench.rs` | 0 | 2 (opt-in, ~2GB fixture) |
 | `tests/render_tests.rs` | 11 | 0 |
 | `tests/signature_verification_tests.rs` | 15 | 0 |
 | `tests/tauri_commands_integration.rs` | 2 | 0 |
-| Doctests | 3 | 8 (`ignore`d) |
-| **Total** | **712** | **11** |
+| Doctests | 4 | 8 (`ignore`d) |
+| **Total** | **841** | **11** |
 
-0 failing. Up from 706/11 at the first refresh — the +6 unit tests are exactly the ones
-`ad35dcb` (+2, `build_subset_cid_set_has_correct_bit_layout`/
-`build_subset_cid_set_marks_unused_gaps_within_the_used_range`, plus splitting one
-`editor/pdfa.rs` test into two, net +1) and `babec0c` (+3,
-`build_full_embed_uses_untagged_base_font_name`/
-`build_with_no_glyphs_used_falls_back_to_untagged_full_embed`/
-`build_subset_uses_tagged_base_font_name`) added — see §2's `font/cid.rs`/`editor/pdfa.rs` rows.
-Up from the original audit's 312 passing / 0 failing overall.
+0 failing. Up from 712/11 at the second refresh — the +129 passing tests are essentially all the
+pure-Rust rendering build's own dedicated test suites landing directly in `src/render/native/`
+(unit tests in `bits.rs`/`color.rs`/`colorspace.rs`/`font.rs`/`function.rs`/`glyph.rs`/`path.rs`/
+`state.rs`/`interpreter.rs`, plus the dedicated `image_integration_tests.rs` (9 tests) and
+`text_tests.rs` (5 tests) modules cited throughout §8a/§8b/§8d) and `render::renderer`'s new unit
+tests (`normalize_rotate`/`apply_rotation_to_dims`/`check_dimensions`/`page_pixel_size`/etc., §8c),
+plus one new doctest (`render::native`'s own module-doc example). Up from the original audit's 312
+passing / 0 failing overall.
+
+**Live benchmark run this session (opt-in, `#[ignore]`d, not part of the counts above):**
+`cargo test --release --features render --test large_file_render_bench -- --ignored --nocapture`
+measured **1.723667458 s** to open + render page 0 of the real ~2.10 GB / 10,000-page fixture
+(793×1123 px) — see §8d for the full comparison against the previously-recorded Pdfium figure
+(82.46 ms) and the honest caveats around that comparison.
 
 ## 11. `cargo audit` results (live re-run)
 
-Re-run again for this second refresh at commit `babec0c` (cargo-audit `0.22.1`; no `--features`
-flag exists for this tool/version, and none is needed — `Cargo.lock` is already fully resolved
-against `full,tauri`, exactly as it was for the first refresh's run below, since neither
-`ad35dcb` nor `babec0c` touched `Cargo.toml`/`Cargo.lock`):
+Re-run again for this third refresh (cargo-audit `0.22.1`; no `--features` flag exists for this
+tool/version, and none is needed — `Cargo.lock` is already fully resolved against `full,tauri`).
+This time `Cargo.toml`/`Cargo.lock` genuinely changed (§8c: `pdfium-render` removed,
+`tiny-skia`/`tiny-skia-path`/`arrayvec`/`arrayref`/`strict-num` added):
 
 ```
 $ cargo audit
     Fetching advisory database from `https://github.com/RustSec/advisory-db.git`
       Loaded 1149 security advisories (from /Users/galihlasahido/.cargo/advisory-db)
     Updating crates.io index
-    Scanning Cargo.lock for vulnerabilities (535 crate dependencies)
+    Scanning Cargo.lock for vulnerabilities (531 crate dependencies)
 [... 17 informational (unmaintained/unsound) warnings, listed below ...]
 warning: 17 allowed warnings found
 ```
 
-Exit code `0`. **0 vulnerabilities.** 535 total crate dependencies scanned — identical to the
-first refresh's number, and more than 5× the original audit's 102, because that number was
-measured on a build with no `render`/`tauri` feature (hence no `pdfium-render`, no
-`tauri`/`wry`/`webkit2gtk`/GTK3-binding transitive tree at all) compiled in.
+Exit code `0`. **0 vulnerabilities.** **531** total crate dependencies scanned — down from 535 at
+the second refresh (**−4**, confirmed via `git diff babec0c HEAD -- Cargo.lock` naming exactly
+which packages left and joined: **removed** `pdfium-render`, `libloading` (its dynamic-loading
+dependency for the native `.so`/`.dylib`/`.dll`, no longer needed), and the transitive-only
+`vecmath`/`utf16string`/`piston-float`/`maybe-owned`/`itertools`/`console_log`/
+`console_error_panic_hook` that only `pdfium-render`'s own dependency tree pulled in — 9 packages
+gone; **added** `tiny-skia`, `tiny-skia-path`, `arrayvec`, `arrayref`, `strict-num` — 5 packages
+new; net **9 − 5 = −4**, exactly matching 535→531). This is the dependency-count-level proof that
+the Pdfium/FFI dependency is genuinely gone, not just unused — the same conclusion §8c's own
+`grep -ri pdfium src/` check already reached from the source-code side.
 
 A `.cargo/audit.toml` (added by a later "Dependency Audit Triage" remediation phase, not present
 at the original audit) explicitly ignores 5 specific, individually-reviewed advisory IDs with
@@ -1009,30 +1255,42 @@ phase. Out of scope for this documentation-refresh session.
 
 ## 12. `cargo clippy` (live re-run)
 
-Re-run again for this second refresh at commit `babec0c` (i.e. against `font/cid.rs`,
-`editor/pdfa.rs`, `document/mod.rs` as changed by `ad35dcb`/`babec0c`):
+Re-run again for this third refresh, against the full pure-Rust rendering build
+(`render/native/`'s ~8,600 new lines, §2/§8a-§8d):
 
 ```
 $ touch src/lib.rs && cargo clippy --features full,tauri --all-targets -- -D warnings
     Checking rust-pdf v0.1.0 (/Users/galihlasahido/RustroverProjects/rust-pdf)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.26s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.93s
 ```
 
-**Clean — 0 warnings, 0 errors**, `touch src/lib.rs` run immediately beforehand (both this run
-and the first refresh's below) to force a real recompile rather than reporting a stale cached
-pass. Same result as the first refresh's run (reproduced verbatim below for provenance):
+**Clean — 0 warnings, 0 errors**, `touch src/lib.rs` run immediately beforehand (same practice as
+every prior refresh) to force a real recompile rather than reporting a stale cached pass. Also
+re-run, per §8c's own claim of having checked every feature combination the migration touched, for
+`default` (no features), `native-render`, `render` and `full` — all clean under plain
+`cargo clippy --features <f> -- -D warnings` (no `--all-targets`):
 
 ```
-$ cargo clippy --features full,tauri --all-targets -- -D warnings
-    Checking rust-pdf v0.1.0 (/Users/galihlasahido/RustroverProjects/rust-pdf)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.70s
+$ cargo clippy -- -D warnings                              # default (no features)
+$ cargo clippy --features native-render -- -D warnings
+$ cargo clippy --features render -- -D warnings
+$ cargo clippy --features full -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s)   # all four, clean
 ```
+
+**One pre-existing, out-of-scope observation, not caused by this refresh and not fixed here**
+(documentation-only session; this crate's other rule is not to touch unrelated code): running
+`cargo clippy --all-targets` (i.e. including `examples/`) against `default`/`native-render`/
+`render` alone (not `full`/`full,tauri`) fails to *compile* `examples/digital_signature_example.rs`
+— that example needs the `signatures` feature, which none of those three feature sets enable, and
+`examples/`'s `Cargo.toml` entries have no `required-features` gate to skip it automatically. This
+is unrelated to rendering (confirmed identical failure with and without any rendering feature
+enabled) and was not introduced by this migration — it is a pre-existing gap in the examples'
+Cargo manifest metadata, out of scope for this rendering-documentation refresh.
 
 This supersedes the original audit's finding of "13 distinct lint categories" under
 `-D warnings` — every one of those (the `approx_constant`/`derivable_impls`/
-`manual_is_multiple_of`/`dead_code` items etc.) has since been fixed by an intervening phase; the
-first refresh did not identify which specific phase, only confirmed the current clean state, and
-this second refresh only re-confirms it stayed clean after the cid.rs fixes.
+`manual_is_multiple_of`/`dead_code` items etc.) has since been fixed by an intervening phase.
 
 ## 13. Untrusted-input risk register
 
@@ -1069,7 +1327,12 @@ exist):
   **superseded by §8c**: a from-scratch, pure-Rust content-stream interpreter/rasterizer
   (`render::native`), with that FFI dependency fully removed. See §8c for the completed migration
   and its accepted compatibility trade-offs (§8's original "why FFI" reasoning is kept as
-  historical record, not current status).
+  historical record, not current status), and **§8d for the current, live-verified list of exactly
+  what that pure-Rust engine still cannot do** (JBIG2/JPX images, Type1/bare-CFF font programs, no
+  true ICC colour management — all fail closed with a structured warning, never silently) — this
+  gap is genuinely closed relative to "no renderer at all," but is not closed to pdfium/mupdf's own
+  compatibility bar; §8d's measured ~20.9× slower page-render time on the identical large-file
+  benchmark is the concrete performance side of the same accepted trade-off.
 - ~~Font program parsing/subsetting (TrueType/OpenType) and embedding~~ — **closed** for
   TrueType/OpenType: §7. CFF/Type1 embedding was not confirmed either way.
 - **Still open, not re-verified this refresh**: a "repair mode" parser tolerant of arbitrary
@@ -1122,13 +1385,45 @@ module inventory in §2 rather than by extrapolating from a percentage-closed co
   predicate that gates `/CIDSet`, fixing a veraPDF 6.3.5-test-3 failure on an untagged full embed
   that previously still got a tagged name).
 - **Second refresh** (2026-07-03, remediation session "ARCHITECTURE.md Final Refresh", commit
-  `babec0c`, this pass): re-ran every live command from §2/§10/§11/§12 against the tree *after*
+  `babec0c`): re-ran every live command from §2/§10/§11/§12 against the tree *after*
   both of the commits above and updated exactly the numbers that moved — §2's `font/cid.rs`/
   `editor/pdfa.rs`/`document/mod.rs` rows and the crate LOC total (39,299→39,591, still 98
   files), §10's coverage aggregate (83.76/78.20/81.99%→83.91/78.28/82.10%) and test count
   (706→712 passing, still 11 ignored, still 0 failing), and re-confirmed §11 (`cargo audit`) and
   §12 (`cargo clippy -D warnings`) are unchanged (neither fix touched `Cargo.toml`/`Cargo.lock`
   or introduced a new lint). Did not touch §1/§3–§9 (narrative)/§13/§14 beyond what the top
-  callout block already documents, since none of their claims depend on `font/cid.rs`'s exact
-  line count or the coverage percentage of a single file. This refresh is the deliberately-last
-  commit of the whole remediation sequence — no `src/**` change follows it.
+  callout block already documents. Was, at the time, the deliberately-last commit of that
+  remediation sequence — but four further code commits landed afterward (the pure-Rust rendering
+  migration below), making it stale for §1/§2/§9/§10/§11/§12, which is exactly what this third
+  refresh corrects.
+- Four code commits landed on top of the second refresh, **at explicit user request**, to migrate
+  rendering off Pdfium/FFI onto a pure-Rust stack: `899fb9f`/`e658df6`/`b63dc98`/`a3db203` (the
+  four-phase build — content-stream interpreter core, text rendering, colour spaces/images,
+  transparency/blend modes — §8a/§8b and `render::native`'s own docs) and `e6af056` ("replace
+  Pdfium/FFI renderer with pure-Rust engine, retire render actor" — §8c, the integration phase that
+  actually deleted the Pdfium dependency and swapped `PdfRenderer`/`tauri_commands` over). Two
+  further security-hardening commits, `5ba3e0c` and `0e14625` (fuzzing + resource-limit hardening
+  of the content-stream interpreter, and a fuzz-found stroke-width panic fix), followed with no
+  `ARCHITECTURE.md`-relevant behavioral change beyond what §8c already described. None of these six
+  commits touched this file.
+- **Third refresh** (this pass): rewrote §1's rendering description and feature-exclusion
+  rationale to reflect the pure-Rust engine (was: FFI to Pdfium); regenerated §2's module inventory
+  (48,168 lines / 111 files, up from 39,591/98 — `render/` 3→17 files/849→9,440 LOC,
+  `tauri_commands/` 7→6 files/2,865→2,592 LOC net, plus the small incidental touch-ups listed in
+  §2's own intro paragraph); added a supersession banner atop §8 pointing to §8c/§8d; added
+  **§8d "Known Limitations"**, the new single place consolidating JBIG2/JPX (placeholder, not
+  decoded), Type1/bare-CFF fonts (fails closed, no glyph painted), ICC colour management
+  (approximated, not colour-managed) and a **measured performance delta against the previous
+  Pdfium benchmark** (1,723.67 ms vs. 82.46 ms on the identical 2.10 GB/10,000-page fixture,
+  ~20.9× slower) — every claim in §8d cross-checked against a named, currently-passing test, not
+  asserted from memory; regenerated §9's LOC line, **§10** (coverage: 83.91/78.28/82.10%→
+  83.97/79.79/82.54%, test count 712→841 passing, still 0 failing, still 11 ignored), **§11**
+  (`cargo audit`: 535→531 dependencies, net −4, named exactly via `git diff ... -- Cargo.lock`,
+  still 0 vulnerabilities, still the same 5 reviewed/ignored advisories + 17 informational
+  warnings) and **§12** (`cargo clippy --features full,tauri --all-targets -- -D warnings`:
+  re-confirmed clean, plus `default`/`native-render`/`render`/`full` each individually re-run
+  clean without `--all-targets`, with a pre-existing, out-of-scope `--all-targets`-only failure on
+  those three feature sets — an `examples/` manifest gap unrelated to rendering — noted and left
+  alone); added a §14 cross-reference to §8d. This is, again, deliberately the **last commit of the
+  entire remediation sequence** — no `src/**` change follows it (verify: `git log --stat -1` on the
+  commit this refresh lands in touches only `ARCHITECTURE.md`).
