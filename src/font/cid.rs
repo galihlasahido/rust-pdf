@@ -227,8 +227,20 @@ impl CompositeFont {
         let used = self.used_glyphs();
         let used_gids: std::collections::BTreeSet<u16> = used.keys().copied().collect();
 
-        let subset_tag = subset_tag_for(&self.base_font_name, self.ttf.raw_data());
-        let tagged_name = format!("{subset_tag}+{}", self.base_font_name);
+        // The PDF/A-style subset tag ("ABCDEF+FontName", ISO 32000-1:2008
+        // 9.6.4.3) must only be applied when the font is *actually* subset:
+        // ISO 19005-1:2005 6.3.5 (as enforced by veraPDF) requires that a
+        // tagged name's CIDFont program have a `/CIDSet` enumerating every
+        // glyph, which only happens on the `will_subset()` branch below. Reuse
+        // that exact predicate (rather than a second, separately-evaluated
+        // condition) so the tag and the /CIDSet-vs-full-embed choice can never
+        // drift out of sync with each other.
+        let tagged_name = if self.will_subset() {
+            let subset_tag = subset_tag_for(&self.base_font_name, self.ttf.raw_data());
+            format!("{subset_tag}+{}", self.base_font_name)
+        } else {
+            self.base_font_name.clone()
+        };
 
         let (font_file_data, cid_to_gid_map, cid_set): EmbedArtifacts = if !self.is_embedded() {
             (None, None, None)
@@ -582,6 +594,57 @@ mod tests {
         assert!(built.descriptor.get("CIDSet").is_none());
     }
 
+    /// Regression test for a bug found by re-audit: `build` used to add
+    /// the PDF/A-style subset-tag prefix ("ABCDEF+FontName", ISO
+    /// 32000-1:2008 9.6.4.3) unconditionally, even along this
+    /// full-embed/no-`/CIDSet` path — which then made ISO 19005-1:2005
+    /// 6.3.5 (as enforced by veraPDF) flag the font: a subset-tagged name
+    /// promises a `/CIDSet` enumerating every glyph, but this path
+    /// deliberately omits one. The tag must only appear when
+    /// [`CompositeFont::will_subset`] is true (the same predicate that
+    /// selects this `/CIDSet`-less branch above), so an explicit
+    /// `subset(false)` embed must keep the plain, untagged `BaseFont`/
+    /// `FontName` on every dictionary that carries it.
+    #[test]
+    fn build_full_embed_uses_untagged_base_font_name() {
+        let font = CompositeFont::new(sample_font_bytes(), "TestFont")
+            .unwrap()
+            .subset(false);
+        font.encode("AB中");
+        assert!(!font.will_subset());
+        let built = font.build(&ids()).unwrap();
+        let expected = Object::Name(PdfName::new_unchecked("TestFont"));
+        assert_eq!(built.descendant.get("BaseFont"), Some(&expected));
+        assert_eq!(built.descriptor.get("FontName"), Some(&expected));
+        assert_eq!(built.type0.get("BaseFont"), Some(&expected));
+    }
+
+    /// Same bug as [`build_full_embed_uses_untagged_base_font_name`], but
+    /// via the edge case that actually surfaced it in practice: `subset`
+    /// left at its default (`true`), yet no glyph ever gets used (e.g. the
+    /// encoded text has no matching glyph in the font's cmap at all, as
+    /// happens embedding a CJK-only font with English-only text). In that
+    /// case [`CompositeFont::will_subset`] is `false` (an empty glyph set
+    /// would make for a degenerate subset, so `build` falls back to a full
+    /// embed) even though `subset(true)` was requested — the tag must
+    /// track `will_subset()`, not the raw `subset` flag.
+    #[test]
+    fn build_with_no_glyphs_used_falls_back_to_untagged_full_embed() {
+        let font = CompositeFont::new(sample_font_bytes(), "TestFont").unwrap(); // subset() defaults to true
+        font.encode("Z"); // not in the fixture's cmap: used_glyphs() stays empty.
+        assert!(font.used_glyphs().is_empty());
+        assert!(!font.will_subset());
+        let built = font.build(&ids()).unwrap();
+        // Full embed, no /CIDSet, same as an explicit `subset(false)`.
+        assert!(built.font_file.is_some());
+        assert!(built.cid_set.is_none());
+        assert!(built.descriptor.get("CIDSet").is_none());
+        let expected = Object::Name(PdfName::new_unchecked("TestFont"));
+        assert_eq!(built.descendant.get("BaseFont"), Some(&expected));
+        assert_eq!(built.descriptor.get("FontName"), Some(&expected));
+        assert_eq!(built.type0.get("BaseFont"), Some(&expected));
+    }
+
     #[test]
     fn build_subset_produces_smaller_font_file_and_gid_map() {
         // Larger fixture so the size delta between full and subset is
@@ -614,6 +677,36 @@ mod tests {
             subset_built.descriptor.get("CIDSet"),
             Some(&Object::Reference(ids().cid_set_id.unwrap()))
         );
+    }
+
+    /// The converse of [`build_full_embed_uses_untagged_base_font_name`]:
+    /// when [`CompositeFont::will_subset`] is genuinely `true`, `build`
+    /// must still add the "ABCDEF+FontName" subset-tag prefix (ISO
+    /// 32000-1:2008 9.6.4.3) — this crate's `/CIDSet` stream (ISO
+    /// 19005-1:2005 6.3.5) is only correct for a tagged name, so the two
+    /// must stay paired.
+    #[test]
+    fn build_subset_uses_tagged_base_font_name() {
+        let font = CompositeFont::new(sample_font_bytes(), "TestFont").unwrap(); // subset() defaults to true
+        font.encode("AB中");
+        assert!(font.will_subset());
+        let built = font.build(&ids()).unwrap();
+        for name in [
+            built.descendant.get("BaseFont"),
+            built.descriptor.get("FontName"),
+            built.type0.get("BaseFont"),
+        ] {
+            match name {
+                Some(Object::Name(n)) => {
+                    let s = n.as_str();
+                    assert!(s.ends_with("+TestFont"), "expected a subset-tagged name, got {s:?}");
+                    let tag = &s[..6];
+                    assert_eq!(tag.len(), 6);
+                    assert!(tag.chars().all(|c| c.is_ascii_uppercase()));
+                }
+                other => panic!("expected a Name object, got {other:?}"),
+            }
+        }
     }
 
     /// ISO 19005-1:2005 6.3.5 / ISO 32000-1:2008 Table 122, as actually
