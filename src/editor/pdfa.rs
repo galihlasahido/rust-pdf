@@ -438,17 +438,16 @@ impl EditableDocument {
     /// CIDs the subset contains.
     ///
     /// This crate's own font-subsetting pipeline
-    /// ([`crate::font::cid::CompositeFont::build`]) does **not** currently
-    /// generate `/CIDSet` - discovered by running this crate's own
-    /// PDF/A-1b output through the real veraPDF CLI while building this
-    /// module, not from a spec read-through. Fixing the root cause (the
-    /// subsetter itself) is out of scope for this pass (it needs a new
-    /// object id threaded through `CompositeFontIds`/`BuiltCompositeFont`
-    /// and every writer that allocates one, in `crate::font::cid` and
-    /// `crate::document`; estimated at a few focused hours, not weeks,
-    /// but real, separate work from this conformance module). Checking
-    /// for it here at least keeps [`EditableDocument::validate_pdfa`]
-    /// from reporting a false "conformant" on a document with this gap.
+    /// ([`crate::font::cid::CompositeFont::build`]) now generates
+    /// `/CIDSet` (a bit vector, MSB-first, one bit per CID present in the
+    /// subsetted CIDFont program, ISO 32000-1:2008 Table 122) whenever it
+    /// actually subsets a font - fixed after this exact gap was found by
+    /// running this crate's own PDF/A-1b output through the real veraPDF
+    /// CLI while building this module. This check remains here as a
+    /// defense-in-depth guard (and to correctly flag any *other* producer's
+    /// output, or a hand-built `FontDescriptor`, that omits `/CIDSet` on a
+    /// subset-tagged CIDFont) rather than only trusting this crate's own
+    /// writer never to regress.
     fn check_cidset_present(&self, font_dict: &PdfDictionary, resource_name: &str, violations: &mut Vec<PdfAViolation>) {
         if !matches!(font_dict.get("Subtype"), Some(Object::Name(n)) if n.as_str() == "Type0") {
             return;
@@ -900,15 +899,45 @@ mod tests {
         assert_eq!(PdfAFlavor::Part2B.min_pdf_version(), PdfVersion::V1_7);
     }
 
-    /// Regression test for a gap discovered by actually running this
-    /// crate's own output through the real veraPDF CLI while building
-    /// this module (see `EditableDocument::check_cidset_present`'s docs
-    /// above): `crate::font::cid::CompositeFont`'s subsetter does not
-    /// generate `/CIDSet`, so `validate_pdfa` must catch that rather than
-    /// reporting a false "conformant".
+    /// Fixed-gap regression test: `crate::font::cid::CompositeFont`'s
+    /// subsetter used to omit `/CIDSet` on subset CIDFonts (found by
+    /// running this crate's own PDF/A-1b output through the real veraPDF
+    /// CLI while building this module - see
+    /// `EditableDocument::check_cidset_present`'s docs above). Now that
+    /// `CompositeFont::build` emits it, a genuinely subset composite-font
+    /// document must validate as PDF/A-1b conformant end to end (saved and
+    /// reopened, exactly like the vector-only conformance tests above).
     #[cfg(feature = "fonts")]
     #[test]
-    fn test_validate_pdfa_reports_missing_cidset_for_subset_cid_font() {
+    fn test_convert_then_save_then_reopen_is_pdfa1b_conformant_with_subset_cid_font() {
+        use crate::font::truetype::test_support::build_test_font;
+        use crate::font::CompositeFont;
+
+        let font_bytes = build_test_font(&[('A', 1), ('B', 2)]);
+        let composite = CompositeFont::new(font_bytes, "TestFont").unwrap(); // subset() defaults to true
+        let encoded = composite.encode("AB");
+        let content = ContentBuilder::new().text_block(TextBuilder::new().font("F1", 12.0).position(72.0, 700.0).show_bytes(encoded));
+        let page = PageBuilder::a4().font("F1", Font::Composite(composite)).content(content).build();
+        let bytes = DocumentBuilder::new().version(PdfVersion::V1_4).page(page).build().unwrap().save_to_bytes().unwrap();
+
+        let mut doc = EditableDocument::from_bytes(bytes).unwrap();
+        let icc = fake_icc_profile(IccColorSpace::Rgb);
+        doc.convert_to_pdfa(PdfAFlavor::Part1B, &sample_options(&icc)).unwrap();
+        let saved = doc.save_pdfa_compatible_to_bytes(PdfAFlavor::Part1B.min_pdf_version()).unwrap();
+
+        let reopened = EditableDocument::from_bytes(saved).unwrap();
+        let report = reopened.validate_pdfa(PdfAFlavor::Part1B).unwrap();
+        assert!(report.is_conformant(), "violations: {:#?}", report.violations);
+    }
+
+    /// Defense-in-depth test for `check_cidset_present` itself (not this
+    /// crate's own writer, which is now covered by the test above): a
+    /// hand-crafted subset-tagged CIDFont whose `FontDescriptor` is missing
+    /// `/CIDSet` (as if produced by some other, non-conformant tool) must
+    /// still be flagged.
+    #[cfg(feature = "fonts")]
+    #[test]
+    fn test_validate_pdfa_reports_missing_cidset_for_hand_built_subset_cid_font() {
         use crate::font::truetype::test_support::build_test_font;
         use crate::font::CompositeFont;
 
@@ -919,8 +948,30 @@ mod tests {
         let page = PageBuilder::a4().font("F1", Font::Composite(composite)).content(content).build();
         let bytes = DocumentBuilder::new().version(PdfVersion::V1_4).page(page).build().unwrap().save_to_bytes().unwrap();
 
-        let doc = EditableDocument::from_bytes(bytes).unwrap();
-        let report = doc.validate_pdfa(PdfAFlavor::Part1B).unwrap();
+        let mut doc = EditableDocument::from_bytes(bytes).unwrap();
+
+        // Locate the (now-present) /CIDSet this crate's own writer added
+        // and strip it back out, simulating a non-conformant producer.
+        let page_id = doc.page_id_at(0).unwrap();
+        let resources = doc.page_resources(page_id).unwrap();
+        let Some(Object::Dictionary(fonts)) = resources.get("Font") else { panic!("no /Font resources") };
+        let (_, font_obj) = fonts.iter().next().expect("page must have a font resource");
+        let Object::Reference(font_id) = font_obj else { panic!("font resource must be indirect") };
+        let font_dict = doc.get_dictionary(*font_id).unwrap();
+        let Some(Object::Array(descendants)) = font_dict.get("DescendantFonts") else { panic!("Type0 font must have DescendantFonts") };
+        let Some(Object::Reference(desc_id)) = descendants.get(0) else { panic!("DescendantFonts[0] must be indirect") };
+        let desc_dict = doc.get_dictionary(*desc_id).unwrap();
+        let Some(Object::Reference(fd_id)) = desc_dict.get("FontDescriptor") else { panic!("descendant font must have a FontDescriptor") };
+        let mut fd = doc.get_dictionary(*fd_id).unwrap();
+        assert!(fd.remove("CIDSet").is_some(), "test precondition: writer should have emitted /CIDSet for this subset font");
+        doc.set_object(*fd_id, Object::Dictionary(fd));
+
+        let icc = fake_icc_profile(IccColorSpace::Rgb);
+        doc.convert_to_pdfa(PdfAFlavor::Part1B, &sample_options(&icc)).unwrap();
+        let saved = doc.save_pdfa_compatible_to_bytes(PdfAFlavor::Part1B.min_pdf_version()).unwrap();
+
+        let reopened = EditableDocument::from_bytes(saved).unwrap();
+        let report = reopened.validate_pdfa(PdfAFlavor::Part1B).unwrap();
         assert!(report.violations.iter().any(|v| v.rule.contains("CIDSet")), "violations: {:#?}", report.violations);
     }
 }

@@ -141,6 +141,15 @@ impl Document {
                         } else {
                             None
                         };
+                        // Same condition as `cid_to_gid_map_id`: /CIDSet
+                        // (ISO 32000-1 Table 122) is only meaningful, and
+                        // only emitted by `CompositeFont::build`, for a
+                        // subset embed (ISO 19005-1 6.3.5).
+                        let cid_set_id = if cf.will_subset() {
+                            Some(pdf_writer.allocate_id())
+                        } else {
+                            None
+                        };
                         let tounicode_id = pdf_writer.allocate_id();
                         FontIds::Composite(crate::font::cid::CompositeFontIds {
                             type0_id,
@@ -148,6 +157,7 @@ impl Document {
                             descriptor_id,
                             font_file_id,
                             cid_to_gid_map_id,
+                            cid_set_id,
                             tounicode_id,
                         })
                     }
@@ -386,6 +396,12 @@ impl Document {
                             (cids.cid_to_gid_map_id, built.cid_to_gid_map)
                         {
                             pdf_writer.write_object_with_id(map_id, &Object::Stream(map_stream))?;
+                        }
+                        if let (Some(cid_set_id), Some(cid_set_stream)) =
+                            (cids.cid_set_id, built.cid_set)
+                        {
+                            pdf_writer
+                                .write_object_with_id(cid_set_id, &Object::Stream(cid_set_stream))?;
                         }
                     }
                 }
