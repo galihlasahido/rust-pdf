@@ -617,6 +617,7 @@ Runnable, `cargo run`-verified examples in [`examples/`](examples/):
 |---|---|---|
 | `forms_example` | `full` | Text fields, checkboxes, radio groups, combo/list boxes, push buttons |
 | `render_and_edit_demo` | `parser fonts render` | Outline, tagged structure, redaction, annotation, rendering |
+| `render_example` | `full render` | `PdfRenderer::render_page` full-page + tile/viewport rendering to PNG, plus inspecting `RenderWarning`s (JBIG2 image / Type1 font gaps) via `render::native::render_content_stream` |
 | `form_fill_flatten_demo` | `parser` | Fill an AcroForm, save incrementally, then flatten |
 | `cjk_font_demo` | `fonts parser` | Embedded/subsetted CJK composite font + text-extraction round-trip |
 | `pdfa_quickstart_demo` | `parser` | Minimal PDF/A-2b conversion + validation |
