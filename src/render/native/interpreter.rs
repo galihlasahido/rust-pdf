@@ -1662,6 +1662,31 @@ impl StrokeParams {
     /// Returns `true` as the second element if the dash pattern was
     /// rejected by `tiny-skia` (e.g. all-zero lengths) and fell back to a
     /// solid stroke.
+    ///
+    /// `width` and each dash-array length are routed through
+    /// [`super::path::sanitize_nonneg_magnitude`] rather than an unchecked
+    /// `as f32` cast: `self.line_width` and `self.dash_array` both come
+    /// straight from content-stream operands (`w`/`d`, ISO 32000-1:2008
+    /// 8.4.3.2/8.4.3.6) via [`GraphicsState`] with only a "not negative"
+    /// clamp applied at parse time, so an adversarial `w` with an
+    /// astronomically large (or non-finite, via an `f64`-parse overflow)
+    /// operand reaches this method otherwise unclamped. Unlike path
+    /// coordinates, an extreme *width* doesn't need an extreme point
+    /// anywhere on the path to trip `tiny-skia`'s internal scanline panic
+    /// -- stroke-to-fill expansion alone is enough (see
+    /// `sanitize_nonneg_magnitude`'s docs for the fuzz-found regression
+    /// this closes: `path::sanitize_point`'s coordinate clamp alone did
+    /// not cover this).
+    ///
+    /// `dash_phase` deliberately is *not* run through the same clamp: it
+    /// is legitimately allowed to be negative (ISO 32000-1 8.4.3.6 puts no
+    /// sign restriction on it) and `tiny_skia::StrokeDash::new` already
+    /// guards it independently -- it rejects a non-finite phase outright
+    /// (reported back here as `dash_invalid`, falling back to a solid
+    /// stroke) and otherwise wraps any finite phase, however large, into
+    /// `[0, interval_len)` *before* it can influence any path geometry, so
+    /// it cannot reach `tiny-skia`'s rasterizer unnormalized the way an
+    /// unclamped width could.
     fn build(&self) -> (Stroke, bool) {
         let det = self.ctm.a * self.ctm.d - self.ctm.b * self.ctm.c;
         let mut scale = det.abs().sqrt();
@@ -1670,7 +1695,7 @@ impl StrokeParams {
         }
 
         let mut stroke = Stroke {
-            width: (self.line_width * scale) as f32,
+            width: super::path::sanitize_nonneg_magnitude(self.line_width * scale),
             miter_limit: self.miter_limit.max(1.0) as f32,
             line_cap: self.line_cap,
             line_join: self.line_join,
@@ -1679,7 +1704,11 @@ impl StrokeParams {
 
         let mut dash_invalid = false;
         if !self.dash_array.is_empty() {
-            let mut scaled: Vec<f32> = self.dash_array.iter().map(|v| (v * scale).max(0.0) as f32).collect();
+            let mut scaled: Vec<f32> = self
+                .dash_array
+                .iter()
+                .map(|v| super::path::sanitize_nonneg_magnitude(v * scale))
+                .collect();
             if scaled.len() % 2 == 1 {
                 // ISO 32000-1 8.4.3.6: an odd-length dash array is used
                 // twice in succession (i.e. treated as if repeated).
@@ -1972,6 +2001,45 @@ mod tests {
     fn extreme_finite_path_coordinate_does_not_panic() {
         let content = b"0 0 m 0 16666666660 l 10 10 l f";
         let out = render_content_stream(content, 32, 32, page(), None).expect("must not panic on an extreme finite coordinate");
+        assert!(out.warnings.is_empty());
+    }
+
+    /// Fuzz-found regression (`render_interpreter` cargo-fuzz target,
+    /// crash artifact `crash-69d1f2a7ec9f0178343d175b1f9807f775e7709e`,
+    /// see [`super::path::sanitize_nonneg_magnitude`]'s docs): an
+    /// astronomically large `w` (line width) operand on an otherwise tiny,
+    /// perfectly ordinary path used to reach `tiny_skia::Stroke::width`
+    /// completely unclamped and trip the rasterizer's internal scanline
+    /// panic during stroke-to-fill expansion -- even though every path
+    /// *coordinate* here is well within
+    /// [`super::path::MAX_COORDINATE_MAGNITUDE`], proving the coordinate
+    /// clamp alone (exercised by the sibling
+    /// `extreme_finite_path_coordinate_does_not_panic` test above) does
+    /// not cover this attack shape. `StrokeParams::build` clamping `width`
+    /// directly is what closes it.
+    #[test]
+    fn extreme_finite_stroke_width_does_not_panic() {
+        // A 60-digit line width (~1e59): finite as `f64`, but many orders
+        // of magnitude past any width a legitimate page could plausibly
+        // use, and past `MAX_COORDINATE_MAGNITUDE`.
+        let huge_width = "9".repeat(60);
+        let content = format!("{huge_width} w 0 0 m 10 10 l s");
+        let out =
+            render_content_stream(content.as_bytes(), 32, 32, page(), None).expect("must not panic on an extreme finite stroke width");
+        assert!(out.warnings.is_empty());
+    }
+
+    /// Same regression as above, but with a line-width literal long
+    /// enough (well past `f64::MAX`'s ~309 decimal digits) that Rust's own
+    /// `str::parse::<f64>` saturates it to `f64::INFINITY` rather than a
+    /// large-but-finite value -- confirming the non-finite guard in
+    /// `sanitize_nonneg_magnitude` (as opposed to only the magnitude
+    /// clamp) is what stops this variant.
+    #[test]
+    fn infinite_stroke_width_does_not_panic() {
+        let huge_width = "9".repeat(400);
+        let content = format!("{huge_width} w 0 0 m 10 10 l s");
+        let out = render_content_stream(content.as_bytes(), 32, 32, page(), None).expect("must not panic on an infinite stroke width");
         assert!(out.warnings.is_empty());
     }
 }

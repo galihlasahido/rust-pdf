@@ -12,6 +12,37 @@
 //!   dangling resource reference, ...) that is recorded and skipped so the
 //!   rest of the content stream still renders, rather than the whole page
 //!   silently coming out blank or the interpreter panicking.
+//!
+//! **Both variants are "structured" in the sense this crate's untrusted-input
+//! rules require (a typed value a caller can match on, never a panic or a
+//! silent no-op) -- "structured" does not by itself mean "must be a
+//! `Result::Err`".** `Type3RecursionLimitExceeded` and
+//! `FormXObjectRecursionLimitExceeded` are deliberately [`RenderWarning`]s,
+//! not [`NativeRenderError`] variants, even though they are resource-limit
+//! trips exactly like `GraphicsStateStackOverflow`/`OperatorBudgetExceeded`/
+//! `RenderTimeBudgetExceeded`. The distinction is scope, not severity: the
+//! three `NativeRenderError` budgets above are *global* -- once tripped,
+//! the entire render's state (operator count, wall clock, one shared
+//! graphics-state stack) is no longer trustworthy, so the whole render must
+//! stop. A Form XObject/Type3 recursion limit, by contrast, is scoped to
+//! *one recursive branch*: hitting it means "stop descending into this one
+//! self-referential Form/glyph", not "this page's render as a whole is
+//! compromised" -- the rest of the page (every sibling operator, every
+//! other Form XObject/glyph) is still perfectly renderable and, per this
+//! crate's mandatory "don't let a malformed/corrupt PDF blank an otherwise
+//! fine page" rule, should still be rendered. Promoting these two to a hard
+//! `Err` would turn one pathological (or even just slightly-too-deep, but
+//! otherwise legitimate) nested Form/Type3 glyph into total page-render
+//! failure for a document that is otherwise completely fine -- strictly
+//! worse for a real caller than the current behavior, not more "correct".
+//! Both limits are still verified to actually bound recursion (not merely
+//! documented as doing so) by
+//! `self_referential_form_xobject_is_bounded_not_infinite` and
+//! `type3_self_referential_charproc_is_bounded_not_infinite`
+//! (`render::native::interpreter` tests), and by the `render_interpreter`
+//! fuzz target's hand-built mutually-recursive `/RecA`/`/RecB` Form
+//! XObjects and self-referential `/T3` font (see `docs/THREAT_MODEL.md`
+//! §4.6a).
 
 use thiserror::Error;
 

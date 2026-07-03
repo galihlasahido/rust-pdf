@@ -241,6 +241,39 @@ fn clamp_magnitude(v: f32) -> f32 {
     v.clamp(-MAX_COORDINATE_MAGNITUDE, MAX_COORDINATE_MAGNITUDE)
 }
 
+/// Sanitizes a single non-negative device-space *magnitude* (as opposed to
+/// [`sanitize_point`]'s coordinate *pair*) destined for a size-sensitive
+/// `tiny-skia` stroke parameter -- stroke width or a dash-array length,
+/// both of which `tiny-skia`'s stroke-to-fill conversion uses to *expand*
+/// a path's outline rather than merely place a point.
+///
+/// This exists because clamping path coordinates alone (`sanitize_point`)
+/// was not sufficient: a fuzz-found regression set an astronomically
+/// large line width via the `w` operator on an otherwise perfectly
+/// reasonable small path, then stroked it with `S`/`s`. Every literal
+/// coordinate in that path was already well inside
+/// [`MAX_COORDINATE_MAGNITUDE`], so `sanitize_point` never saw anything to
+/// clamp -- but `StrokeParams::build`'s `width` field
+/// (`render::native::interpreter`) fed that unclamped width straight into
+/// `tiny_skia::Stroke`, whose stroke-to-fill conversion then expanded the
+/// path's geometry by that width and tripped the exact same internal
+/// scanline panic (`scan/path.rs`'s `assertion failed: edges[curr_idx].
+/// last_y >= curr_y as i32`, documented in [`MAX_COORDINATE_MAGNITUDE`]'s
+/// docs) that clamping coordinates alone was believed to have fully
+/// closed. Non-finite input (`NaN`/`Infinity`, reachable e.g. from a
+/// content stream literal that overflows `f64` parsing) folds to `0.0`
+/// (tiny-skia treats a `0.0` stroke width as a thinnest-possible hairline,
+/// per ISO 32000-1:2008 8.4.3.2 -- not as "no stroke") rather than being
+/// clamped to a magnitude, since a magnitude-clamp alone would still let
+/// `NaN` slip through unchanged (`f32::clamp` returns its input as-is when
+/// that input is `NaN`).
+pub(super) fn sanitize_nonneg_magnitude(v: f64) -> f32 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    (v as f32).clamp(0.0, MAX_COORDINATE_MAGNITUDE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +390,43 @@ mod tests {
         let (x, y) = sanitize_point(123.5, -45.25);
         assert_eq!(x, 123.5);
         assert_eq!(y, -45.25);
+    }
+
+    /// Fuzz-found regression (see [`sanitize_nonneg_magnitude`]'s docs):
+    /// an astronomically large but finite stroke width/dash length is
+    /// clamped to [`MAX_COORDINATE_MAGNITUDE`] rather than passed through
+    /// unchanged -- this, not `sanitize_point`'s coordinate clamp, is what
+    /// stops `StrokeParams::build` (`render::native::interpreter`) from
+    /// handing `tiny-skia` a stroke width that trips its internal
+    /// scanline panic during stroke-to-fill expansion.
+    #[test]
+    fn sanitize_nonneg_magnitude_clamps_extreme_finite_value() {
+        assert_eq!(sanitize_nonneg_magnitude(1e11), MAX_COORDINATE_MAGNITUDE);
+
+        // A moderate, plausible width passes through unclamped.
+        assert_eq!(sanitize_nonneg_magnitude(2.5), 2.5);
+    }
+
+    /// Non-finite input (e.g. from a content-stream numeric literal long
+    /// enough to overflow `f64` parsing to infinity) folds to `0.0` rather
+    /// than being clamped to a magnitude -- `f32::clamp` would otherwise
+    /// pass a `NaN` input straight through unchanged (it only compares
+    /// against, and returns, its bounds, so it never actually observes
+    /// that its input is out of range when that input is `NaN`).
+    #[test]
+    fn sanitize_nonneg_magnitude_replaces_non_finite_with_zero() {
+        assert_eq!(sanitize_nonneg_magnitude(f64::NAN), 0.0);
+        assert_eq!(sanitize_nonneg_magnitude(f64::INFINITY), 0.0);
+        assert_eq!(sanitize_nonneg_magnitude(f64::NEG_INFINITY), 0.0);
+    }
+
+    /// A negative input (shouldn't normally occur -- both stroke width and
+    /// dash-array entries are clamped to non-negative well before reaching
+    /// this function -- but defensively checked here anyway) still clamps
+    /// into the non-negative range rather than passing a negative width
+    /// through to `tiny-skia`.
+    #[test]
+    fn sanitize_nonneg_magnitude_clamps_negative_to_zero() {
+        assert_eq!(sanitize_nonneg_magnitude(-5.0), 0.0);
     }
 }

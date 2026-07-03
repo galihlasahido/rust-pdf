@@ -230,6 +230,7 @@ glyph procedure's) into a PDF this process opens for rendering.
 | Input whose *cost per operator*, not operator count, is what makes it pathological (e.g. a legal, modest operator count that nonetheless does expensive per-operator work) | **New this phase:** `MAX_RENDER_DURATION = 20s` wall-clock budget (`interpreter.rs`), checked alongside the operator count on every content-stream item; `NativeRenderError::RenderTimeBudgetExceeded` | Coarser than the other bounds by nature (wall-clock, not a deterministic count) -- generous enough that no legitimate render should hit it, but a heavily-loaded host process could in principle see it trip closer to the margin than on idle hardware; accepted, since the alternative (no time bound at all) is strictly worse |
 | A single path object (between one path-painting operator and the next) accumulating unbounded points from a long run of `l`/`c` construction operators with no intervening paint | **New this phase:** `MAX_PATH_POINTS_PER_PATH = 1_000_000` (`path.rs`), reserved incrementally per path object and reset at the next path-painting operator; further construction on an over-budget path is dropped (not the whole render), `RenderWarning::PathPointBudgetExceeded` recorded once | None known |
 | **Found during this phase** via the `render_interpreter` fuzz target: a path with one finite-but-absurdly-large coordinate (reachable from an ordinary content stream via a huge literal operand, or a `cm` scale factor applied to an ordinary one) trips an internal `assert!` in `tiny_skia::scan::path::fill_path_impl` (`edges[curr_idx].last_y >= curr_y as i32`) and aborts the process -- **`tiny-skia` itself does not always gracefully refuse out-of-range geometry**, contradicting what this crate's own `render::native` module docs previously (incorrectly) claimed | `path::sanitize_point` now clamps every device-space coordinate's magnitude to `MAX_COORDINATE_MAGNITUDE = 1_000_000.0` (empirically well below the confirmed-safe `1e10` and confirmed-crashing `1e11` from bisecting this finding), in addition to its pre-existing `NaN`/`Infinity` sanitization -- same architecture as the `ttf-parser` `catch_unwind` mitigation in §4.3: a defensive clamp in this crate's own code at the boundary into a dependency, not a patch to the dependency itself. Regression test: `extreme_finite_path_coordinate_does_not_panic` (interpreter-level) and `sanitize_point_clamps_extreme_finite_magnitude` (unit-level) | **Medium, accepted for now, same posture as the `ttf-parser` entry in §4.3.** `tiny-skia`'s own internal fixed-point/scanline conversion evidently has other undocumented magnitude limits beyond the one bisected here; the clamp closes the *specific* reachable path (device-space coordinates from content-stream operands/CTM), but a coordinate reaching `tiny-skia` through some other, not-yet-audited path in this crate (e.g. a glyph outline scaled by an extreme `/FontMatrix`, or an extreme image transform) could in principle still exceed a similar internal limit through a code path this pass didn't specifically re-verify against the clamp. Re-review trigger: any further `render_interpreter` fuzz crash inside `tiny-skia` itself (as opposed to this crate's own code) should get its coordinate source added to `sanitize_point`'s call sites (already used by `to_device`, glyph outline conversion, `paint_placeholder_rect`, and `form_bbox_mask` -- see `path.rs`'s call sites) or, if genuinely unreachable through that helper, its own dedicated clamp |
+| **Found by an independent, later `render_interpreter` fuzz run (`crash-69d1f2a7ec9f0178343d175b1f9807f775e7709e`), minutes *after* this same phase's `sanitize_point` fix above had already been committed and its own "clean 250k-run" follow-up reported** -- proof that clamping path *coordinates* alone was not sufficient: a `w` (line width, ISO 32000-1 8.4.3.2) operand set to a finite-but-astronomically-large value (or, in a second variant, a literal long enough to overflow `f64::parse` to `Infinity`) on an otherwise perfectly ordinary small path reaches `tiny_skia::Stroke::width` unclamped and trips the *same* internal scanline `assert!` during stroke-to-fill expansion, even though every coordinate in the path is already within `MAX_COORDINATE_MAGNITUDE` | `StrokeParams::build` (`interpreter.rs`) now routes both the stroke `width` and every dash-array length through the new `path::sanitize_nonneg_magnitude`, which clamps a finite magnitude into `[0.0, MAX_COORDINATE_MAGNITUDE]` and folds non-finite (`NaN`/`±Infinity`) input to `0.0` (a `0.0` stroke width is a valid hairline stroke per 8.4.3.2, not "no stroke", so this is a safe fallback, not a silent no-op). Regression tests: `extreme_finite_stroke_width_does_not_panic` / `infinite_stroke_width_does_not_panic` (interpreter-level) and `sanitize_nonneg_magnitude_clamps_extreme_finite_value` / `sanitize_nonneg_magnitude_replaces_non_finite_with_zero` / `sanitize_nonneg_magnitude_clamps_negative_to_zero` (unit-level, `path.rs`) | **Same posture as the row above, and its own cautionary tale for that row's "accepted for now" reasoning: this crate's first attempt at "the coordinate clamp closes this class of `tiny-skia` panic" was itself incomplete**, because stroke width/dash length are magnitudes that reach `tiny-skia`'s rasterizer through a different call path than point coordinates, so the earlier fix's scope didn't cover them. Re-review trigger, updated: before declaring *any* `tiny-skia`-panic fuzz finding fully closed, explicitly check every numeric value flowing into a `tiny_skia::Stroke`/`Paint`/transform construction this crate builds (not just point coordinates) against `MAX_COORDINATE_MAGNITUDE`, not only the specific field the fuzzer happened to hit first. |
 
 ### 4.7 Signatures / encryption (`src/signatures/*`, `src/encryption/*`)
 
@@ -284,10 +285,33 @@ regression test the same phase it was found. A follow-up run of a clean
 examples of every attack shape named in this phase's task: deep `q`/`Q`
 nesting, path-operator floods, `Do`/`Tf`/`gs` invocations of the hostile
 resources) completed with **`Done 250000 runs in 145 second(s)`, zero
-crashes, zero timeouts, zero new artifacts** after that fix landed --
-satisfying this phase's "≥200,000 iterations, no crash" definition of
-done. Corpus coverage grew to 5637 edges / 2391 corpus entries over that
-run, per libFuzzer's own coverage counters.
+crashes, zero timeouts, zero new artifacts** after that fix landed.
+
+**That "clean" claim turned out to be premature and is corrected here
+rather than quietly rewritten.** A separate, independent 250,000-iteration
+run against that same fixed build (still within the same phase, minutes
+after the run above) found a second real crash,
+`crash-69d1f2a7ec9f0178343d175b1f9807f775e7709e` -- an astronomically large
+`w` (stroke width) operand, not a path coordinate, tripping the identical
+`tiny-skia` scanline `assert!` through a different call path (see the new
+row in §4.6a's table above). This is exactly why this document's own crash
+triage process (below) treats "a clean N-iteration run" as a snapshot of
+one build, not a permanent property of the interpreter: fuzzing is
+probabilistic coverage, and a 145-second/250,000-iteration run finding
+nothing is evidence the *known* crash class is fixed, not proof no
+*other* crash class exists. That second crash is now fixed the same way
+(`path::sanitize_nonneg_magnitude`, §4.6a) and covered by its own
+regression tests. A fresh 250,000-iteration run against the build with
+*both* fixes applied
+(`cargo +nightly fuzz run render_interpreter -- -runs=250000
+-max_len=65536 -timeout=25`) completed with **`Done 250000 runs in 161
+second(s)`, zero crashes, zero timeouts, zero new artifacts** --
+satisfying this phase's "≥200,000 iterations, no crash" definition of done
+against the currently-fixed code (corpus coverage: 5906 edges / 2973
+corpus entries / 873 KB per libFuzzer's own counters at the end of that
+run). As with the run it corrects, this is a snapshot, not a permanent
+guarantee -- see the crash triage process immediately below, and re-run
+this target after any further change to `render::native`.
 
 Crash triage process: a crash found by any target should (1) get a minimal
 reproducer via `cargo fuzz tmin`, (2) get a regression test added at the
@@ -335,7 +359,7 @@ depths in this crate, as of this phase (`grep -rn "^pub const MAX_\|^const MAX_"
 | `MAX_OPERATOR_COUNT` | 2,000,000 (new this phase) | `render/native/interpreter.rs` |
 | `MAX_RENDER_DURATION` | 20s wall-clock (new this phase) | `render/native/interpreter.rs` |
 | `MAX_PATH_POINTS_PER_PATH` | 1,000,000 (new this phase) | `render/native/path.rs` |
-| `MAX_COORDINATE_MAGNITUDE` | 1,000,000.0 device-space units (new this phase, fuzz-found) | `render/native/path.rs` |
+| `MAX_COORDINATE_MAGNITUDE` | 1,000,000.0 device-space units (new this phase, fuzz-found); also the ceiling used by `sanitize_nonneg_magnitude` for stroke width/dash-array lengths (fuzz-found second crash, §4.6a) | `render/native/path.rs` |
 | `MAX_CHAIN_DEPTH` | 16 | `signatures/chain.rs` |
 | `MAX_DSS_OBJECTS` | 4096 | `signatures/dss.rs` |
 | `MAX_SIGNATURE_SIZE` / `MAX_RESPONSE_LEN` | 1 MiB / 1 MiB | `signatures/signer.rs`, `signatures/timestamp.rs` |
