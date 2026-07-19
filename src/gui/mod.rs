@@ -19,6 +19,7 @@ mod forms;
 mod search;
 mod theme;
 mod thumbnails;
+mod tools;
 mod viewer;
 
 pub use app::PdfViewerApp;

@@ -11,12 +11,15 @@ use egui::{CentralPanel, Color32, Context, Panel, ScrollArea, Ui};
 use crate::editor::{BookmarkNode, Destination};
 use crate::error::{PdfResult, RenderError};
 use crate::render::PdfRenderer;
+use crate::types::Rectangle;
+use crate::Color;
 
 use super::actions;
 use super::coords::PageCoords;
 use super::forms::FormOverlayState;
 use super::search::SearchState;
 use super::thumbnails::{self, ThumbnailStrip};
+use super::tools::{self, FinishedGesture, Tool, ToolState};
 use super::viewer::PageViewer;
 
 const DEFAULT_DPI: f32 = 96.0;
@@ -66,6 +69,7 @@ pub struct PdfViewerApp {
     thumbnails: ThumbnailStrip,
     search: SearchState,
     forms: FormOverlayState,
+    tools: ToolState,
 
     /// Path the current document was opened from (or last saved to via
     /// "Save As…"). `None` when nothing is open.
@@ -99,6 +103,7 @@ impl Default for PdfViewerApp {
             thumbnails: ThumbnailStrip::default(),
             search: SearchState::default(),
             forms: FormOverlayState::default(),
+            tools: ToolState::default(),
             open_path: None,
             dirty: false,
             needs_full_rewrite: false,
@@ -123,6 +128,7 @@ impl PdfViewerApp {
         self.thumbnails.reset();
         self.search.reset();
         self.forms = FormOverlayState::default();
+        self.tools.set_active(Tool::None);
         self.current_page = 0;
         self.dirty = false;
         self.needs_full_rewrite = false;
@@ -368,6 +374,21 @@ impl PdfViewerApp {
                         ui.spinner();
                     }
                 });
+
+                let has_doc = self.page_count() > 0;
+                ui.add_enabled_ui(has_doc, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Tool:");
+                        for tool in tools::ALL_TOOLS {
+                            if ui
+                                .selectable_label(self.tools.active == tool, tool.label())
+                                .clicked()
+                            {
+                                self.tools.set_active(tool);
+                            }
+                        }
+                    });
+                });
             });
     }
 
@@ -608,6 +629,7 @@ impl PdfViewerApp {
                 }
 
                 let mut committed = false;
+                let mut finished_gesture = None;
                 let current_page = self.current_page;
                 let dpi = self.dpi;
                 ScrollArea::both().show(ui, |ui| {
@@ -620,8 +642,17 @@ impl PdfViewerApp {
                         if let Some(page_size_pt) = page_size_pt {
                             let coords =
                                 PageCoords::for_page(page_size_pt, dpi, image_response.rect);
-                            if self.forms.show(ui, &renderer, current_page, &coords) {
-                                committed = true;
+                            if self.tools.active == Tool::None {
+                                if self.forms.show(ui, &renderer, current_page, &coords) {
+                                    committed = true;
+                                }
+                            } else {
+                                finished_gesture = self.tools.handle(
+                                    ui,
+                                    image_response.rect,
+                                    &coords,
+                                    current_page,
+                                );
                             }
                         }
                     } else if let Some(error) = &self.viewer.error {
@@ -630,6 +661,9 @@ impl PdfViewerApp {
                         ui.label("Rendering…");
                     }
                 });
+                if let Some(gesture) = finished_gesture {
+                    self.commit_gesture(&renderer, gesture, None);
+                }
                 if committed {
                     self.mark_dirty();
                 }
@@ -639,6 +673,139 @@ impl PdfViewerApp {
 }
 
 impl PdfViewerApp {
+    /// Commits a finished annotation gesture (see `tools.rs`) into the
+    /// document. `text` is the prompt text for tools that needed one
+    /// (`FreeText`/`Stamp`/`Comment`) -- `None` for the immediate-commit
+    /// tools (`Highlight`/`Underline`/`Strikeout`/`Ink`).
+    fn commit_gesture(
+        &mut self,
+        renderer: &SharedRenderer,
+        gesture: FinishedGesture,
+        text: Option<&str>,
+    ) {
+        let page_index = gesture.page_index;
+        let result: PdfResult<()> = {
+            let mut renderer = renderer.write().unwrap_or_else(|p| p.into_inner());
+            match gesture.tool {
+                Tool::Highlight => {
+                    let quad = tools::bounding_rect(&gesture.points);
+                    renderer
+                        .edit_document(|doc| {
+                            doc.add_highlight_annotation(page_index, &[quad], Color::rgb(1.0, 1.0, 0.0))
+                        })
+                        .map(|_| ())
+                }
+                Tool::Underline => {
+                    let quad = tools::bounding_rect(&gesture.points);
+                    renderer
+                        .edit_document(|doc| {
+                            doc.add_underline_annotation(page_index, &[quad], Color::rgb(0.9, 0.1, 0.1))
+                        })
+                        .map(|_| ())
+                }
+                Tool::Strikeout => {
+                    let quad = tools::bounding_rect(&gesture.points);
+                    renderer
+                        .edit_document(|doc| {
+                            doc.add_strikeout_annotation(page_index, &[quad], Color::rgb(0.9, 0.1, 0.1))
+                        })
+                        .map(|_| ())
+                }
+                Tool::Ink => {
+                    let stroke = gesture.points.clone();
+                    renderer
+                        .edit_document(|doc| {
+                            doc.add_ink_annotation(page_index, &[stroke], Color::rgb(0.1, 0.3, 0.9), 2.0)
+                        })
+                        .map(|_| ())
+                }
+                Tool::Stamp => {
+                    let (llx, lly, urx, ury) = tools::bounding_rect(&gesture.points);
+                    let rect = Rectangle::new(llx, lly, urx, ury);
+                    let label = text.unwrap_or_default();
+                    renderer
+                        .edit_document(|doc| {
+                            doc.add_stamp_annotation(page_index, rect, label, Color::rgb(0.9, 0.5, 0.1))
+                        })
+                        .map(|_| ())
+                }
+                Tool::FreeText => {
+                    let (llx, lly, urx, ury) = tools::bounding_rect(&gesture.points);
+                    let rect = Rectangle::new(llx, lly, urx, ury);
+                    let content = text.unwrap_or_default();
+                    renderer
+                        .edit_document(|doc| {
+                            doc.add_freetext_annotation(page_index, rect, content, 12.0, Color::BLACK)
+                        })
+                        .map(|_| ())
+                }
+                Tool::Comment => {
+                    let (x, y) = gesture.points[0];
+                    let contents = text.unwrap_or_default();
+                    renderer
+                        .edit_document(|doc| doc.add_comment(page_index, (x, y), contents, None))
+                        .map(|_| ())
+                }
+                // Redaction and signature placement are handled by their
+                // own dedicated flows, not the generic annotation commit
+                // path -- see `apply_redaction`/the signing dialog.
+                Tool::Redact | Tool::SignPlace | Tool::None => Ok(()),
+            }
+        };
+
+        match result {
+            Ok(()) => self.mark_dirty(),
+            Err(err) => self.last_error = Some(format!("Annotation failed: {err}")),
+        }
+    }
+
+    /// Shows the small text prompt for a gesture that needs one before
+    /// it's committed (see `Tool::needs_prompt`). A no-op if nothing is
+    /// pending.
+    fn tool_prompt(&mut self, ctx: &Context) {
+        let Some(tool) = self.tools.pending.as_ref().map(|g| g.tool) else {
+            return;
+        };
+        let DocState::Loaded { renderer, .. } = &self.doc else {
+            self.tools.cancel_pending();
+            return;
+        };
+        let renderer = renderer.clone();
+
+        let title = match tool {
+            Tool::FreeText => "Add Text Box",
+            Tool::Stamp => "Add Stamp",
+            Tool::Comment => "Add Comment",
+            Tool::Redact => "Redact",
+            _ => "Add Annotation",
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.text_edit_multiline(&mut self.tools.prompt_text);
+                ui.horizontal(|ui| {
+                    if ui.button("Add").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if submit {
+            if let Some(gesture) = self.tools.take_pending() {
+                let text = std::mem::take(&mut self.tools.prompt_text);
+                self.commit_gesture(&renderer, gesture, Some(&text));
+            }
+        } else if cancel {
+            self.tools.cancel_pending();
+        }
+    }
+
     fn error_banner(&mut self, ui: &mut Ui) {
         let Some(message) = self.last_error.clone() else {
             return;
@@ -669,6 +836,7 @@ impl App for PdfViewerApp {
         if self.search.poll() {
             ctx.request_repaint();
         }
+        self.tool_prompt(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
