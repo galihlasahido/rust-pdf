@@ -3,11 +3,11 @@
 //! plain case-insensitive substring match, off the UI thread.
 
 use std::sync::mpsc;
-use std::sync::Arc;
 
 use crate::render::PdfRenderer;
 
 use super::actions;
+use super::app::SharedRenderer;
 
 const SNIPPET_RADIUS: usize = 40;
 /// Caps result count so a pathologically repetitive query (e.g. a single
@@ -30,15 +30,18 @@ pub struct SearchState {
 impl SearchState {
     /// Starts a background search over every page for the current `query`.
     /// An empty query just clears any existing results.
-    pub fn run(&mut self, renderer: &Arc<PdfRenderer>, page_count: usize) {
+    pub fn run(&mut self, renderer: &SharedRenderer, page_count: usize) {
         let query = self.query.trim().to_string();
         if query.is_empty() {
             self.results.clear();
             self.pending = None;
             return;
         }
-        let renderer = Arc::clone(renderer);
-        let rx = actions::spawn(move || search_all_pages(&renderer, page_count, &query));
+        let renderer = renderer.clone();
+        let rx = actions::spawn(move || {
+            let renderer = renderer.read().unwrap_or_else(|p| p.into_inner());
+            search_all_pages(&renderer, page_count, &query)
+        });
         self.pending = Some(rx);
     }
 

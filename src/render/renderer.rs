@@ -114,6 +114,33 @@ impl PdfRenderer {
         &self.document
     }
 
+    /// Runs `f` with mutable access to the underlying [`EditableDocument`]
+    /// (structural edits: form field values, annotations, page
+    /// manipulation, redaction, ...), then always clears the thumbnail
+    /// cache -- so a caller can never forget to invalidate a render cache
+    /// that's now stale. Prefer this over reaching into the document some
+    /// other way for any mutation that should be reflected next time a
+    /// page is rendered.
+    pub fn edit_document<R>(&mut self, f: impl FnOnce(&mut EditableDocument) -> R) -> R {
+        let result = f(&mut self.document);
+        self.clear_thumbnail_cache();
+        result
+    }
+
+    /// A page's raw, *unrotated* `/MediaBox` size in PDF user-space points
+    /// (ISO 32000-1 §7.7.3.3, 1/72 inch) -- the space `EditableDocument`'s
+    /// own field/annotation/text-layout rectangles are already expressed
+    /// in (see e.g. `list_form_fields`'s `FormFieldWidget::rect` and
+    /// `extract_page_text_layout`'s `TextRun`, both documented as
+    /// unrotated-page-space with rotation left to the caller). `None` for
+    /// an out-of-range or unreadable page index, mirroring
+    /// [`Self::render_page`]'s own `InvalidPageIndex`/`DocumentLoad`
+    /// failure modes rather than panicking.
+    pub fn page_size_pt(&self, page_index: usize) -> Option<(f64, f64)> {
+        let (_, media_box, _) = page_geometry(&self.document, page_index).ok()?;
+        Some((media_box.width(), media_box.height()))
+    }
+
     /// Renders a page to an RGBA raster image at the given resolution.
     ///
     /// # Parameters
@@ -174,7 +201,11 @@ impl PdfRenderer {
         let (disp_w_pt, disp_h_pt) = display_dimensions_pt(&media_box, rotate);
         let longest = disp_w_pt.max(disp_h_pt).max(1.0);
         let dpi = (72.0 * f64::from(max_dimension) / longest) as f32;
-        let dpi = if dpi.is_finite() && dpi > 0.0 { dpi } else { 72.0 };
+        let dpi = if dpi.is_finite() && dpi > 0.0 {
+            dpi
+        } else {
+            72.0
+        };
 
         let image = render_page_document(&self.document, page_index, dpi, None)?;
 
@@ -231,7 +262,12 @@ pub(crate) fn render_page_document(
     // font/image/ExtGState on a genuine whole-document page silently fail
     // to resolve (treated the same as "resource absent").
     let mut resolve_budget = MAX_RESOLVE_REFERENCES;
-    let mut resources = match deep_resolve(document, &Object::Dictionary(resources_raw), 0, &mut resolve_budget) {
+    let mut resources = match deep_resolve(
+        document,
+        &Object::Dictionary(resources_raw),
+        0,
+        &mut resolve_budget,
+    ) {
         Object::Dictionary(d) => d,
         _ => PdfDictionary::new(),
     };
@@ -245,7 +281,13 @@ pub(crate) fn render_page_document(
     // `append_annotation_appearances`'s own docs for the algorithm and
     // its documented simplifications.
     if let Ok(page_dict) = document.get_dictionary(page_id) {
-        append_annotation_appearances(document, &page_dict, &mut resources, &mut content, &mut resolve_budget);
+        append_annotation_appearances(
+            document,
+            &page_dict,
+            &mut resources,
+            &mut content,
+            &mut resolve_budget,
+        );
     }
 
     let (content_w, content_h) = page_pixel_size(&media_box, dpi);
@@ -253,7 +295,9 @@ pub(crate) fn render_page_document(
     check_dimensions(full_w, full_h)?;
 
     match viewport {
-        None => render_full_page(&content, &resources, media_box, content_w, content_h, rotate, page_index),
+        None => render_full_page(
+            &content, &resources, media_box, content_w, content_h, rotate, page_index,
+        ),
         Some(vp) => {
             if vp.width == 0 || vp.height == 0 {
                 return Err(RenderError::EmptyViewport);
@@ -275,8 +319,9 @@ pub(crate) fn render_page_document(
             }
             check_dimensions(vp.width, vp.height)?;
 
-            let full_page =
-                render_full_page(&content, &resources, media_box, content_w, content_h, rotate, page_index)?;
+            let full_page = render_full_page(
+                &content, &resources, media_box, content_w, content_h, rotate, page_index,
+            )?;
 
             Ok(image::imageops::crop_imm(&full_page, vp.x, vp.y, vp.width, vp.height).to_image())
         }
@@ -514,8 +559,16 @@ fn appearance_fit_matrix(bbox: Option<Rectangle>, form_matrix: Matrix, rect: Rec
     // A zero/degenerate transformed BBox extent can't be scaled to fit
     // `rect` (division by zero) -- fall back to no scaling on that axis
     // rather than producing a non-finite matrix.
-    let scale_x = if t_w.abs() > f64::EPSILON { rect.width() / t_w } else { 1.0 };
-    let scale_y = if t_h.abs() > f64::EPSILON { rect.height() / t_h } else { 1.0 };
+    let scale_x = if t_w.abs() > f64::EPSILON {
+        rect.width() / t_w
+    } else {
+        1.0
+    };
+    let scale_y = if t_h.abs() > f64::EPSILON {
+        rect.height() / t_h
+    } else {
+        1.0
+    };
 
     Matrix::translate(-t_llx, -t_lly)
         .multiply(&Matrix::scale(scale_x, scale_y))
@@ -540,7 +593,12 @@ fn appearance_fit_matrix(bbox: Option<Rectangle>, form_matrix: Matrix, rect: Rec
 /// -- which every consumer in [`native`] already treats as "absent"/
 /// unsupported (a warning, never a panic) -- rather than resolving
 /// forever or overflowing the stack.
-fn deep_resolve(document: &EditableDocument, obj: &Object, depth: u32, budget: &mut usize) -> Object {
+fn deep_resolve(
+    document: &EditableDocument,
+    obj: &Object,
+    depth: u32,
+    budget: &mut usize,
+) -> Object {
     if depth > MAX_RESOLVE_DEPTH {
         return Object::Null;
     }
@@ -558,7 +616,10 @@ fn deep_resolve(document: &EditableDocument, obj: &Object, depth: u32, budget: &
         Object::Dictionary(dict) => {
             let mut out = PdfDictionary::new();
             for (key, value) in dict.iter() {
-                out.set(key.clone(), deep_resolve(document, value, depth + 1, budget));
+                out.set(
+                    key.clone(),
+                    deep_resolve(document, value, depth + 1, budget),
+                );
             }
             Object::Dictionary(out)
         }
@@ -572,7 +633,10 @@ fn deep_resolve(document: &EditableDocument, obj: &Object, depth: u32, budget: &
         Object::Stream(stream) => {
             let mut new_dict = PdfDictionary::new();
             for (key, value) in stream.dictionary.iter() {
-                new_dict.set(key.clone(), deep_resolve(document, value, depth + 1, budget));
+                new_dict.set(
+                    key.clone(),
+                    deep_resolve(document, value, depth + 1, budget),
+                );
             }
             Object::Stream(PdfStream::from_raw(new_dict, stream.data.clone()))
         }
@@ -593,7 +657,10 @@ fn page_geometry(
     let page_count = page_ids.len();
     let page_id = *page_ids
         .get(page_index)
-        .ok_or(RenderError::InvalidPageIndex { index: page_index, page_count })?;
+        .ok_or(RenderError::InvalidPageIndex {
+            index: page_index,
+            page_count,
+        })?;
 
     let media_box = document
         .effective_media_box(page_id)
@@ -693,8 +760,9 @@ fn render_full_page(
     rotate: i64,
     page_index: usize,
 ) -> Result<RgbaImage, RenderError> {
-    let output = native::render_content_stream(content, content_w, content_h, media_box, Some(resources))
-        .map_err(|source| RenderError::PageRender { page_index, source })?;
+    let output =
+        native::render_content_stream(content, content_w, content_h, media_box, Some(resources))
+            .map_err(|source| RenderError::PageRender { page_index, source })?;
 
     let image = pixmap_to_rgba_image(&output.pixmap);
     Ok(rotate_image(image, rotate))
@@ -720,7 +788,8 @@ fn pixmap_to_rgba_image(pixmap: &Pixmap) -> RgbaImage {
     // is an internal invariant of this function's own loop, not a
     // property of untrusted file data, so `expect` here does not violate
     // this crate's "never unwrap/expect on data from a file" rule.
-    RgbaImage::from_raw(width, height, buf).expect("pixmap-derived buffer length always matches width*height*4")
+    RgbaImage::from_raw(width, height, buf)
+        .expect("pixmap-derived buffer length always matches width*height*4")
 }
 
 /// Applies a normalized (see [`normalize_rotate`]) clockwise rotation to a

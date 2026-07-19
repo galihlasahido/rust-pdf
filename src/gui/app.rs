@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use eframe::{App, Frame};
 use egui::{CentralPanel, Color32, Context, Panel, ScrollArea, Ui};
@@ -21,11 +21,20 @@ const DEFAULT_DPI: f32 = 96.0;
 const MIN_DPI: f32 = 24.0;
 const MAX_DPI: f32 = 600.0;
 
+/// Shared handle to the open document. A `RwLock` (rather than a bare
+/// `Arc<PdfRenderer>`) because editing features need exclusive `&mut`
+/// access to the underlying `EditableDocument` (see
+/// `PdfRenderer::edit_document`) while background threads may still be
+/// mid-render against the same document -- `.read()` for rendering (many
+/// pages can render concurrently, same as before), `.write()` for edits
+/// (naturally serializes against in-flight reads instead of racing them).
+pub(super) type SharedRenderer = Arc<RwLock<PdfRenderer>>;
+
 enum DocState {
     Empty,
     Loading,
     Loaded {
-        renderer: Arc<PdfRenderer>,
+        renderer: SharedRenderer,
         page_count: usize,
         bookmarks: Vec<BookmarkNode>,
     },
@@ -80,7 +89,7 @@ impl PdfViewerApp {
                 let page_count = renderer.page_count();
                 let bookmarks = renderer.document().list_bookmarks().unwrap_or_default();
                 self.doc = DocState::Loaded {
-                    renderer: Arc::new(renderer),
+                    renderer: Arc::new(RwLock::new(renderer)),
                     page_count,
                     bookmarks,
                 };

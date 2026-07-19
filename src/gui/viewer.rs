@@ -7,14 +7,14 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc;
-use std::sync::Arc;
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
 use crate::error::RenderError;
-use crate::render::{PdfRenderer, RgbaImage};
+use crate::render::RgbaImage;
 
 use super::actions;
+use super::app::SharedRenderer;
 
 type PageKey = (usize, u32); // (page_index, dpi.to_bits())
 
@@ -37,7 +37,7 @@ impl PageViewer {
     /// Marks `page_index`/`dpi` as the page to display, kicking off a
     /// background render if it's not already cached or in flight. Cheap to
     /// call every frame.
-    pub fn show(&mut self, renderer: &Arc<PdfRenderer>, page_index: usize, dpi: f32) {
+    pub fn show(&mut self, renderer: &SharedRenderer, page_index: usize, dpi: f32) {
         let key = (page_index, dpi.to_bits());
         self.current_key = Some(key);
         self.request(renderer, key);
@@ -46,18 +46,21 @@ impl PageViewer {
     /// Kicks off a background render for `page_index`/`dpi` without making
     /// it the currently-displayed page. Used to warm the cache for the
     /// page(s) next to the one currently shown.
-    pub fn prefetch(&mut self, renderer: &Arc<PdfRenderer>, page_index: usize, dpi: f32) {
+    pub fn prefetch(&mut self, renderer: &SharedRenderer, page_index: usize, dpi: f32) {
         self.request(renderer, (page_index, dpi.to_bits()));
     }
 
-    fn request(&mut self, renderer: &Arc<PdfRenderer>, key: PageKey) {
+    fn request(&mut self, renderer: &SharedRenderer, key: PageKey) {
         if self.cache_position(key).is_some() || self.pending.contains_key(&key) {
             return;
         }
         let (page_index, dpi_bits) = key;
         let dpi = f32::from_bits(dpi_bits);
-        let renderer = Arc::clone(renderer);
-        let rx = actions::spawn(move || renderer.render_page(page_index, dpi, None));
+        let renderer = renderer.clone();
+        let rx = actions::spawn(move || {
+            let renderer = renderer.read().unwrap_or_else(|p| p.into_inner());
+            renderer.render_page(page_index, dpi, None)
+        });
         self.pending.insert(key, rx);
     }
 
@@ -147,13 +150,15 @@ impl PageViewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::PdfRenderer;
+    use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
 
-    fn open_fixture() -> Arc<PdfRenderer> {
-        Arc::new(
+    fn open_fixture() -> SharedRenderer {
+        Arc::new(RwLock::new(
             PdfRenderer::open_file("tests/output/multipage_report.pdf")
                 .expect("fixture should open"),
-        )
+        ))
     }
 
     /// Polls until nothing is pending or a deadline passes, so the test

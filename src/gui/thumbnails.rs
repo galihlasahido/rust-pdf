@@ -11,9 +11,8 @@ use std::sync::Arc;
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
-use crate::render::PdfRenderer;
-
 use super::actions;
+use super::app::SharedRenderer;
 
 /// Longest side of a thumbnail, in pixels.
 pub const MAX_DIMENSION: u32 = 120;
@@ -40,7 +39,7 @@ impl ThumbnailStrip {
     /// is a no-op -- the caller re-requests every frame for visible rows,
     /// so it's retried automatically once a slot opens up). Cheap to call
     /// every frame for visible rows.
-    pub fn request(&mut self, renderer: &Arc<PdfRenderer>, page_index: usize) {
+    pub fn request(&mut self, renderer: &SharedRenderer, page_index: usize) {
         if self.textures.contains_key(&page_index) || self.pending.contains_key(&page_index) {
             return;
         }
@@ -49,10 +48,13 @@ impl ThumbnailStrip {
         }
         self.in_flight.fetch_add(1, Ordering::SeqCst);
 
-        let renderer = Arc::clone(renderer);
+        let renderer = renderer.clone();
         let in_flight = Arc::clone(&self.in_flight);
         let rx = actions::spawn(move || {
-            let result = renderer.render_thumbnail(page_index, MAX_DIMENSION);
+            let result = {
+                let renderer = renderer.read().unwrap_or_else(|p| p.into_inner());
+                renderer.render_thumbnail(page_index, MAX_DIMENSION)
+            };
             in_flight.fetch_sub(1, Ordering::SeqCst);
             result
         });
