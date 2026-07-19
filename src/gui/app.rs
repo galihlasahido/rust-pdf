@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use eframe::{App, Frame};
 use egui::{CentralPanel, Color32, Context, Panel, ScrollArea, Ui};
 
-use crate::editor::{BookmarkNode, Destination};
+use crate::editor::{BookmarkNode, Destination, EditableDocument};
 use crate::error::{PdfResult, RenderError};
 use crate::render::PdfRenderer;
 use crate::types::Rectangle;
@@ -688,26 +688,26 @@ impl PdfViewerApp {
             let mut renderer = renderer.write().unwrap_or_else(|p| p.into_inner());
             match gesture.tool {
                 Tool::Highlight => {
-                    let quad = tools::bounding_rect(&gesture.points);
+                    let quads = selected_text_quads(&renderer, page_index, &gesture.points);
                     renderer
                         .edit_document(|doc| {
-                            doc.add_highlight_annotation(page_index, &[quad], Color::rgb(1.0, 1.0, 0.0))
+                            doc.add_highlight_annotation(page_index, &quads, Color::rgb(1.0, 1.0, 0.0))
                         })
                         .map(|_| ())
                 }
                 Tool::Underline => {
-                    let quad = tools::bounding_rect(&gesture.points);
+                    let quads = selected_text_quads(&renderer, page_index, &gesture.points);
                     renderer
                         .edit_document(|doc| {
-                            doc.add_underline_annotation(page_index, &[quad], Color::rgb(0.9, 0.1, 0.1))
+                            doc.add_underline_annotation(page_index, &quads, Color::rgb(0.9, 0.1, 0.1))
                         })
                         .map(|_| ())
                 }
                 Tool::Strikeout => {
-                    let quad = tools::bounding_rect(&gesture.points);
+                    let quads = selected_text_quads(&renderer, page_index, &gesture.points);
                     renderer
                         .edit_document(|doc| {
-                            doc.add_strikeout_annotation(page_index, &[quad], Color::rgb(0.9, 0.1, 0.1))
+                            doc.add_strikeout_annotation(page_index, &quads, Color::rgb(0.9, 0.1, 0.1))
                         })
                         .map(|_| ())
                 }
@@ -746,15 +746,35 @@ impl PdfViewerApp {
                         .edit_document(|doc| doc.add_comment(page_index, (x, y), contents, None))
                         .map(|_| ())
                 }
-                // Redaction and signature placement are handled by their
-                // own dedicated flows, not the generic annotation commit
-                // path -- see `apply_redaction`/the signing dialog.
-                Tool::Redact | Tool::SignPlace | Tool::None => Ok(()),
+                Tool::Redact => {
+                    let (llx, lly, urx, ury) = tools::bounding_rect(&gesture.points);
+                    let rect = Rectangle::new(llx, lly, urx, ury);
+                    let reason = text.unwrap_or_default();
+                    let actor = current_actor();
+                    renderer
+                        .edit_document(|doc| doc.apply_redaction(page_index, rect, &actor, reason))
+                        .map(|_| ())
+                }
+                // Signature placement doesn't create an annotation at all
+                // -- it just records the drawn rect for the signing
+                // dialog (see `sign.rs`) to place the visible signature
+                // at, so it's not part of this commit path.
+                Tool::SignPlace | Tool::None => Ok(()),
             }
         };
+        let was_redaction = gesture.tool == Tool::Redact;
 
         match result {
-            Ok(()) => self.mark_dirty(),
+            Ok(()) => {
+                if was_redaction {
+                    // Redaction removes underlying bytes rather than just
+                    // hiding them -- `save_incremental` can't express
+                    // that, so every save for the rest of this session
+                    // must be a full rewrite.
+                    self.needs_full_rewrite = true;
+                }
+                self.mark_dirty();
+            }
             Err(err) => self.last_error = Some(format!("Annotation failed: {err}")),
         }
     }
@@ -871,6 +891,59 @@ fn show_bookmark(ui: &mut Ui, node: &BookmarkNode, jump_to: &mut Option<usize>) 
     }
 }
 
+/// Maps a Highlight/Underline/Strikeout drag gesture's PDF-space
+/// rectangle to the actual text runs it overlaps (via
+/// `extract_page_text_layout`), producing one quad per overlapping run
+/// rather than a single coarse bounding box -- this is what makes the
+/// markup track the underlying text instead of an approximate
+/// hand-drawn rectangle. Falls back to the gesture's own bounding box if
+/// the page has no extractable text under the drag, so the tool still
+/// places *something* visible rather than silently adding an empty
+/// annotation.
+fn selected_text_quads(
+    renderer: &PdfRenderer,
+    page_index: usize,
+    points: &[(f64, f64)],
+) -> Vec<(f64, f64, f64, f64)> {
+    let drag_rect = tools::bounding_rect(points);
+    let quads = text_run_quads(renderer.document(), page_index, drag_rect);
+    if quads.is_empty() {
+        vec![drag_rect]
+    } else {
+        quads
+    }
+}
+
+fn text_run_quads(
+    document: &EditableDocument,
+    page_index: usize,
+    drag_rect: (f64, f64, f64, f64),
+) -> Vec<(f64, f64, f64, f64)> {
+    let Ok(page_id) = document.page_id_at(page_index) else {
+        return Vec::new();
+    };
+    let Ok(runs) = document.extract_page_text_layout(page_id) else {
+        return Vec::new();
+    };
+    let (dllx, dlly, durx, dury) = drag_rect;
+    runs.into_iter()
+        .filter_map(|run| {
+            let (rllx, rlly, rurx, rury) = (run.x, run.y, run.x + run.width, run.y + run.height);
+            let intersects = rllx < durx && rurx > dllx && rlly < dury && rury > dlly;
+            intersects.then_some((rllx, rlly, rurx, rury))
+        })
+        .collect()
+}
+
+/// A best-effort "who did this" for the redaction audit trail
+/// (`RedactionAuditEntry::actor`) -- the OS account name, since this app
+/// has no user-identity system of its own.
+fn current_actor() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
 fn destination_page_index(dest: &Destination) -> Option<usize> {
     match dest {
         Destination::FitPage { page_index } | Destination::Xyz { page_index, .. } => {
@@ -890,4 +963,36 @@ fn surface_frame(ui: &Ui) -> egui::Frame {
     let fill = Color32::from_rgb(shift(base.r()), shift(base.g()), shift(base.b()));
 
     egui::Frame::side_top_panel(ui.style()).fill(fill)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_run_quads_finds_overlapping_runs_and_ignores_far_away_drags() {
+        let renderer =
+            PdfRenderer::open_file("tests/output/multipage_report.pdf").expect("should open");
+        let document = renderer.document();
+
+        let whole_page = text_run_quads(document, 0, (0.0, 0.0, 1000.0, 1000.0));
+        assert!(
+            !whole_page.is_empty(),
+            "a page-covering drag should overlap at least one text run"
+        );
+
+        let nowhere = text_run_quads(document, 0, (100_000.0, 100_000.0, 100_001.0, 100_001.0));
+        assert!(nowhere.is_empty());
+    }
+
+    #[test]
+    fn selected_text_quads_falls_back_to_the_drag_rect_when_nothing_overlaps() {
+        let renderer =
+            PdfRenderer::open_file("tests/output/multipage_report.pdf").expect("should open");
+        let points = [(100_000.0, 100_000.0), (100_001.0, 100_001.0)];
+
+        let quads = selected_text_quads(&renderer, 0, &points);
+
+        assert_eq!(quads, vec![(100_000.0, 100_000.0, 100_001.0, 100_001.0)]);
+    }
 }

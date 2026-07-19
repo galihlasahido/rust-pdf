@@ -191,3 +191,36 @@ fn page_management_actions_change_page_count_as_expected() {
         .expect("delete_page should succeed");
     assert_eq!(renderer.page_count(), original_count);
 }
+
+#[test]
+fn redaction_removes_content_and_requires_full_rewrite() {
+    // Exactly the wiring gui::app.rs's Redact tool depends on.
+    let mut renderer =
+        PdfRenderer::open_file("tests/output/multipage_report.pdf").expect("should open");
+
+    let entry = renderer
+        .edit_document(|doc| {
+            doc.apply_redaction(
+                0,
+                Rectangle::new(20.0, 20.0, 550.0, 750.0),
+                "test_actor",
+                "test reason",
+            )
+        })
+        .expect("apply_redaction should succeed");
+    assert_eq!(entry.actor, "test_actor");
+    assert_eq!(entry.reason, "test reason");
+
+    // save_incremental must refuse after a redaction (it can't express
+    // "some bytes are now permanently gone"); save_full_rewrite must not.
+    assert!(
+        renderer.document().save_incremental_to_bytes().is_err(),
+        "save_incremental should refuse after a redaction"
+    );
+    assert!(
+        renderer.document().save_full_rewrite_to_bytes().is_ok(),
+        "save_full_rewrite should still work after a redaction"
+    );
+
+    assert_eq!(renderer.document().audit_log().len(), 1);
+}
