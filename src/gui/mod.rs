@@ -14,7 +14,9 @@
 
 mod actions;
 mod app;
+mod search;
 mod theme;
+mod thumbnails;
 mod viewer;
 
 pub use app::PdfViewerApp;

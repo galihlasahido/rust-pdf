@@ -17,7 +17,10 @@ fn open_render_and_convert_to_color_image() {
         .render_page(0, 96.0, None)
         .expect("page 0 should render");
     assert!(image.width() > 0 && image.height() > 0);
-    assert_eq!(image.as_raw().len(), (image.width() * image.height() * 4) as usize);
+    assert_eq!(
+        image.as_raw().len(),
+        (image.width() * image.height() * 4) as usize
+    );
 
     // Exactly the conversion `gui::viewer::PageViewer::poll` performs.
     let size = [image.width() as usize, image.height() as usize];
@@ -40,5 +43,43 @@ fn document_accessor_exposes_bookmarks_api() {
         PdfRenderer::open_file("tests/output/multipage_report.pdf").expect("should open");
     // Just needs to not error -- this fixture may or may not have bookmarks,
     // the point is `PdfRenderer::document()` -> `list_bookmarks()` works.
-    let _ = renderer.document().list_bookmarks().expect("should not error");
+    let _ = renderer
+        .document()
+        .list_bookmarks()
+        .expect("should not error");
+}
+
+#[test]
+fn render_thumbnail_and_convert_to_color_image() {
+    // Exactly what `gui::thumbnails::ThumbnailStrip::poll` does.
+    let renderer =
+        PdfRenderer::open_file("tests/output/multipage_report.pdf").expect("should open");
+    let thumb = renderer
+        .render_thumbnail(0, 120)
+        .expect("thumbnail should render");
+    assert!(thumb.width() <= 120 && thumb.height() <= 120);
+
+    let size = [thumb.width() as usize, thumb.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw());
+    assert_eq!(color_image.size, size);
+}
+
+#[test]
+fn extract_page_text_by_index_for_search() {
+    // Exactly what `gui::search::search_all_pages` does per page.
+    let renderer =
+        PdfRenderer::open_file("tests/output/multipage_report.pdf").expect("should open");
+    let document = renderer.document();
+    let page_count = renderer.page_count();
+    assert!(page_count > 1);
+
+    let mut found_any_text = false;
+    for page_index in 0..page_count {
+        let page_id = document.page_id_at(page_index).expect("page id");
+        let text = document.extract_page_text(page_id).expect("extract text");
+        if !text.trim().is_empty() {
+            found_any_text = true;
+        }
+    }
+    assert!(found_any_text, "fixture should have extractable text somewhere");
 }

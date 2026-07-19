@@ -13,6 +13,8 @@ use crate::error::RenderError;
 use crate::render::PdfRenderer;
 
 use super::actions;
+use super::search::SearchState;
+use super::thumbnails::{self, ThumbnailStrip};
 use super::viewer::PageViewer;
 
 const DEFAULT_DPI: f32 = 96.0;
@@ -36,6 +38,8 @@ pub struct PdfViewerApp {
     current_page: usize,
     dpi: f32,
     viewer: PageViewer,
+    thumbnails: ThumbnailStrip,
+    search: SearchState,
 }
 
 impl Default for PdfViewerApp {
@@ -46,6 +50,8 @@ impl Default for PdfViewerApp {
             current_page: 0,
             dpi: DEFAULT_DPI,
             viewer: PageViewer::default(),
+            thumbnails: ThumbnailStrip::default(),
+            search: SearchState::default(),
         }
     }
 }
@@ -61,6 +67,8 @@ impl PdfViewerApp {
     fn open_file(&mut self, path: PathBuf) {
         self.doc = DocState::Loading;
         self.viewer.reset();
+        self.thumbnails.reset();
+        self.search.reset();
         self.current_page = 0;
         self.opening = Some(actions::spawn(move || PdfRenderer::open_file(&path)));
     }
@@ -107,6 +115,15 @@ impl PdfViewerApp {
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
+        let renderer_and_count = match &self.doc {
+            DocState::Loaded {
+                renderer,
+                page_count,
+                ..
+            } => Some((Arc::clone(renderer), *page_count)),
+            _ => None,
+        };
+
         Panel::top("toolbar")
             .frame(surface_frame(ui))
             .show(ui, |ui| {
@@ -171,7 +188,29 @@ impl PdfViewerApp {
                         self.dpi = DEFAULT_DPI;
                     }
 
-                    if self.opening.is_some() || self.viewer.is_loading() {
+                    ui.separator();
+
+                    let text_response = ui.add_enabled(
+                        has_doc,
+                        egui::TextEdit::singleline(&mut self.search.query)
+                            .hint_text("Search text…")
+                            .desired_width(160.0),
+                    );
+                    let search_clicked = ui
+                        .add_enabled(has_doc, egui::Button::new("Search"))
+                        .clicked();
+                    let submitted = text_response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    if let Some((renderer, page_count)) = &renderer_and_count {
+                        if search_clicked || submitted {
+                            self.search.run(renderer, *page_count);
+                        }
+                    }
+
+                    if self.opening.is_some()
+                        || self.viewer.is_loading()
+                        || self.search.is_searching()
+                    {
                         ui.spinner();
                     }
                 });
@@ -195,6 +234,88 @@ impl PdfViewerApp {
                 ScrollArea::vertical().show(ui, |ui| {
                     for bookmark in bookmarks {
                         show_bookmark(ui, bookmark, &mut jump_to);
+                    }
+                });
+            });
+        if let Some(page_index) = jump_to {
+            self.go_to_page(page_index);
+        }
+    }
+
+    fn search_results_panel(&mut self, ui: &mut Ui) {
+        if self.search.results().is_empty() && !self.search.is_searching() {
+            return;
+        }
+
+        let mut jump_to = None;
+        Panel::bottom("search_results")
+            .frame(surface_frame(ui))
+            .default_size(160.0)
+            .show(ui, |ui| {
+                if self.search.is_searching() {
+                    ui.label("Searching…");
+                    return;
+                }
+                let results = self.search.results();
+                ui.label(format!("{} match(es)", results.len()));
+                ScrollArea::vertical().show(ui, |ui| {
+                    for hit in results {
+                        let label = format!("Page {}: {}", hit.page_index + 1, hit.snippet);
+                        if ui.selectable_label(false, label).clicked() {
+                            jump_to = Some(hit.page_index);
+                        }
+                    }
+                });
+            });
+        if let Some(page_index) = jump_to {
+            self.go_to_page(page_index);
+        }
+    }
+
+    fn thumbnails_panel(&mut self, ui: &mut Ui) {
+        let DocState::Loaded {
+            renderer,
+            page_count,
+            ..
+        } = &self.doc
+        else {
+            return;
+        };
+        let renderer = Arc::clone(renderer);
+        let page_count = *page_count;
+        let current_page = self.current_page;
+
+        let mut jump_to = None;
+        Panel::right("thumbnails")
+            .frame(surface_frame(ui))
+            .default_size(140.0)
+            .show(ui, |ui| {
+                const ROW_HEIGHT: f32 = thumbnails::MAX_DIMENSION as f32 + 24.0;
+                ScrollArea::vertical().show_rows(ui, ROW_HEIGHT, page_count, |ui, row_range| {
+                    for page_index in row_range {
+                        self.thumbnails.request(&renderer, page_index);
+
+                        ui.vertical_centered(|ui| {
+                            let is_current = page_index == current_page;
+                            if let Some(texture) = self.thumbnails.texture(page_index) {
+                                let response = ui.add(
+                                    egui::Button::new(egui::Image::new(texture))
+                                        .selected(is_current),
+                                );
+                                if response.clicked() {
+                                    jump_to = Some(page_index);
+                                }
+                            } else {
+                                ui.add_sized(
+                                    [
+                                        thumbnails::MAX_DIMENSION as f32,
+                                        thumbnails::MAX_DIMENSION as f32 * 0.75,
+                                    ],
+                                    egui::Spinner::new(),
+                                );
+                            }
+                            ui.label(format!("{}", page_index + 1));
+                        });
                     }
                 });
             });
@@ -238,11 +359,19 @@ impl App for PdfViewerApp {
         if self.viewer.poll(ctx) {
             ctx.request_repaint();
         }
+        if self.thumbnails.poll(ctx) {
+            ctx.request_repaint();
+        }
+        if self.search.poll() {
+            ctx.request_repaint();
+        }
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
         self.toolbar(ui);
+        self.search_results_panel(ui);
         self.bookmarks_panel(ui);
+        self.thumbnails_panel(ui);
         self.page_panel(ui);
     }
 }
