@@ -14,6 +14,8 @@
 
 mod actions;
 mod app;
+mod coords;
+mod forms;
 mod search;
 mod theme;
 mod thumbnails;

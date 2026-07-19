@@ -9,10 +9,12 @@ use eframe::{App, Frame};
 use egui::{CentralPanel, Color32, Context, Panel, ScrollArea, Ui};
 
 use crate::editor::{BookmarkNode, Destination};
-use crate::error::RenderError;
+use crate::error::{PdfResult, RenderError};
 use crate::render::PdfRenderer;
 
 use super::actions;
+use super::coords::PageCoords;
+use super::forms::FormOverlayState;
 use super::search::SearchState;
 use super::thumbnails::{self, ThumbnailStrip};
 use super::viewer::PageViewer;
@@ -49,6 +51,23 @@ pub struct PdfViewerApp {
     viewer: PageViewer,
     thumbnails: ThumbnailStrip,
     search: SearchState,
+    forms: FormOverlayState,
+
+    /// Path the current document was opened from (or last saved to via
+    /// "Save As…"). `None` when nothing is open.
+    open_path: Option<PathBuf>,
+    /// Set on every successful edit, cleared on a successful save.
+    dirty: bool,
+    /// Set once a redaction (a future pass) runs this session: redaction
+    /// removes underlying bytes rather than just hiding them, which
+    /// `save_incremental` cannot express -- `save`/`save_as` must route
+    /// to `save_full_rewrite` once this is set, for the rest of the
+    /// session. Threaded through now so the redaction feature doesn't
+    /// need to also teach `save` about this later.
+    needs_full_rewrite: bool,
+    saving: Option<mpsc::Receiver<PdfResult<()>>>,
+    /// Most recent edit/save failure, shown as a dismissable banner.
+    last_error: Option<String>,
 }
 
 impl Default for PdfViewerApp {
@@ -61,6 +80,12 @@ impl Default for PdfViewerApp {
             viewer: PageViewer::default(),
             thumbnails: ThumbnailStrip::default(),
             search: SearchState::default(),
+            forms: FormOverlayState::default(),
+            open_path: None,
+            dirty: false,
+            needs_full_rewrite: false,
+            saving: None,
+            last_error: None,
         }
     }
 }
@@ -78,7 +103,12 @@ impl PdfViewerApp {
         self.viewer.reset();
         self.thumbnails.reset();
         self.search.reset();
+        self.forms = FormOverlayState::default();
         self.current_page = 0;
+        self.dirty = false;
+        self.needs_full_rewrite = false;
+        self.last_error = None;
+        self.open_path = Some(path.clone());
         self.opening = Some(actions::spawn(move || PdfRenderer::open_file(&path)));
     }
 
@@ -95,8 +125,17 @@ impl PdfViewerApp {
                 };
                 self.opening = None;
             }
+            Ok(Err(RenderError::PasswordRequired)) => {
+                self.doc = DocState::Error(
+                    "This PDF is password-protected. Encrypted PDFs aren't supported yet."
+                        .to_string(),
+                );
+                self.open_path = None;
+                self.opening = None;
+            }
             Ok(Err(err)) => {
                 self.doc = DocState::Error(err.to_string());
+                self.open_path = None;
                 self.opening = None;
             }
             Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),
@@ -104,9 +143,78 @@ impl PdfViewerApp {
                 self.doc = DocState::Error(
                     "failed to open file: worker thread ended unexpectedly".to_string(),
                 );
+                self.open_path = None;
                 self.opening = None;
             }
         }
+    }
+
+    /// Marks the document as having unsaved changes and drops the page
+    /// caches so the next render/thumbnail reflects the edit -- call this
+    /// after any successful mutation (form fill, page rotate/delete/
+    /// insert/reorder, and later annotate/redact/sign).
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.viewer.reset();
+        self.thumbnails.reset();
+    }
+
+    fn save(&mut self) {
+        self.trigger_save(self.needs_full_rewrite);
+    }
+
+    fn save_as(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).save_file() else {
+            return;
+        };
+        self.open_path = Some(path);
+        // Always a full rewrite for an arbitrary new path -- the simplest
+        // safe default (an incremental update assumes it's appending to
+        // bytes it already wrote, which isn't true when the target is a
+        // fresh file).
+        self.trigger_save(true);
+    }
+
+    fn trigger_save(&mut self, full_rewrite: bool) {
+        let (DocState::Loaded { renderer, .. }, Some(path)) = (&self.doc, &self.open_path) else {
+            return;
+        };
+        let renderer = renderer.clone();
+        let path = path.clone();
+        self.saving = Some(actions::spawn(move || {
+            let renderer = renderer.read().unwrap_or_else(|p| p.into_inner());
+            let doc = renderer.document();
+            if full_rewrite {
+                doc.save_full_rewrite(&path)
+            } else {
+                doc.save_incremental(&path)
+            }
+        }));
+    }
+
+    fn poll_save(&mut self, ctx: &Context) {
+        let Some(rx) = &self.saving else { return };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.dirty = false;
+                self.last_error = None;
+                self.saving = None;
+            }
+            Ok(Err(err)) => {
+                self.last_error = Some(format!("Save failed: {err}"));
+                self.saving = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.last_error =
+                    Some("Save failed: worker thread ended unexpectedly".to_string());
+                self.saving = None;
+            }
+        }
+    }
+
+    fn is_saving(&self) -> bool {
+        self.saving.is_some()
     }
 
     fn page_count(&self) -> usize {
@@ -120,6 +228,7 @@ impl PdfViewerApp {
         let page_count = self.page_count();
         if page_count > 0 {
             self.current_page = page_index.min(page_count - 1);
+            self.forms = FormOverlayState::default();
         }
     }
 
@@ -146,10 +255,26 @@ impl PdfViewerApp {
                         }
                     }
 
-                    ui.separator();
-
                     let page_count = self.page_count();
                     let has_doc = page_count > 0;
+
+                    if ui
+                        .add_enabled(has_doc && self.dirty, egui::Button::new("Save"))
+                        .clicked()
+                    {
+                        self.save();
+                    }
+                    if ui
+                        .add_enabled(has_doc, egui::Button::new("Save As…"))
+                        .clicked()
+                    {
+                        self.save_as();
+                    }
+                    if self.dirty {
+                        ui.colored_label(Color32::YELLOW, "●").on_hover_text("Unsaved changes");
+                    }
+
+                    ui.separator();
 
                     if ui
                         .add_enabled(
@@ -219,6 +344,7 @@ impl PdfViewerApp {
                     if self.opening.is_some()
                         || self.viewer.is_loading()
                         || self.search.is_searching()
+                        || self.is_saving()
                     {
                         ui.spinner();
                     }
@@ -361,23 +487,59 @@ impl PdfViewerApp {
                         .prefetch(&renderer, self.current_page - 1, self.dpi);
                 }
 
+                let mut committed = false;
+                let current_page = self.current_page;
+                let dpi = self.dpi;
                 ScrollArea::both().show(ui, |ui| {
                     if let Some(texture) = self.viewer.texture() {
-                        ui.image(texture);
+                        let image_response = ui.image(texture);
+                        let page_size_pt = {
+                            let guard = renderer.read().unwrap_or_else(|p| p.into_inner());
+                            guard.page_size_pt(current_page)
+                        };
+                        if let Some(page_size_pt) = page_size_pt {
+                            let coords =
+                                PageCoords::for_page(page_size_pt, dpi, image_response.rect);
+                            if self.forms.show(ui, &renderer, current_page, &coords) {
+                                committed = true;
+                            }
+                        }
                     } else if let Some(error) = &self.viewer.error {
                         ui.colored_label(Color32::RED, error);
                     } else {
                         ui.label("Rendering…");
                     }
                 });
+                if committed {
+                    self.mark_dirty();
+                }
             }
         });
+    }
+}
+
+impl PdfViewerApp {
+    fn error_banner(&mut self, ui: &mut Ui) {
+        let Some(message) = self.last_error.clone() else {
+            return;
+        };
+        Panel::top("error_banner")
+            .frame(egui::Frame::side_top_panel(ui.style()).fill(Color32::from_rgb(120, 30, 30)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(Color32::WHITE, &message);
+                    if ui.small_button("✕").clicked() {
+                        self.last_error = None;
+                    }
+                });
+            });
     }
 }
 
 impl App for PdfViewerApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut Frame) {
         self.poll_open(ctx);
+        self.poll_save(ctx);
         if self.viewer.poll(ctx) {
             ctx.request_repaint();
         }
@@ -391,6 +553,7 @@ impl App for PdfViewerApp {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
         self.toolbar(ui);
+        self.error_banner(ui);
         self.search_results_panel(ui);
         self.bookmarks_panel(ui);
         self.thumbnails_panel(ui);
