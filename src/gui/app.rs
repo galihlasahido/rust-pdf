@@ -90,6 +90,8 @@ pub struct PdfViewerApp {
     /// on a second click to actually delete -- a lightweight two-step
     /// confirm instead of a modal dialog.
     delete_confirm: Option<usize>,
+    /// Whether the annotations/redaction-log panel is toggled open.
+    show_annotations_panel: bool,
 }
 
 impl Default for PdfViewerApp {
@@ -110,6 +112,7 @@ impl Default for PdfViewerApp {
             saving: None,
             last_error: None,
             delete_confirm: None,
+            show_annotations_panel: false,
         }
     }
 }
@@ -387,6 +390,13 @@ impl PdfViewerApp {
                                 self.tools.set_active(tool);
                             }
                         }
+                        ui.separator();
+                        if ui
+                            .selectable_label(self.show_annotations_panel, "Annotations")
+                            .clicked()
+                        {
+                            self.show_annotations_panel = !self.show_annotations_panel;
+                        }
                     });
                 });
             });
@@ -444,6 +454,73 @@ impl PdfViewerApp {
             });
         if let Some(page_index) = jump_to {
             self.go_to_page(page_index);
+        }
+    }
+
+    fn annotations_panel(&mut self, ui: &mut Ui) {
+        if !self.show_annotations_panel {
+            return;
+        }
+        let DocState::Loaded { renderer, .. } = &self.doc else {
+            return;
+        };
+        let renderer = Arc::clone(renderer);
+        let current_page = self.current_page;
+
+        let mut delete_id = None;
+        Panel::bottom("annotations")
+            .frame(surface_frame(ui))
+            .default_size(180.0)
+            .show(ui, |ui| {
+                let (annotations, redactions) = {
+                    let guard = renderer.read().unwrap_or_else(|p| p.into_inner());
+                    let doc = guard.document();
+                    (
+                        doc.list_annotations(current_page).unwrap_or_default(),
+                        doc.audit_log().to_vec(),
+                    )
+                };
+
+                ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading(format!("Annotations on page {}", current_page + 1));
+                    if annotations.is_empty() {
+                        ui.label("No annotations on this page.");
+                    }
+                    for annot in &annotations {
+                        ui.horizontal(|ui| {
+                            let author = annot.author.as_deref().unwrap_or("(unknown)");
+                            let contents = annot.contents.as_deref().unwrap_or("");
+                            ui.label(format!("{:?} — {author}: {contents}", annot.kind));
+                            if ui.small_button("🗑").clicked() {
+                                delete_id = Some(annot.id);
+                            }
+                        });
+                    }
+
+                    ui.separator();
+                    ui.heading("Redaction log");
+                    if redactions.is_empty() {
+                        ui.label("No redactions applied.");
+                    }
+                    for entry in &redactions {
+                        let where_ = entry
+                            .page_index
+                            .map(|p| format!("page {}", p + 1))
+                            .unwrap_or_else(|| "document".to_string());
+                        ui.label(format!(
+                            "{} — {where_} — {}: {}",
+                            entry.timestamp, entry.actor, entry.reason
+                        ));
+                    }
+                });
+            });
+
+        if let Some(id) = delete_id {
+            let mut renderer = renderer.write().unwrap_or_else(|p| p.into_inner());
+            match renderer.edit_document(|doc| doc.delete_annotation(current_page, id)) {
+                Ok(()) => self.mark_dirty(),
+                Err(err) => self.last_error = Some(format!("Delete annotation failed: {err}")),
+            }
         }
     }
 
@@ -863,6 +940,7 @@ impl App for PdfViewerApp {
         self.toolbar(ui);
         self.error_banner(ui);
         self.search_results_panel(ui);
+        self.annotations_panel(ui);
         self.bookmarks_panel(ui);
         self.thumbnails_panel(ui);
         self.page_panel(ui);
