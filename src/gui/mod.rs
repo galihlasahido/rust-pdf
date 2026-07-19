@@ -17,6 +17,7 @@ mod app;
 mod coords;
 mod forms;
 mod search;
+mod sign;
 mod theme;
 mod thumbnails;
 mod tools;

@@ -86,7 +86,7 @@ tauri = ["dep:tauri", "dep:tokio", "dep:serde", "parser", "render", "signatures"
 # directly on `render::PdfRenderer`/`editor::EditableDocument` -- both are
 # already plain synchronous, Tauri-free APIs -- so this pulls in `render`
 # and `parser` only, no `tauri`/`tokio`/`serde` at all. See src/gui/mod.rs.
-native-gui = ["dep:eframe", "dep:egui", "dep:rfd", "render", "parser"]
+native-gui = ["dep:eframe", "dep:egui", "dep:rfd", "render", "parser", "signatures"]
 
 [dependencies]
 thiserror = "2.0"

@@ -18,6 +18,7 @@ use super::actions;
 use super::coords::PageCoords;
 use super::forms::FormOverlayState;
 use super::search::SearchState;
+use super::sign::{self, SignDialogState};
 use super::thumbnails::{self, ThumbnailStrip};
 use super::tools::{self, FinishedGesture, Tool, ToolState};
 use super::viewer::PageViewer;
@@ -92,6 +93,7 @@ pub struct PdfViewerApp {
     delete_confirm: Option<usize>,
     /// Whether the annotations/redaction-log panel is toggled open.
     show_annotations_panel: bool,
+    sign_dialog: SignDialogState,
 }
 
 impl Default for PdfViewerApp {
@@ -113,6 +115,7 @@ impl Default for PdfViewerApp {
             last_error: None,
             delete_confirm: None,
             show_annotations_panel: false,
+            sign_dialog: SignDialogState::default(),
         }
     }
 }
@@ -132,6 +135,7 @@ impl PdfViewerApp {
         self.search.reset();
         self.forms = FormOverlayState::default();
         self.tools.set_active(Tool::None);
+        self.sign_dialog = SignDialogState::default();
         self.current_page = 0;
         self.dirty = false;
         self.needs_full_rewrite = false;
@@ -396,6 +400,9 @@ impl PdfViewerApp {
                             .clicked()
                         {
                             self.show_annotations_panel = !self.show_annotations_panel;
+                        }
+                        if ui.button("Sign Document…").clicked() {
+                            self.begin_sign(None);
                         }
                     });
                 });
@@ -739,7 +746,12 @@ impl PdfViewerApp {
                     }
                 });
                 if let Some(gesture) = finished_gesture {
-                    self.commit_gesture(&renderer, gesture, None);
+                    if gesture.tool == Tool::SignPlace {
+                        let rect = tools::bounding_rect(&gesture.points);
+                        self.begin_sign(Some(rect));
+                    } else {
+                        self.commit_gesture(&renderer, gesture, None);
+                    }
                 }
                 if committed {
                     self.mark_dirty();
@@ -903,6 +915,207 @@ impl PdfViewerApp {
         }
     }
 
+    /// Opens the "Sign Document" dialog. `visible_rect` is the PDF-space
+    /// rectangle captured via `Tool::SignPlace`, if signing was triggered
+    /// that way rather than from the toolbar button directly.
+    fn begin_sign(&mut self, visible_rect: Option<(f64, f64, f64, f64)>) {
+        self.sign_dialog.open = true;
+        self.sign_dialog.visible_rect = visible_rect;
+        self.sign_dialog.error = None;
+        self.tools.set_active(Tool::None);
+    }
+
+    fn poll_signing(&mut self, ctx: &Context) {
+        let Some(rx) = &self.sign_dialog.signing else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(output_path)) => {
+                self.sign_dialog = SignDialogState::default();
+                self.open_file(output_path);
+            }
+            Ok(Err(err)) => {
+                self.sign_dialog.error = Some(err);
+                self.sign_dialog.signing = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.sign_dialog.error =
+                    Some("Signing failed: worker thread ended unexpectedly".to_string());
+                self.sign_dialog.signing = None;
+            }
+        }
+    }
+
+    fn sign_dialog_window(&mut self, ctx: &Context) {
+        if !self.sign_dialog.open {
+            return;
+        }
+        let DocState::Loaded { renderer, .. } = &self.doc else {
+            self.sign_dialog.open = false;
+            return;
+        };
+        let renderer = Arc::clone(renderer);
+
+        let mut close = false;
+        let mut do_sign = false;
+        egui::Window::new("Sign Document")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Certificate (PEM):");
+                    if ui.button("Browse…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Certificate", &["pem", "crt", "cer"])
+                            .pick_file()
+                        {
+                            self.sign_dialog.cert_path = Some(path);
+                        }
+                    }
+                });
+                ui.label(
+                    self.sign_dialog
+                        .cert_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none selected)".to_string()),
+                );
+
+                ui.horizontal(|ui| {
+                    ui.label("Private key (PEM):");
+                    if ui.button("Browse…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Private key", &["pem", "key"])
+                            .pick_file()
+                        {
+                            self.sign_dialog.key_path = Some(path);
+                        }
+                    }
+                });
+                ui.label(
+                    self.sign_dialog
+                        .key_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none selected)".to_string()),
+                );
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut self.sign_dialog.name);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Reason:");
+                    ui.text_edit_singleline(&mut self.sign_dialog.reason);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Location:");
+                    ui.text_edit_singleline(&mut self.sign_dialog.location);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Contact info:");
+                    ui.text_edit_singleline(&mut self.sign_dialog.contact_info);
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Algorithm:");
+                    egui::ComboBox::new("sign_algorithm", "")
+                        .selected_text(sign::algorithm_label(self.sign_dialog.algorithm))
+                        .show_ui(ui, |ui| {
+                            for algo in sign::ALGORITHMS {
+                                ui.selectable_value(
+                                    &mut self.sign_dialog.algorithm,
+                                    algo,
+                                    sign::algorithm_label(algo),
+                                );
+                            }
+                        });
+                });
+                ui.checkbox(&mut self.sign_dialog.pades_b, "PAdES-B (CAdES baseline)");
+
+                if self.sign_dialog.visible_rect.is_some() {
+                    ui.label(
+                        "A visible signature widget will be drawn on the document's first page.",
+                    );
+                } else {
+                    ui.label("This will be an invisible signature (no visible widget).");
+                }
+
+                if let Some(error) = &self.sign_dialog.error {
+                    ui.colored_label(Color32::RED, error);
+                }
+
+                ui.horizontal(|ui| {
+                    let ready = self.sign_dialog.cert_path.is_some()
+                        && self.sign_dialog.key_path.is_some()
+                        && !self.sign_dialog.is_signing();
+                    if ui.add_enabled(ready, egui::Button::new("Sign…")).clicked() {
+                        do_sign = true;
+                    }
+                    if ui
+                        .add_enabled(!self.sign_dialog.is_signing(), egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                    if self.sign_dialog.is_signing() {
+                        ui.spinner();
+                    }
+                });
+            });
+
+        if do_sign {
+            let Some(output_path) = rfd::FileDialog::new()
+                .add_filter("PDF", &["pdf"])
+                .set_file_name("signed.pdf")
+                .save_file()
+            else {
+                return;
+            };
+            let pdf_bytes = {
+                let guard = renderer.read().unwrap_or_else(|p| p.into_inner());
+                match guard.document().save_full_rewrite_to_bytes() {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        self.sign_dialog.error =
+                            Some(format!("Failed to prepare document: {err}"));
+                        return;
+                    }
+                }
+            };
+            let cert_path = self.sign_dialog.cert_path.clone().unwrap();
+            let key_path = self.sign_dialog.key_path.clone().unwrap();
+            let name = self.sign_dialog.name.clone();
+            let reason = self.sign_dialog.reason.clone();
+            let location = self.sign_dialog.location.clone();
+            let contact_info = self.sign_dialog.contact_info.clone();
+            let algorithm = self.sign_dialog.algorithm;
+            let pades_b = self.sign_dialog.pades_b;
+            let visible_rect = self.sign_dialog.visible_rect;
+            self.sign_dialog.error = None;
+            self.sign_dialog.signing = Some(actions::spawn(move || {
+                sign::sign_in_background(
+                    pdf_bytes,
+                    cert_path,
+                    key_path,
+                    name,
+                    reason,
+                    location,
+                    contact_info,
+                    algorithm,
+                    pades_b,
+                    visible_rect,
+                    output_path,
+                )
+            }));
+        }
+        if close {
+            self.sign_dialog = SignDialogState::default();
+        }
+    }
+
     fn error_banner(&mut self, ui: &mut Ui) {
         let Some(message) = self.last_error.clone() else {
             return;
@@ -934,6 +1147,7 @@ impl App for PdfViewerApp {
             ctx.request_repaint();
         }
         self.tool_prompt(ctx);
+        self.poll_signing(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
@@ -944,6 +1158,7 @@ impl App for PdfViewerApp {
         self.bookmarks_panel(ui);
         self.thumbnails_panel(ui);
         self.page_panel(ui);
+        self.sign_dialog_window(ui.ctx());
     }
 }
 
