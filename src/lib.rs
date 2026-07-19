@@ -70,6 +70,8 @@ pub mod error;
 pub mod filter;
 pub mod font;
 pub mod forms;
+#[cfg(feature = "native-gui")]
+pub mod gui;
 #[cfg(feature = "images")]
 pub mod image;
 pub mod object;

@@ -6,6 +6,11 @@ edition = "2021"
 [lib]
 crate-type = ["rlib", "cdylib"]  # rlib for Rust, cdylib for C/FFI
 
+[[bin]]
+name = "rust-pdf-gui"
+path = "src/gui/main.rs"
+required-features = ["native-gui"]
+
 [features]
 default = []
 compression = ["flate2"]
@@ -77,6 +82,11 @@ render = ["native-render", "images"]
 # `parser` (structural editing), `render` (rasterization) and
 # `signatures` (digital signing), so pulls all three in.
 tauri = ["dep:tauri", "dep:tokio", "dep:serde", "parser", "render", "signatures"]
+# Native desktop GUI shell (egui/eframe), gui/mod.rs and its siblings. Built
+# directly on `render::PdfRenderer`/`editor::EditableDocument` -- both are
+# already plain synchronous, Tauri-free APIs -- so this pulls in `render`
+# and `parser` only, no `tauri`/`tokio`/`serde` at all. See src/gui/mod.rs.
+native-gui = ["dep:eframe", "dep:egui", "dep:rfd", "render", "parser"]
 
 [dependencies]
 thiserror = "2.0"
@@ -146,6 +156,15 @@ tauri = { version = "2", optional = true }
 # runtime to an app that already uses Tauri.
 tokio = { version = "1", optional = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 serde = { version = "1", optional = true, features = ["derive"] }
+# Native GUI shell (feature `native-gui`, see src/gui): immediate-mode UI
+# toolkit + its native windowing/rendering backend. Pure Rust, no webview.
+egui = { version = "0.35", optional = true }
+# `glow` (OpenGL) renderer only -- lighter/faster to compile than pulling in
+# `wgpu` as well, and sufficient for 2D document rendering.
+eframe = { version = "0.35", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+# Native "Open File" dialog (feature `native-gui`) -- OS-native picker
+# (NSOpenPanel/IFileOpenDialog/GTK), no custom-built file browser UI.
+rfd = { version = "0.17", optional = true }
 
 [dev-dependencies]
 lopdf = "0.43.0"

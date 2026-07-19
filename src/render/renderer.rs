@@ -107,6 +107,13 @@ impl PdfRenderer {
         self.document.page_count().unwrap_or(0)
     }
 
+    /// Returns the underlying [`EditableDocument`], for callers that need
+    /// document-level operations (bookmarks, text layout, form fields, ...)
+    /// alongside rendering without opening the same file a second time.
+    pub fn document(&self) -> &EditableDocument {
+        &self.document
+    }
+
     /// Renders a page to an RGBA raster image at the given resolution.
     ///
     /// # Parameters
