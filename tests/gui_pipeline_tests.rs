@@ -81,5 +81,8 @@ fn extract_page_text_by_index_for_search() {
             found_any_text = true;
         }
     }
-    assert!(found_any_text, "fixture should have extractable text somewhere");
+    assert!(
+        found_any_text,
+        "fixture should have extractable text somewhere"
+    );
 }

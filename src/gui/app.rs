@@ -335,9 +335,22 @@ impl PdfViewerApp {
             DocState::Error(message) => {
                 ui.centered_and_justified(|ui| ui.colored_label(Color32::RED, message));
             }
-            DocState::Loaded { renderer, .. } => {
+            DocState::Loaded {
+                renderer,
+                page_count,
+                ..
+            } => {
                 let renderer = Arc::clone(renderer);
-                self.viewer.request(&renderer, self.current_page, self.dpi);
+                let page_count = *page_count;
+                self.viewer.show(&renderer, self.current_page, self.dpi);
+                if self.current_page + 1 < page_count {
+                    self.viewer
+                        .prefetch(&renderer, self.current_page + 1, self.dpi);
+                }
+                if self.current_page > 0 {
+                    self.viewer
+                        .prefetch(&renderer, self.current_page - 1, self.dpi);
+                }
 
                 ScrollArea::both().show(ui, |ui| {
                     if let Some(texture) = self.viewer.texture() {
