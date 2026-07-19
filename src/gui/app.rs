@@ -12,7 +12,7 @@ use crate::editor::{BookmarkNode, Destination, EditableDocument};
 use crate::error::{PdfResult, RenderError};
 use crate::render::PdfRenderer;
 use crate::types::Rectangle;
-use crate::Color;
+use crate::{Color, SignatureVerifier, VerifiedSignature};
 
 use super::actions;
 use super::coords::PageCoords;
@@ -94,6 +94,14 @@ pub struct PdfViewerApp {
     /// Whether the annotations/redaction-log panel is toggled open.
     show_annotations_panel: bool,
     sign_dialog: SignDialogState,
+    /// Whether the signatures panel is toggled open.
+    show_signatures_panel: bool,
+    /// Most recently computed signature-verification results, cleared
+    /// whenever a new document opens or an edit is made (verification
+    /// reads the *saved* file, not in-memory edits -- see
+    /// `start_signature_check`'s doc comment).
+    signatures_result: Option<Vec<VerifiedSignature>>,
+    signature_check: Option<mpsc::Receiver<Result<Vec<VerifiedSignature>, String>>>,
 }
 
 impl Default for PdfViewerApp {
@@ -116,6 +124,9 @@ impl Default for PdfViewerApp {
             delete_confirm: None,
             show_annotations_panel: false,
             sign_dialog: SignDialogState::default(),
+            show_signatures_panel: false,
+            signatures_result: None,
+            signature_check: None,
         }
     }
 }
@@ -136,6 +147,8 @@ impl PdfViewerApp {
         self.forms = FormOverlayState::default();
         self.tools.set_active(Tool::None);
         self.sign_dialog = SignDialogState::default();
+        self.signatures_result = None;
+        self.signature_check = None;
         self.current_page = 0;
         self.dirty = false;
         self.needs_full_rewrite = false;
@@ -189,6 +202,9 @@ impl PdfViewerApp {
         self.dirty = true;
         self.viewer.reset();
         self.thumbnails.reset();
+        // Stale the moment there's an unsaved edit -- verification reads
+        // the saved file, not in-memory changes.
+        self.signatures_result = None;
     }
 
     fn save(&mut self) {
@@ -404,6 +420,19 @@ impl PdfViewerApp {
                         if ui.button("Sign Document…").clicked() {
                             self.begin_sign(None);
                         }
+                        if ui
+                            .selectable_label(self.show_signatures_panel, "Signatures")
+                            .clicked()
+                        {
+                            self.show_signatures_panel = !self.show_signatures_panel;
+                            if self.show_signatures_panel
+                                && self.signatures_result.is_none()
+                                && self.signature_check.is_none()
+                                && !self.dirty
+                            {
+                                self.start_signature_check();
+                            }
+                        }
                     });
                 });
             });
@@ -529,6 +558,151 @@ impl PdfViewerApp {
                 Err(err) => self.last_error = Some(format!("Delete annotation failed: {err}")),
             }
         }
+    }
+
+    /// Verification reads the signed bytes on disk (via
+    /// `SignatureVerifier::from_file`) rather than round-tripping the
+    /// in-memory `EditableDocument` -- the simplest way to guarantee
+    /// what's checked is exactly what a signature covers, and it matches
+    /// what a user means by "check this file's signatures". Callers must
+    /// not call this while `self.dirty` (the toolbar/panel both guard on
+    /// it) since the on-disk file wouldn't reflect pending edits.
+    fn start_signature_check(&mut self) {
+        let Some(path) = self.open_path.clone() else {
+            return;
+        };
+        self.signature_check = Some(actions::spawn(move || {
+            SignatureVerifier::from_file(&path)
+                .and_then(|v| v.verify())
+                .map_err(|e| e.to_string())
+        }));
+    }
+
+    fn poll_signature_check(&mut self, ctx: &Context) {
+        let Some(rx) = &self.signature_check else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(results)) => {
+                self.signatures_result = Some(results);
+                self.signature_check = None;
+            }
+            Ok(Err(err)) => {
+                self.last_error = Some(format!("Signature check failed: {err}"));
+                self.signature_check = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.last_error =
+                    Some("Signature check failed: worker thread ended unexpectedly".to_string());
+                self.signature_check = None;
+            }
+        }
+    }
+
+    fn signatures_panel(&mut self, ui: &mut Ui) {
+        if !self.show_signatures_panel || self.page_count() == 0 {
+            return;
+        }
+
+        Panel::bottom("signatures")
+            .frame(surface_frame(ui))
+            .default_size(200.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Digital Signatures");
+                    let checking = self.signature_check.is_some();
+                    if ui
+                        .add_enabled(
+                            !checking && !self.dirty,
+                            egui::Button::new("Check Signatures"),
+                        )
+                        .clicked()
+                    {
+                        self.start_signature_check();
+                    }
+                    if checking {
+                        ui.spinner();
+                    }
+                });
+
+                if self.dirty {
+                    ui.label(
+                        "Save the document first -- verification checks the saved file, \
+                         not in-memory edits.",
+                    );
+                    return;
+                }
+
+                let Some(results) = &self.signatures_result else {
+                    ui.label("Click \"Check Signatures\" to verify this document.");
+                    return;
+                };
+
+                if results.is_empty() {
+                    ui.label("This document has no digital signatures.");
+                    return;
+                }
+
+                ScrollArea::vertical().show(ui, |ui| {
+                    for (i, sig) in results.iter().enumerate() {
+                        ui.group(|ui| {
+                            let (status, color) = if sig.is_valid {
+                                ("Valid", Color32::from_rgb(60, 180, 75))
+                            } else {
+                                ("Invalid", Color32::from_rgb(200, 60, 60))
+                            };
+                            ui.horizontal(|ui| {
+                                ui.strong(format!("Signature {}", i + 1));
+                                ui.colored_label(color, status);
+                            });
+                            if let Some(name) = &sig.signer_name {
+                                ui.label(format!("Signer: {name}"));
+                            }
+                            if let Some(reason) = &sig.reason {
+                                ui.label(format!("Reason: {reason}"));
+                            }
+                            if let Some(location) = &sig.location {
+                                ui.label(format!("Location: {location}"));
+                            }
+                            if let Some(time) = &sig.signing_time {
+                                ui.label(format!("Signed: {time}"));
+                            }
+                            match sig.certificate_valid_now {
+                                Some(true) => {
+                                    ui.label("Certificate: valid now");
+                                }
+                                Some(false) => {
+                                    ui.colored_label(
+                                        Color32::YELLOW,
+                                        "Certificate: expired or not yet valid",
+                                    );
+                                }
+                                None => {}
+                            }
+                            if let Some(chain) = &sig.chain {
+                                if chain.trusted {
+                                    ui.colored_label(
+                                        Color32::from_rgb(60, 180, 75),
+                                        "Certificate chain: trusted",
+                                    );
+                                } else {
+                                    ui.colored_label(
+                                        Color32::YELLOW,
+                                        format!(
+                                            "Certificate chain: not trusted ({})",
+                                            chain.error.as_deref().unwrap_or("unknown")
+                                        ),
+                                    );
+                                }
+                            }
+                            if let Some(err) = &sig.error {
+                                ui.colored_label(Color32::RED, err);
+                            }
+                        });
+                    }
+                });
+            });
     }
 
     fn thumbnails_panel(&mut self, ui: &mut Ui) {
@@ -1148,6 +1322,7 @@ impl App for PdfViewerApp {
         }
         self.tool_prompt(ctx);
         self.poll_signing(ctx);
+        self.poll_signature_check(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
@@ -1155,6 +1330,7 @@ impl App for PdfViewerApp {
         self.error_banner(ui);
         self.search_results_panel(ui);
         self.annotations_panel(ui);
+        self.signatures_panel(ui);
         self.bookmarks_panel(ui);
         self.thumbnails_panel(ui);
         self.page_panel(ui);

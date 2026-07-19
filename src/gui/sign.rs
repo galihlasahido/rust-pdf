@@ -222,5 +222,15 @@ mod tests {
         assert_eq!(verified.len(), 1);
         assert!(verified[0].is_valid, "signature should verify as valid");
         assert_eq!(verified[0].signer_name.as_deref(), Some("GUI Test Signer"));
+
+        // Exactly what `app.rs`'s `start_signature_check` does against
+        // `open_path` -- verify from the file on disk rather than bytes
+        // already in memory.
+        let verified_from_file = SignatureVerifier::from_file(&output_path)
+            .expect("open signed file")
+            .verify()
+            .expect("verify should not error");
+        assert_eq!(verified_from_file.len(), 1);
+        assert!(verified_from_file[0].is_valid);
     }
 }
