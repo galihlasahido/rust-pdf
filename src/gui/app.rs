@@ -23,6 +23,20 @@ const DEFAULT_DPI: f32 = 96.0;
 const MIN_DPI: f32 = 24.0;
 const MAX_DPI: f32 = 600.0;
 
+/// A page-management action requested from the thumbnail panel this
+/// frame, applied after the panel's closure ends (see
+/// [`PdfViewerApp::apply_page_action`]) since it needs `&mut self` for
+/// `mark_dirty`/re-clamping `current_page`, which the closure -- already
+/// borrowing `self.doc` -- can't grant alongside.
+enum PageAction {
+    RotateLeft(usize),
+    RotateRight(usize),
+    MoveUp(usize),
+    MoveDown(usize),
+    Delete(usize),
+    InsertBlankAfter(usize),
+}
+
 /// Shared handle to the open document. A `RwLock` (rather than a bare
 /// `Arc<PdfRenderer>`) because editing features need exclusive `&mut`
 /// access to the underlying `EditableDocument` (see
@@ -68,6 +82,10 @@ pub struct PdfViewerApp {
     saving: Option<mpsc::Receiver<PdfResult<()>>>,
     /// Most recent edit/save failure, shown as a dismissable banner.
     last_error: Option<String>,
+    /// The page index a delete has been armed for (first click), waiting
+    /// on a second click to actually delete -- a lightweight two-step
+    /// confirm instead of a modal dialog.
+    delete_confirm: Option<usize>,
 }
 
 impl Default for PdfViewerApp {
@@ -86,6 +104,7 @@ impl Default for PdfViewerApp {
             needs_full_rewrite: false,
             saving: None,
             last_error: None,
+            delete_confirm: None,
         }
     }
 }
@@ -421,11 +440,12 @@ impl PdfViewerApp {
         let current_page = self.current_page;
 
         let mut jump_to = None;
+        let mut action = None;
         Panel::right("thumbnails")
             .frame(surface_frame(ui))
-            .default_size(140.0)
+            .default_size(160.0)
             .show(ui, |ui| {
-                const ROW_HEIGHT: f32 = thumbnails::MAX_DIMENSION as f32 + 24.0;
+                const ROW_HEIGHT: f32 = thumbnails::MAX_DIMENSION as f32 + 48.0;
                 ScrollArea::vertical().show_rows(ui, ROW_HEIGHT, page_count, |ui, row_range| {
                     for page_index in row_range {
                         self.thumbnails.request(&renderer, page_index);
@@ -450,12 +470,112 @@ impl PdfViewerApp {
                                 );
                             }
                             ui.label(format!("{}", page_index + 1));
+
+                            ui.horizontal(|ui| {
+                                if ui.small_button("⟲").on_hover_text("Rotate left").clicked() {
+                                    action = Some(PageAction::RotateLeft(page_index));
+                                }
+                                if ui.small_button("⟳").on_hover_text("Rotate right").clicked() {
+                                    action = Some(PageAction::RotateRight(page_index));
+                                }
+                                if ui
+                                    .add_enabled(page_index > 0, egui::Button::new("↑").small())
+                                    .on_hover_text("Move up")
+                                    .clicked()
+                                {
+                                    action = Some(PageAction::MoveUp(page_index));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        page_index + 1 < page_count,
+                                        egui::Button::new("↓").small(),
+                                    )
+                                    .on_hover_text("Move down")
+                                    .clicked()
+                                {
+                                    action = Some(PageAction::MoveDown(page_index));
+                                }
+                                if ui
+                                    .small_button("+")
+                                    .on_hover_text("Insert blank page after")
+                                    .clicked()
+                                {
+                                    action = Some(PageAction::InsertBlankAfter(page_index));
+                                }
+                                let armed = self.delete_confirm == Some(page_index);
+                                let delete_response = ui
+                                    .small_button(if armed { "Confirm?" } else { "🗑" })
+                                    .on_hover_text(if armed {
+                                        "Click again to permanently delete this page"
+                                    } else {
+                                        "Delete page"
+                                    });
+                                if delete_response.clicked() {
+                                    if armed {
+                                        action = Some(PageAction::Delete(page_index));
+                                        self.delete_confirm = None;
+                                    } else {
+                                        self.delete_confirm = Some(page_index);
+                                    }
+                                }
+                            });
                         });
                     }
                 });
             });
         if let Some(page_index) = jump_to {
             self.go_to_page(page_index);
+        }
+        if let Some(action) = action {
+            self.apply_page_action(&renderer, action);
+        }
+    }
+
+    fn apply_page_action(&mut self, renderer: &SharedRenderer, action: PageAction) {
+        let result: PdfResult<()> = {
+            let mut renderer = renderer.write().unwrap_or_else(|p| p.into_inner());
+            match action {
+                PageAction::RotateLeft(idx) => {
+                    renderer.edit_document(|doc| doc.rotate_page(idx, -90))
+                }
+                PageAction::RotateRight(idx) => {
+                    renderer.edit_document(|doc| doc.rotate_page(idx, 90))
+                }
+                PageAction::MoveUp(idx) => {
+                    renderer.edit_document(|doc| doc.move_page(idx, idx.saturating_sub(1)))
+                }
+                PageAction::MoveDown(idx) => {
+                    renderer.edit_document(|doc| doc.move_page(idx, idx + 1))
+                }
+                PageAction::Delete(idx) => renderer.edit_document(|doc| doc.delete_page(idx)),
+                PageAction::InsertBlankAfter(idx) => {
+                    let (width, height) = renderer.page_size_pt(idx).unwrap_or((612.0, 792.0));
+                    renderer
+                        .edit_document(|doc| doc.insert_blank_page(idx + 1, width, height))
+                        .map(|_| ())
+                }
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                self.mark_dirty();
+                if let DocState::Loaded {
+                    renderer,
+                    page_count,
+                    ..
+                } = &mut self.doc
+                {
+                    if let Ok(guard) = renderer.read() {
+                        *page_count = guard.page_count();
+                    }
+                }
+                let count = self.page_count();
+                if count > 0 {
+                    self.current_page = self.current_page.min(count - 1);
+                }
+            }
+            Err(err) => self.last_error = Some(format!("Page action failed: {err}")),
         }
     }
 
