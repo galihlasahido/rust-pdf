@@ -9,6 +9,7 @@ use eframe::{App, Frame};
 use egui::{CentralPanel, Color32, Context, Panel, ScrollArea, Ui};
 
 use crate::editor::{BookmarkNode, Destination, EditableDocument};
+use crate::encryption::{EncryptionAlgorithm, EncryptionConfig, Permissions};
 use crate::error::{PdfResult, RenderError};
 use crate::render::PdfRenderer;
 use crate::types::Rectangle;
@@ -17,6 +18,7 @@ use crate::{Color, SignatureVerifier, VerifiedSignature};
 use super::actions;
 use super::coords::PageCoords;
 use super::forms::FormOverlayState;
+use super::password::PasswordDialogState;
 use super::search::SearchState;
 use super::sign::{self, SignDialogState};
 use super::thumbnails::{self, ThumbnailStrip};
@@ -102,6 +104,7 @@ pub struct PdfViewerApp {
     /// `start_signature_check`'s doc comment).
     signatures_result: Option<Vec<VerifiedSignature>>,
     signature_check: Option<mpsc::Receiver<Result<Vec<VerifiedSignature>, String>>>,
+    password_dialog: PasswordDialogState,
 }
 
 impl Default for PdfViewerApp {
@@ -127,6 +130,7 @@ impl Default for PdfViewerApp {
             show_signatures_panel: false,
             signatures_result: None,
             signature_check: None,
+            password_dialog: PasswordDialogState::default(),
         }
     }
 }
@@ -149,6 +153,7 @@ impl PdfViewerApp {
         self.sign_dialog = SignDialogState::default();
         self.signatures_result = None;
         self.signature_check = None;
+        self.password_dialog = PasswordDialogState::default();
         self.current_page = 0;
         self.dirty = false;
         self.needs_full_rewrite = false;
@@ -419,6 +424,11 @@ impl PdfViewerApp {
                         }
                         if ui.button("Sign Document…").clicked() {
                             self.begin_sign(None);
+                        }
+                        if ui.button("Password Protect…").clicked() {
+                            self.password_dialog.open = true;
+                            self.password_dialog.error = None;
+                            self.password_dialog.success = None;
                         }
                         if ui
                             .selectable_label(self.show_signatures_panel, "Signatures")
@@ -1290,6 +1300,192 @@ impl PdfViewerApp {
         }
     }
 
+    fn poll_password_export(&mut self, ctx: &Context) {
+        let Some(rx) = &self.password_dialog.exporting else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(path)) => {
+                self.password_dialog.success = Some(path);
+                self.password_dialog.exporting = None;
+            }
+            Ok(Err(err)) => {
+                self.password_dialog.error = Some(err);
+                self.password_dialog.exporting = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.password_dialog.error =
+                    Some("Export failed: worker thread ended unexpectedly".to_string());
+                self.password_dialog.exporting = None;
+            }
+        }
+    }
+
+    fn password_dialog_window(&mut self, ctx: &Context) {
+        if !self.password_dialog.open {
+            return;
+        }
+        let DocState::Loaded { renderer, .. } = &self.doc else {
+            self.password_dialog.open = false;
+            return;
+        };
+        let renderer = Arc::clone(renderer);
+
+        let mut close = false;
+        let mut do_export = false;
+        egui::Window::new("Password Protect / Encrypt")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("User password (to open):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.password_dialog.user_password)
+                            .password(true),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Owner password (full access):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.password_dialog.owner_password)
+                            .password(true),
+                    );
+                });
+                ui.label("Leave a password blank to skip requiring it.");
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Encryption:");
+                    egui::ComboBox::new("password_algorithm", "")
+                        .selected_text(match self.password_dialog.algorithm {
+                            EncryptionAlgorithm::Aes256 => "AES-256 (PDF 2.0)",
+                            EncryptionAlgorithm::Aes128 => "AES-128 (PDF 1.5+)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.password_dialog.algorithm,
+                                EncryptionAlgorithm::Aes256,
+                                "AES-256 (PDF 2.0)",
+                            );
+                            ui.selectable_value(
+                                &mut self.password_dialog.algorithm,
+                                EncryptionAlgorithm::Aes128,
+                                "AES-128 (PDF 1.5+)",
+                            );
+                        });
+                });
+
+                ui.separator();
+                ui.label("Permissions (apply when opened with the user password):");
+                ui.checkbox(&mut self.password_dialog.allow_printing, "Allow printing");
+                ui.checkbox(&mut self.password_dialog.allow_modifying, "Allow modifying");
+                ui.checkbox(
+                    &mut self.password_dialog.allow_copying,
+                    "Allow copying text/images",
+                );
+                ui.checkbox(
+                    &mut self.password_dialog.allow_annotating,
+                    "Allow annotating",
+                );
+                ui.checkbox(
+                    &mut self.password_dialog.allow_filling_forms,
+                    "Allow filling forms",
+                );
+                ui.checkbox(
+                    &mut self.password_dialog.allow_extraction,
+                    "Allow content extraction (accessibility)",
+                );
+                ui.checkbox(
+                    &mut self.password_dialog.allow_assembly,
+                    "Allow document assembly",
+                );
+
+                ui.label(
+                    "Note: once encrypted, this file can't be reopened by this app -- \
+                     open it in another PDF reader to verify.",
+                );
+
+                if let Some(path) = &self.password_dialog.success {
+                    ui.colored_label(
+                        Color32::from_rgb(60, 180, 75),
+                        format!("Saved encrypted copy to {}", path.display()),
+                    );
+                }
+                if let Some(error) = &self.password_dialog.error {
+                    ui.colored_label(Color32::RED, error);
+                }
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.password_dialog.is_exporting(),
+                            egui::Button::new("Export…"),
+                        )
+                        .clicked()
+                    {
+                        do_export = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.password_dialog.is_exporting(),
+                            egui::Button::new("Close"),
+                        )
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                    if self.password_dialog.is_exporting() {
+                        ui.spinner();
+                    }
+                });
+            });
+
+        if do_export {
+            let Some(output_path) = rfd::FileDialog::new()
+                .add_filter("PDF", &["pdf"])
+                .set_file_name("protected.pdf")
+                .save_file()
+            else {
+                return;
+            };
+
+            let permissions = Permissions::new()
+                .allow_printing(self.password_dialog.allow_printing)
+                .allow_modifying(self.password_dialog.allow_modifying)
+                .allow_copying(self.password_dialog.allow_copying)
+                .allow_annotating(self.password_dialog.allow_annotating)
+                .allow_filling_forms(self.password_dialog.allow_filling_forms)
+                .allow_extraction(self.password_dialog.allow_extraction)
+                .allow_assembly(self.password_dialog.allow_assembly);
+
+            let base_config = match self.password_dialog.algorithm {
+                EncryptionAlgorithm::Aes256 => EncryptionConfig::aes256(),
+                EncryptionAlgorithm::Aes128 => EncryptionConfig::aes128(),
+            };
+            let config = base_config
+                .user_password(self.password_dialog.user_password.clone())
+                .owner_password(self.password_dialog.owner_password.clone())
+                .permissions(permissions);
+
+            self.password_dialog.error = None;
+            self.password_dialog.success = None;
+            self.password_dialog.exporting = Some(actions::spawn(move || {
+                let guard = renderer.read().unwrap_or_else(|p| p.into_inner());
+                let bytes = guard
+                    .document()
+                    .save_encrypted_to_bytes(config)
+                    .map_err(|e| e.to_string())?;
+                std::fs::write(&output_path, &bytes)
+                    .map_err(|e| format!("Failed to write output file: {e}"))?;
+                Ok(output_path)
+            }));
+        }
+        if close {
+            self.password_dialog = PasswordDialogState::default();
+        }
+    }
+
     fn error_banner(&mut self, ui: &mut Ui) {
         let Some(message) = self.last_error.clone() else {
             return;
@@ -1323,6 +1519,7 @@ impl App for PdfViewerApp {
         self.tool_prompt(ctx);
         self.poll_signing(ctx);
         self.poll_signature_check(ctx);
+        self.poll_password_export(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
@@ -1335,6 +1532,7 @@ impl App for PdfViewerApp {
         self.thumbnails_panel(ui);
         self.page_panel(ui);
         self.sign_dialog_window(ui.ctx());
+        self.password_dialog_window(ui.ctx());
     }
 }
 

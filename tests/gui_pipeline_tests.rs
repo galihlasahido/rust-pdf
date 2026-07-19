@@ -5,6 +5,7 @@
 
 #![cfg(feature = "native-gui")]
 
+use rust_pdf::encryption::{EncryptionConfig, Permissions};
 use rust_pdf::render::PdfRenderer;
 use rust_pdf::types::Rectangle;
 use rust_pdf::Color;
@@ -190,6 +191,44 @@ fn page_management_actions_change_page_count_as_expected() {
         .edit_document(|doc| doc.delete_page(0))
         .expect("delete_page should succeed");
     assert_eq!(renderer.page_count(), original_count);
+}
+
+#[test]
+fn password_protect_export_produces_structurally_encrypted_output() {
+    // Exactly the wiring gui::app.rs's Password Protect dialog depends
+    // on: build a config from the dialog's permission checkboxes/
+    // passwords, then export via `EditableDocument::save_encrypted_to_bytes`.
+    let renderer =
+        PdfRenderer::open_file("tests/output/multipage_report.pdf").expect("should open");
+
+    let permissions = Permissions::new()
+        .allow_printing(true)
+        .allow_modifying(false)
+        .allow_copying(true)
+        .allow_annotating(true)
+        .allow_filling_forms(true)
+        .allow_extraction(true)
+        .allow_assembly(false);
+    let config = EncryptionConfig::aes256()
+        .user_password("open123")
+        .owner_password("owner456")
+        .permissions(permissions);
+
+    let encrypted_bytes = renderer
+        .document()
+        .save_encrypted_to_bytes(config)
+        .expect("save_encrypted_to_bytes should succeed");
+
+    assert!(encrypted_bytes.starts_with(b"%PDF-1."));
+    let text = String::from_utf8_lossy(&encrypted_bytes);
+    assert!(text.contains("/Encrypt"));
+
+    // Documented, disclosed limitation (see `src/editor/encrypt.rs`): this
+    // crate's own parser cannot reopen its own encrypted output, so the
+    // GUI treats this as a terminal export rather than reopening the
+    // result -- assert that limitation still holds rather than silently
+    // relying on it.
+    assert!(PdfRenderer::open_bytes(encrypted_bytes).is_err());
 }
 
 #[test]

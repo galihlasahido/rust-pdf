@@ -16,6 +16,7 @@ mod actions;
 mod app;
 mod coords;
 mod forms;
+mod password;
 mod search;
 mod sign;
 mod theme;
