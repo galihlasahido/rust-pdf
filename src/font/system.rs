@@ -29,6 +29,10 @@ use font_kit::family_name::FamilyName;
 use font_kit::properties::{Properties, Style, Weight};
 #[cfg(feature = "system-fonts")]
 use font_kit::source::SystemSource;
+#[cfg(feature = "system-fonts")]
+use std::collections::HashMap;
+#[cfg(feature = "system-fonts")]
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Parses a PDF `/BaseFont` name into a bare family name plus bold/italic
 /// flags, stripping the naming conventions real-world PDF producers
@@ -101,7 +105,36 @@ pub(crate) fn parse_base_font_name(base_font: &str) -> (String, bool, bool) {
         }
     }
 
-    (family.trim_end_matches(['-', ',']).to_string(), bold, italic)
+    (
+        family.trim_end_matches(['-', ',']).to_string(),
+        bold,
+        italic,
+    )
+}
+
+/// Process-lifetime cache of resolved system font bytes, keyed by the
+/// same `(family, bold, italic)` a caller passes to
+/// [`load_system_font_bytes`].
+///
+/// Without this, every page of every render redid a full `font-kit`
+/// family/style query (Core Text on macOS) *plus* loading every style in
+/// the matched family from disk just to read its properties, *plus*
+/// loading the winning match's bytes a second time -- for every distinct
+/// font name the page uses. A real-world document commonly reuses the
+/// same handful of fonts across every page (a slide deck's title/body
+/// fonts, a report's body/heading fonts, ...), so this OS-service-bound
+/// work was being paid in full on every single page instead of once per
+/// process -- the dominant cost behind multi-second-per-page renders on
+/// documents that lean on non-embedded system fonts. `None` results (no
+/// matching family) are cached too, so a font-kit lookup that's known not
+/// to resolve isn't retried every page either.
+#[cfg(feature = "system-fonts")]
+type SystemFontCache = Mutex<HashMap<(String, bool, bool), Option<Arc<Vec<u8>>>>>;
+
+#[cfg(feature = "system-fonts")]
+fn system_font_cache() -> &'static SystemFontCache {
+    static CACHE: OnceLock<SystemFontCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Looks up `family` (with `bold`/`italic` as parsed by
@@ -113,8 +146,32 @@ pub(crate) fn parse_base_font_name(base_font: &str) -> (String, bool, bool) {
 /// was already treated before this feature existed - fail closed, no
 /// glyphs painted, a [`super::super::render::native::RenderWarning`]
 /// recorded, never a panic.
+///
+/// Memoized per `(family, bold, italic)` for the lifetime of the process
+/// -- see [`SystemFontCache`]'s doc comment for why.
 #[cfg(feature = "system-fonts")]
 pub(crate) fn load_system_font_bytes(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>> {
+    let key = (family.to_string(), bold, italic);
+
+    {
+        let cache = system_font_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.get(&key) {
+            return cached.as_deref().cloned();
+        }
+    }
+
+    let resolved = resolve_system_font_bytes(family, bold, italic).map(Arc::new);
+    system_font_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, resolved.clone());
+    resolved.as_deref().cloned()
+}
+
+#[cfg(feature = "system-fonts")]
+fn resolve_system_font_bytes(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>> {
     let mut properties = Properties::new();
     properties.style(if italic { Style::Italic } else { Style::Normal });
     properties.weight(if bold { Weight::BOLD } else { Weight::NORMAL });
@@ -124,7 +181,9 @@ pub(crate) fn load_system_font_bytes(family: &str, bold: bool, italic: bool) -> 
     // being unreachable e.g. in a headless/sandboxed environment) is
     // treated identically: fall back to "no substitute", not a panic or
     // a hard error.
-    let handle = SystemSource::new().select_best_match(&families, &properties).ok()?;
+    let handle = SystemSource::new()
+        .select_best_match(&families, &properties)
+        .ok()?;
     let font = handle.load().ok()?;
     let data = font.copy_font_data()?;
     Some((*data).clone())
@@ -141,9 +200,18 @@ mod tests {
 
     #[test]
     fn parses_hyphenated_postscript_names() {
-        assert_eq!(parse_base_font_name("Arial-BoldMT"), ("Arial".to_string(), true, false));
-        assert_eq!(parse_base_font_name("ArialMT"), ("Arial".to_string(), false, false));
-        assert_eq!(parse_base_font_name("Arial-ItalicMT"), ("Arial".to_string(), false, true));
+        assert_eq!(
+            parse_base_font_name("Arial-BoldMT"),
+            ("Arial".to_string(), true, false)
+        );
+        assert_eq!(
+            parse_base_font_name("ArialMT"),
+            ("Arial".to_string(), false, false)
+        );
+        assert_eq!(
+            parse_base_font_name("Arial-ItalicMT"),
+            ("Arial".to_string(), false, true)
+        );
         assert_eq!(
             parse_base_font_name("Arial-BoldItalicMT"),
             ("Arial".to_string(), true, true)
@@ -152,17 +220,32 @@ mod tests {
 
     #[test]
     fn parses_subset_tag_prefix() {
-        assert_eq!(parse_base_font_name("ABCDEF+Arial-BoldMT"), ("Arial".to_string(), true, false));
+        assert_eq!(
+            parse_base_font_name("ABCDEF+Arial-BoldMT"),
+            ("Arial".to_string(), true, false)
+        );
         // A `+` that isn't a valid 6-upper-letter subset tag is part of
         // the name, not stripped.
-        assert_eq!(parse_base_font_name("A+Arial"), ("A+Arial".to_string(), false, false));
+        assert_eq!(
+            parse_base_font_name("A+Arial"),
+            ("A+Arial".to_string(), false, false)
+        );
     }
 
     #[test]
     fn parses_comma_style_convention() {
-        assert_eq!(parse_base_font_name("Arial,Bold"), ("Arial".to_string(), true, false));
-        assert_eq!(parse_base_font_name("Arial,BoldItalic"), ("Arial".to_string(), true, true));
-        assert_eq!(parse_base_font_name("TimesNewRoman,Italic"), ("TimesNewRoman".to_string(), false, true));
+        assert_eq!(
+            parse_base_font_name("Arial,Bold"),
+            ("Arial".to_string(), true, false)
+        );
+        assert_eq!(
+            parse_base_font_name("Arial,BoldItalic"),
+            ("Arial".to_string(), true, true)
+        );
+        assert_eq!(
+            parse_base_font_name("TimesNewRoman,Italic"),
+            ("TimesNewRoman".to_string(), false, true)
+        );
     }
 
     #[test]
@@ -179,8 +262,14 @@ mod tests {
 
     #[test]
     fn leaves_plain_family_names_untouched() {
-        assert_eq!(parse_base_font_name("Verdana"), ("Verdana".to_string(), false, false));
-        assert_eq!(parse_base_font_name("Courier New"), ("Courier New".to_string(), false, false));
+        assert_eq!(
+            parse_base_font_name("Verdana"),
+            ("Verdana".to_string(), false, false)
+        );
+        assert_eq!(
+            parse_base_font_name("Courier New"),
+            ("Courier New".to_string(), false, false)
+        );
     }
 
     // `load_system_font_bytes` itself is deliberately NOT unit-tested here
@@ -189,4 +278,16 @@ mod tests {
     // containers commonly have zero fonts). See
     // `render::native::font::tests` for a live, environment-tolerant
     // integration test that skips gracefully when nothing is found.
+
+    #[cfg(feature = "system-fonts")]
+    #[test]
+    fn repeated_lookups_return_identical_bytes() {
+        // Environment-tolerant like the note above: doesn't assert a
+        // specific family resolves, just that the cache doesn't corrupt
+        // the answer on a repeat lookup for the same key (whether that
+        // answer is `Some(bytes)` or `None`).
+        let first = load_system_font_bytes("Helvetica", false, false);
+        let second = load_system_font_bytes("Helvetica", false, false);
+        assert_eq!(first, second);
+    }
 }

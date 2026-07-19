@@ -173,3 +173,16 @@ tempfile = "3.0"
 # to assert on the JSON shape of `CommandError`/DTOs and to drive
 # `#[tokio::test]`s against `tauri::test`'s `MockRuntime`.
 serde_json = "1"
+
+# `native-render`'s content-stream interpreter is CPU-bound pixel/image-decode
+# work (path rasterization, JPEG/Flate decode, per-pixel colour-space
+# conversion) -- at opt-level 0 (plain `cargo build`/`cargo run`'s default)
+# this runs roughly an order of magnitude slower than optimized, since none
+# of that numeric code gets vectorized/inlined. A real page with a couple of
+# megapixel-scale embedded images has been measured at ~30x slower to render
+# at opt-level 0 than at opt-level 3 for the exact same content. `opt-level 2`
+# keeps `debug-assertions`/`overflow-checks` on (still a real debug build,
+# still fast to iterate on/compile) while making a plain `cargo run --bin
+# rust-pdf-gui` usable without every user needing to remember `--release`.
+[profile.dev]
+opt-level = 2
