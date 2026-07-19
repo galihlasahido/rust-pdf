@@ -9,6 +9,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "rust-pdf",
         options,
-        Box::new(|_cc| Ok(Box::new(rust_pdf::gui::PdfViewerApp::default()))),
+        Box::new(|cc| Ok(Box::new(rust_pdf::gui::PdfViewerApp::new(cc)))),
     )
 }

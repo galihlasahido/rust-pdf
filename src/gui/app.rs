@@ -51,6 +51,13 @@ impl Default for PdfViewerApp {
 }
 
 impl PdfViewerApp {
+    /// Creates the app, applying [`super::theme`]'s visual polish to the
+    /// context before the first frame.
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        super::theme::apply(&cc.egui_ctx);
+        Self::default()
+    }
+
     fn open_file(&mut self, path: PathBuf) {
         self.doc = DocState::Loading;
         self.viewer.reset();
@@ -100,61 +107,75 @@ impl PdfViewerApp {
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
-        Panel::top("toolbar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Open PDF…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PDF", &["pdf"])
-                        .pick_file()
-                    {
-                        self.open_file(path);
+        Panel::top("toolbar")
+            .frame(surface_frame(ui))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Open PDF…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PDF", &["pdf"])
+                            .pick_file()
+                        {
+                            self.open_file(path);
+                        }
                     }
-                }
 
-                ui.separator();
+                    ui.separator();
 
-                let page_count = self.page_count();
-                let has_doc = page_count > 0;
+                    let page_count = self.page_count();
+                    let has_doc = page_count > 0;
 
-                if ui
-                    .add_enabled(has_doc && self.current_page > 0, egui::Button::new("< Prev"))
-                    .clicked()
-                {
-                    self.go_to_page(self.current_page.saturating_sub(1));
-                }
-                ui.label(if has_doc {
-                    format!("Page {} / {}", self.current_page + 1, page_count)
-                } else {
-                    "No document".to_string()
+                    if ui
+                        .add_enabled(
+                            has_doc && self.current_page > 0,
+                            egui::Button::new("< Prev"),
+                        )
+                        .clicked()
+                    {
+                        self.go_to_page(self.current_page.saturating_sub(1));
+                    }
+                    ui.label(if has_doc {
+                        format!("Page {} / {}", self.current_page + 1, page_count)
+                    } else {
+                        "No document".to_string()
+                    });
+                    if ui
+                        .add_enabled(
+                            has_doc && self.current_page + 1 < page_count,
+                            egui::Button::new("Next >"),
+                        )
+                        .clicked()
+                    {
+                        self.go_to_page(self.current_page + 1);
+                    }
+
+                    ui.separator();
+
+                    if ui
+                        .add_enabled(has_doc, egui::Button::new("Zoom -"))
+                        .clicked()
+                    {
+                        self.dpi = (self.dpi * 0.8).clamp(MIN_DPI, MAX_DPI);
+                    }
+                    ui.label(format!("{:.0}%", self.dpi / DEFAULT_DPI * 100.0));
+                    if ui
+                        .add_enabled(has_doc, egui::Button::new("Zoom +"))
+                        .clicked()
+                    {
+                        self.dpi = (self.dpi * 1.25).clamp(MIN_DPI, MAX_DPI);
+                    }
+                    if ui
+                        .add_enabled(has_doc, egui::Button::new("Reset"))
+                        .clicked()
+                    {
+                        self.dpi = DEFAULT_DPI;
+                    }
+
+                    if self.opening.is_some() || self.viewer.is_loading() {
+                        ui.spinner();
+                    }
                 });
-                if ui
-                    .add_enabled(
-                        has_doc && self.current_page + 1 < page_count,
-                        egui::Button::new("Next >"),
-                    )
-                    .clicked()
-                {
-                    self.go_to_page(self.current_page + 1);
-                }
-
-                ui.separator();
-
-                if ui.add_enabled(has_doc, egui::Button::new("Zoom -")).clicked() {
-                    self.dpi = (self.dpi * 0.8).clamp(MIN_DPI, MAX_DPI);
-                }
-                ui.label(format!("{:.0}%", self.dpi / DEFAULT_DPI * 100.0));
-                if ui.add_enabled(has_doc, egui::Button::new("Zoom +")).clicked() {
-                    self.dpi = (self.dpi * 1.25).clamp(MIN_DPI, MAX_DPI);
-                }
-                if ui.add_enabled(has_doc, egui::Button::new("Reset")).clicked() {
-                    self.dpi = DEFAULT_DPI;
-                }
-
-                if self.opening.is_some() || self.viewer.is_loading() {
-                    ui.spinner();
-                }
             });
-        });
     }
 
     fn bookmarks_panel(&mut self, ui: &mut Ui) {
@@ -166,15 +187,17 @@ impl PdfViewerApp {
         }
 
         let mut jump_to = None;
-        Panel::left("bookmarks").show(ui, |ui| {
-            ui.heading("Bookmarks");
-            ui.separator();
-            ScrollArea::vertical().show(ui, |ui| {
-                for bookmark in bookmarks {
-                    show_bookmark(ui, bookmark, &mut jump_to);
-                }
+        Panel::left("bookmarks")
+            .frame(surface_frame(ui))
+            .show(ui, |ui| {
+                ui.heading("Bookmarks");
+                ui.separator();
+                ScrollArea::vertical().show(ui, |ui| {
+                    for bookmark in bookmarks {
+                        show_bookmark(ui, bookmark, &mut jump_to);
+                    }
+                });
             });
-        });
         if let Some(page_index) = jump_to {
             self.go_to_page(page_index);
         }
@@ -252,4 +275,17 @@ fn destination_page_index(dest: &Destination) -> Option<usize> {
             Some(*page_index)
         }
     }
+}
+
+/// A frame for the toolbar/bookmark chrome that's subtly offset from the
+/// document canvas's own background -- just enough to read as a distinct
+/// surface, not a hard line.
+fn surface_frame(ui: &Ui) -> egui::Frame {
+    let visuals = ui.visuals();
+    let base = visuals.panel_fill;
+    let delta: i16 = if visuals.dark_mode { 10 } else { -6 };
+    let shift = |c: u8| (i16::from(c) + delta).clamp(0, 255) as u8;
+    let fill = Color32::from_rgb(shift(base.r()), shift(base.g()), shift(base.b()));
+
+    egui::Frame::side_top_panel(ui.style()).fill(fill)
 }
