@@ -13,11 +13,13 @@ use crate::signatures::{
     VisibleSignature,
 };
 
-pub const ALGORITHMS: [SignatureAlgorithm; 4] = [
+pub const ALGORITHMS: [SignatureAlgorithm; 6] = [
     SignatureAlgorithm::RsaSha256,
     SignatureAlgorithm::RsaSha384,
     SignatureAlgorithm::RsaSha512,
     SignatureAlgorithm::EcdsaP256Sha256,
+    SignatureAlgorithm::EcdsaP384Sha384,
+    SignatureAlgorithm::EcdsaP521Sha512,
 ];
 
 /// `SignatureAlgorithm` isn't tied to the private key's own type anywhere
@@ -30,6 +32,8 @@ pub fn algorithm_label(algo: SignatureAlgorithm) -> &'static str {
         SignatureAlgorithm::RsaSha384 => "RSA + SHA-384",
         SignatureAlgorithm::RsaSha512 => "RSA + SHA-512",
         SignatureAlgorithm::EcdsaP256Sha256 => "ECDSA P-256 + SHA-256",
+        SignatureAlgorithm::EcdsaP384Sha384 => "ECDSA P-384 + SHA-384",
+        SignatureAlgorithm::EcdsaP521Sha512 => "ECDSA P-521 + SHA-512",
     }
 }
 
