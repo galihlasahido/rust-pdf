@@ -36,7 +36,10 @@
 mod certificate;
 mod chain;
 mod config;
+mod crl;
+mod doc_timestamp;
 mod dss;
+mod ocsp;
 mod pkcs7;
 mod signer;
 mod timestamp;
@@ -44,13 +47,22 @@ mod verifier;
 
 pub use certificate::{Certificate, PrivateKey};
 pub use chain::{validate_chain, ChainValidationResult};
-pub use config::{PadesLevel, SignatureConfig, VisibleSignature};
+pub use config::{CertificationLevel, PadesLevel, SignatureConfig, VisibleSignature};
+pub use crl::{
+    extract_crl_distribution_point_url, is_certificate_revoked, parse_crl, Crl, CrlTransport,
+    OID_CRL_DISTRIBUTION_POINTS,
+};
+pub use doc_timestamp::{embed_document_timestamp, embed_document_timestamp_sized};
 pub use dss::{embed_document_security_store, DssEntry};
+pub use ocsp::{
+    build_ocsp_request, ocsp_responder_url, parse_ocsp_response, CertId, CertStatus,
+    OcspCertStatus, OcspRequest, OcspTransport,
+};
 pub use pkcs7::Pkcs7Builder;
-pub use signer::{ByteRange, DocumentSigner, IncrementalSigner, SignatureInfo};
+pub use signer::{ByteRange, DocumentSigner, IncrementalSigner, RemoteSigner, SignatureInfo};
 pub use timestamp::{
-    build_timestamp_request, parse_timestamp_response, TimestampAuthorityClient,
-    TimestampRequest, TimestampToken,
+    build_timestamp_request, parse_timestamp_response, TimestampAuthorityClient, TimestampRequest,
+    TimestampToken,
 };
 pub use verifier::{SignatureVerifier, VerifiedSignature};
 
@@ -71,6 +83,16 @@ pub enum SignatureAlgorithm {
     RsaSha512,
     /// ECDSA with P-256 curve and SHA-256.
     EcdsaP256Sha256,
+    /// ECDSA with P-384 curve and SHA-384.
+    EcdsaP384Sha384,
+    /// ECDSA with P-521 curve and SHA-512.
+    ///
+    /// Yes, SHA-512 (not a "SHA-521" -- no such hash exists): NIST SP
+    /// 800-186 / SEC 2 pair the P-521 curve with SHA-512 since it's the
+    /// widest standard hash with output at least as large as P-521's ~521-bit
+    /// order, matching the P-256/SHA-256 and P-384/SHA-384 sizing convention
+    /// as closely as possible.
+    EcdsaP521Sha512,
 }
 
 impl SignatureAlgorithm {
@@ -81,6 +103,8 @@ impl SignatureAlgorithm {
             SignatureAlgorithm::RsaSha384 => "1.2.840.113549.1.1.12",
             SignatureAlgorithm::RsaSha512 => "1.2.840.113549.1.1.13",
             SignatureAlgorithm::EcdsaP256Sha256 => "1.2.840.10045.4.3.2",
+            SignatureAlgorithm::EcdsaP384Sha384 => "1.2.840.10045.4.3.3",
+            SignatureAlgorithm::EcdsaP521Sha512 => "1.2.840.10045.4.3.4",
         }
     }
 
@@ -90,8 +114,12 @@ impl SignatureAlgorithm {
             SignatureAlgorithm::RsaSha256 | SignatureAlgorithm::EcdsaP256Sha256 => {
                 "2.16.840.1.101.3.4.2.1" // SHA-256
             }
-            SignatureAlgorithm::RsaSha384 => "2.16.840.1.101.3.4.2.2", // SHA-384
-            SignatureAlgorithm::RsaSha512 => "2.16.840.1.101.3.4.2.3", // SHA-512
+            SignatureAlgorithm::RsaSha384 | SignatureAlgorithm::EcdsaP384Sha384 => {
+                "2.16.840.1.101.3.4.2.2" // SHA-384
+            }
+            SignatureAlgorithm::RsaSha512 | SignatureAlgorithm::EcdsaP521Sha512 => {
+                "2.16.840.1.101.3.4.2.3" // SHA-512
+            }
         }
     }
 
@@ -105,6 +133,8 @@ impl SignatureAlgorithm {
             "1.2.840.113549.1.1.12" => Some(SignatureAlgorithm::RsaSha384),
             "1.2.840.113549.1.1.13" => Some(SignatureAlgorithm::RsaSha512),
             "1.2.840.10045.4.3.2" => Some(SignatureAlgorithm::EcdsaP256Sha256),
+            "1.2.840.10045.4.3.3" => Some(SignatureAlgorithm::EcdsaP384Sha384),
+            "1.2.840.10045.4.3.4" => Some(SignatureAlgorithm::EcdsaP521Sha512),
             _ => None,
         }
     }
@@ -122,7 +152,10 @@ impl SignatureAlgorithm {
     /// e.g. OpenSSL's `ts` (RFC 3161 timestamp authority) implementation
     /// does. Verifying only real-world-produced CMS (not just our own
     /// output) needs to accept both conventions.
-    pub(crate) fn from_oids(signature_algorithm_oid: &str, digest_algorithm_oid: &str) -> Option<Self> {
+    pub(crate) fn from_oids(
+        signature_algorithm_oid: &str,
+        digest_algorithm_oid: &str,
+    ) -> Option<Self> {
         if let Some(algo) = Self::from_oid(signature_algorithm_oid) {
             return Some(algo);
         }
@@ -155,19 +188,18 @@ pub(crate) fn digest_for_algorithm(algo: SignatureAlgorithm, data: &[u8]) -> Vec
             hasher.update(data);
             hasher.finalize().to_vec()
         }
-        SignatureAlgorithm::RsaSha384 => {
+        SignatureAlgorithm::RsaSha384 | SignatureAlgorithm::EcdsaP384Sha384 => {
             let mut hasher = Sha384::new();
             hasher.update(data);
             hasher.finalize().to_vec()
         }
-        SignatureAlgorithm::RsaSha512 => {
+        SignatureAlgorithm::RsaSha512 | SignatureAlgorithm::EcdsaP521Sha512 => {
             let mut hasher = Sha512::new();
             hasher.update(data);
             hasher.finalize().to_vec()
         }
     }
 }
-
 
 /// PDF signature dictionary field names.
 pub mod fields {
@@ -187,10 +219,7 @@ mod tests {
 
     #[test]
     fn test_signature_algorithm_oid() {
-        assert_eq!(
-            SignatureAlgorithm::RsaSha256.oid(),
-            "1.2.840.113549.1.1.11"
-        );
+        assert_eq!(SignatureAlgorithm::RsaSha256.oid(), "1.2.840.113549.1.1.11");
         assert_eq!(
             SignatureAlgorithm::EcdsaP256Sha256.oid(),
             "1.2.840.10045.4.3.2"
@@ -209,6 +238,8 @@ mod tests {
             SignatureAlgorithm::RsaSha384,
             SignatureAlgorithm::RsaSha512,
             SignatureAlgorithm::EcdsaP256Sha256,
+            SignatureAlgorithm::EcdsaP384Sha384,
+            SignatureAlgorithm::EcdsaP521Sha512,
         ] {
             assert_eq!(SignatureAlgorithm::from_oid(algo.oid()), Some(algo));
         }
@@ -225,6 +256,9 @@ mod tests {
             hasher.update(data);
             hasher.finalize().to_vec()
         };
-        assert_eq!(digest_for_algorithm(SignatureAlgorithm::RsaSha256, data), expected);
+        assert_eq!(
+            digest_for_algorithm(SignatureAlgorithm::RsaSha256, data),
+            expected
+        );
     }
 }

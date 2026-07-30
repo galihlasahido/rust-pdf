@@ -28,10 +28,11 @@ use cms::signed_data::{SignedData, SignerIdentifier};
 use der::asn1::OctetString;
 use der::{Decode, Encode};
 
-use crate::error::SignatureError;
 use super::chain::{self, ChainValidationResult};
+use super::config::CertificationLevel;
 use super::timestamp;
 use super::{digest_for_algorithm, ByteRange, Certificate, SignatureAlgorithm, SignatureResult};
+use crate::error::SignatureError;
 
 /// Verifies digital signatures embedded in a PDF document.
 #[derive(Debug)]
@@ -43,7 +44,10 @@ pub struct SignatureVerifier {
 impl SignatureVerifier {
     /// Creates a verifier for the given PDF bytes.
     pub fn new(pdf_bytes: Vec<u8>) -> Self {
-        Self { pdf_bytes, trust_anchors: Vec::new() }
+        Self {
+            pdf_bytes,
+            trust_anchors: Vec::new(),
+        }
     }
 
     /// Creates a verifier by reading a PDF file from disk.
@@ -121,6 +125,23 @@ pub struct VerifiedSignature {
     /// `None` if there is no timestamp token at all (not an error --most
     /// signatures won't have one).
     pub timestamp: Option<TimestampVerification>,
+    /// `Some(level)` if this signature dictionary carries a DocMDP
+    /// `/Reference` entry (ISO 32000-1 12.8.2.2) declaring it a
+    /// *certification signature* at that [`CertificationLevel`]; `None` for
+    /// an ordinary approval signature. This reflects only what is declared
+    /// in the signature dictionary itself -- it is **not** cross-checked
+    /// against the catalog's `/Perms /DocMDP` entry (which should point
+    /// back at this same signature, see [`super::SignatureConfig::certification`])
+    /// or against whether this is actually the first signature in the
+    /// document (a malformed or adversarially crafted PDF could declare
+    /// `/TransformMethod /DocMDP` on a later signature). Callers that need
+    /// the full DocMDP trust story -- "is this genuinely the certifying
+    /// signature, and were the permitted-by-`P` modifications the only ones
+    /// made after it" -- must additionally check this is the *first*
+    /// signature found in [`SignatureVerifier::verify`]'s returned `Vec`
+    /// and reason about `byte_range` coverage themselves; this crate does
+    /// not automate that cross-check.
+    pub certification_level: Option<CertificationLevel>,
     /// Explains why `is_valid` is `false`, if applicable.
     pub error: Option<String>,
 }
@@ -150,6 +171,7 @@ struct RawSignature {
     reason: Option<String>,
     location: Option<String>,
     signing_time: Option<String>,
+    certification_level: Option<CertificationLevel>,
 }
 
 /// Scans raw PDF bytes for `/Type /Sig` dictionaries and extracts their
@@ -187,6 +209,7 @@ fn find_signature_objects(pdf_bytes: &[u8]) -> Vec<RawSignature> {
                 reason: parse_string_field(slice, b"/Reason ("),
                 location: parse_string_field(slice, b"/Location ("),
                 signing_time: parse_string_field(slice, b"/M ("),
+                certification_level: parse_certification_level(slice),
             });
         }
 
@@ -217,6 +240,39 @@ fn parse_byte_range(slice: &[u8]) -> Option<ByteRange> {
         return None;
     }
     Some(ByteRange::new(nums[0], nums[1], nums[2], nums[3]))
+}
+
+/// Extracts a DocMDP [`CertificationLevel`] from a signature dictionary's
+/// raw bytes, if it declares one via a `/Reference [ << /TransformMethod
+/// /DocMDP ... /TransformParams << ... /P <n> ... >> >> ]` entry (see
+/// `signer.rs::build_docmdp_reference`, the writer side this mirrors). Not a
+/// real PDF object parser -- like the rest of this module's `parse_*`
+/// helpers, it locates `/TransformMethod /DocMDP` by literal byte search
+/// and then reads the next `/P <digits>` token, bounded to the text before
+/// the `/Reference` array's closing `]` so an unrelated later `/P` entry
+/// elsewhere in the dictionary can't be misread as the DocMDP permission.
+fn parse_certification_level(slice: &[u8]) -> Option<CertificationLevel> {
+    const TRANSFORM_METHOD_DOCMDP: &[u8] = b"/TransformMethod /DocMDP";
+    let method_pos = find_bytes(slice, TRANSFORM_METHOD_DOCMDP)?;
+    let after_method = &slice[method_pos + TRANSFORM_METHOD_DOCMDP.len()..];
+
+    let scope_end = find_bytes(after_method, b"]").unwrap_or(after_method.len());
+    let scoped = &after_method[..scope_end];
+
+    const P_KEY: &[u8] = b"/P ";
+    let p_pos = find_bytes(scoped, P_KEY)?;
+    let after_p = &scoped[p_pos + P_KEY.len()..];
+
+    let digits: Vec<u8> = after_p
+        .iter()
+        .copied()
+        .take_while(|b| b.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let p_value: i64 = std::str::from_utf8(&digits).ok()?.parse().ok()?;
+    CertificationLevel::from_p_value(p_value)
 }
 
 fn parse_hex_contents(slice: &[u8]) -> Option<Vec<u8>> {
@@ -327,7 +383,11 @@ fn trim_to_der_length(bytes: &[u8]) -> Option<&[u8]> {
     bytes.get(..total)
 }
 
-fn verify_one(pdf_bytes: &[u8], raw: RawSignature, trust_anchors: &[Certificate]) -> VerifiedSignature {
+fn verify_one(
+    pdf_bytes: &[u8],
+    raw: RawSignature,
+    trust_anchors: &[Certificate],
+) -> VerifiedSignature {
     let mut result = VerifiedSignature {
         signer_name: raw.name.clone(),
         reason: raw.reason.clone(),
@@ -339,6 +399,7 @@ fn verify_one(pdf_bytes: &[u8], raw: RawSignature, trust_anchors: &[Certificate]
         certificate_valid_now: None,
         chain: None,
         timestamp: None,
+        certification_level: raw.certification_level,
         error: None,
     };
 
@@ -490,20 +551,22 @@ fn verify_cryptographically(
             let value = attr.values.get(0)?;
             let token_der = value.to_der().ok()?;
             let expected_digest = digest_for_algorithm(algo, signer_info.signature.as_bytes());
-            Some(match timestamp::verify_token(&token_der, algo, &expected_digest) {
-                Ok(token) => TimestampVerification {
-                    gen_time: Some(token.gen_time),
-                    tsa_certificate: token.tsa_certificate,
-                    valid: true,
-                    error: None,
+            Some(
+                match timestamp::verify_token(&token_der, algo, &expected_digest) {
+                    Ok(token) => TimestampVerification {
+                        gen_time: Some(token.gen_time),
+                        tsa_certificate: token.tsa_certificate,
+                        valid: true,
+                        error: None,
+                    },
+                    Err(e) => TimestampVerification {
+                        gen_time: None,
+                        tsa_certificate: None,
+                        valid: false,
+                        error: Some(e),
+                    },
                 },
-                Err(e) => TimestampVerification {
-                    gen_time: None,
-                    tsa_certificate: None,
-                    valid: false,
-                    error: Some(e),
-                },
-            })
+            )
         })
     });
 
@@ -538,7 +601,9 @@ const OID_SIGNATURE_TIMESTAMP_TOKEN: &str = "1.2.840.113549.1.9.16.2.14";
 
 /// Returns every certificate embedded in the CMS `certificates` set.
 fn all_certificates(signed_data: &SignedData) -> Vec<Certificate> {
-    let Some(certs) = signed_data.certificates.as_ref() else { return Vec::new() };
+    let Some(certs) = signed_data.certificates.as_ref() else {
+        return Vec::new();
+    };
     certs
         .0
         .iter()
@@ -601,6 +666,8 @@ pub(super) fn verify_signature_bytes(
         SignatureAlgorithm::RsaSha384 => verify_rsa::<sha2::Sha384>(spki, message, signature_bytes),
         SignatureAlgorithm::RsaSha512 => verify_rsa::<sha2::Sha512>(spki, message, signature_bytes),
         SignatureAlgorithm::EcdsaP256Sha256 => verify_ecdsa_p256(spki, message, signature_bytes),
+        SignatureAlgorithm::EcdsaP384Sha384 => verify_ecdsa_p384(spki, message, signature_bytes),
+        SignatureAlgorithm::EcdsaP521Sha512 => verify_ecdsa_p521(spki, message, signature_bytes),
     }
 }
 
@@ -633,6 +700,57 @@ fn verify_ecdsa_p256(
 
     let verifying_key =
         VerifyingKey::try_from(spki).map_err(|e| format!("Invalid ECDSA public key: {e}"))?;
+    let sig = Signature::from_der(signature_bytes)
+        .map_err(|e| format!("Invalid ECDSA signature encoding: {e}"))?;
+
+    Ok(verifying_key.verify(message, &sig).is_ok())
+}
+
+// NOTE(ownership): `verify_ecdsa_p384`/`verify_ecdsa_p521` and their two
+// match arms above are the minimal addition required to keep this module
+// compiling once `SignatureAlgorithm` (owned by the ECDSA multi-curve task)
+// gained the `EcdsaP384Sha384`/`EcdsaP521Sha512` variants -- Rust requires
+// this `match` to stay exhaustive. This file is not otherwise in that
+// task's file-ownership list; only this mechanical, same-shape-as-P-256
+// addition was made here.
+
+/// Verifies an ECDSA P-384 signature. See [`verify_ecdsa_p256`] -- identical
+/// shape, different curve.
+fn verify_ecdsa_p384(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> Result<bool, String> {
+    use p384::ecdsa::{Signature, VerifyingKey};
+    use signature::Verifier;
+
+    let verifying_key =
+        VerifyingKey::try_from(spki).map_err(|e| format!("Invalid ECDSA public key: {e}"))?;
+    let sig = Signature::from_der(signature_bytes)
+        .map_err(|e| format!("Invalid ECDSA signature encoding: {e}"))?;
+
+    Ok(verifying_key.verify(message, &sig).is_ok())
+}
+
+/// Verifies an ECDSA P-521 signature.
+///
+/// Unlike [`verify_ecdsa_p256`]/`verify_ecdsa_p384`, `p521::ecdsa::VerifyingKey`
+/// has no direct SPKI/PKCS8 support (see `sign_ecdsa_p521`'s doc comment in
+/// `certificate.rs` for why) -- so this goes through `p521::PublicKey` (a
+/// plain `elliptic_curve::PublicKey<NistP521>` alias, which does support
+/// SPKI) and hands its affine point to `VerifyingKey::from_affine`.
+fn verify_ecdsa_p521(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> Result<bool, String> {
+    use p521::ecdsa::{Signature, VerifyingKey};
+    use signature::Verifier;
+
+    let public_key =
+        p521::PublicKey::try_from(spki).map_err(|e| format!("Invalid ECDSA public key: {e}"))?;
+    let verifying_key = VerifyingKey::from_affine(*public_key.as_affine())
+        .map_err(|e| format!("Invalid ECDSA public key: {e}"))?;
     let sig = Signature::from_der(signature_bytes)
         .map_err(|e| format!("Invalid ECDSA signature encoding: {e}"))?;
 
@@ -688,7 +806,10 @@ mod tests {
     fn test_trim_to_der_length_short_form() {
         let mut bytes = vec![0x30, 0x03, 0x01, 0x02, 0x03];
         bytes.extend_from_slice(&[0u8; 10]); // trailing padding
-        assert_eq!(trim_to_der_length(&bytes), Some(&[0x30, 0x03, 0x01, 0x02, 0x03][..]));
+        assert_eq!(
+            trim_to_der_length(&bytes),
+            Some(&[0x30, 0x03, 0x01, 0x02, 0x03][..])
+        );
     }
 
     #[test]

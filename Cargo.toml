@@ -17,7 +17,7 @@ compression = ["flate2"]
 images = ["image", "compression"]
 parser = ["nom", "compression", "jpeg-decoder", "dep:memmap2"]
 encryption = ["aes", "cbc", "sha2", "md-5", "rand", "zeroize"]
-signatures = ["encryption", "cms", "x509-cert", "rsa", "p256", "ecdsa", "const-oid", "der", "spki", "pkcs8", "signature"]
+signatures = ["encryption", "cms", "x509-cert", "rsa", "p256", "p384", "p521", "ecdsa", "const-oid", "der", "spki", "pkcs8", "signature", "dep:sec1"]
 html = []
 office = []
 # Embedded TrueType/OpenType font loading (ttf-parser), Type0/CID composite
@@ -115,7 +115,20 @@ cms = { version = "0.2", optional = true, features = ["std"] }
 x509-cert = { version = "0.2", optional = true, features = ["std", "pem"] }
 rsa = { version = "0.9", optional = true, features = ["sha2"] }
 p256 = { version = "0.13", optional = true, features = ["ecdsa"] }
+# ECDSA P-384 and P-521 curves (same RustCrypto family/versions as `p256`
+# above), for the `EcdsaP384Sha384`/`EcdsaP521Sha512` signature algorithms
+# (see src/signatures/mod.rs::SignatureAlgorithm).
+p384 = { version = "0.13", optional = true, features = ["ecdsa"] }
+p521 = { version = "0.13", optional = true, features = ["ecdsa"] }
 ecdsa = { version = "0.16", optional = true }
+# Parses the SEC1 `ECPrivateKey` ASN.1 structure (`BEGIN EC PRIVATE KEY`
+# PEM) directly, so `PrivateKey::from_pem` (src/signatures/certificate.rs)
+# can read the key's embedded `namedCurve` OID and pick the matching curve
+# (P-256/P-384/P-521) before parsing it with that curve's own
+# `p256`/`p384`/`p521::SecretKey`. Already an implicit transitive
+# dependency of `p256`/`p384`/`p521`/`elliptic-curve` (same version, no new
+# code pulled in) -- declaring it directly just lets us call its decoder.
+sec1 = { version = "0.7", optional = true, features = ["std"] }
 const-oid = { version = "0.9", optional = true }
 der = { version = "0.7", optional = true, features = ["std", "pem", "alloc"] }
 spki = { version = "0.7", optional = true, features = ["std"] }

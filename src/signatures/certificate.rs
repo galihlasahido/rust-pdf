@@ -1,7 +1,7 @@
 //! X.509 certificate and private key handling.
 
-use crate::error::SignatureError;
 use super::SignatureResult;
+use crate::error::SignatureError;
 use std::fs;
 use std::path::Path;
 
@@ -30,8 +30,8 @@ impl Certificate {
 
     /// Loads a certificate from PEM data.
     pub fn from_pem(pem_data: &str) -> SignatureResult<Self> {
-        use x509_cert::Certificate as X509Cert;
         use der::Decode;
+        use x509_cert::Certificate as X509Cert;
 
         // Parse PEM to get DER bytes
         let der_bytes = pem_to_der(pem_data, "CERTIFICATE")?;
@@ -66,8 +66,8 @@ impl Certificate {
 
     /// Loads a certificate from DER bytes.
     pub fn from_der(der_bytes: &[u8]) -> SignatureResult<Self> {
-        use x509_cert::Certificate as X509Cert;
         use der::Decode;
+        use x509_cert::Certificate as X509Cert;
 
         let cert = X509Cert::from_der(der_bytes).map_err(|e| {
             SignatureError::CertificateLoadFailed(format!("Failed to parse certificate: {}", e))
@@ -117,9 +117,9 @@ impl Certificate {
     /// This only checks the `notBefore`/`notAfter` fields — it does not
     /// verify the certificate against a trust store or check revocation.
     pub fn is_currently_valid(&self) -> SignatureResult<bool> {
-        use x509_cert::Certificate as X509Cert;
         use der::Decode;
         use std::time::SystemTime;
+        use x509_cert::Certificate as X509Cert;
 
         let cert = X509Cert::from_der(&self.der_bytes).map_err(|e| {
             SignatureError::CertificateLoadFailed(format!("Failed to parse certificate: {}", e))
@@ -154,7 +154,19 @@ pub enum KeyType {
     Rsa,
     /// ECDSA P-256 private key.
     EcdsaP256,
+    /// ECDSA P-384 private key.
+    EcdsaP384,
+    /// ECDSA P-521 private key.
+    EcdsaP521,
 }
+
+/// SEC 2 / RFC 5480 `namedCurve` OIDs for the three NIST curves this crate
+/// signs with. Shared by both the PKCS#8 (`algorithm.parameters`) and SEC1
+/// (`ECPrivateKey.parameters`) code paths below, since both encode the
+/// curve the same way -- as this bare OID.
+const OID_P256: &str = "1.2.840.10045.3.1.7";
+const OID_P384: &str = "1.3.132.0.34";
+const OID_P521: &str = "1.3.132.0.35";
 
 impl PrivateKey {
     /// Loads a private key from a PEM file.
@@ -190,9 +202,10 @@ impl PrivateKey {
         // Try EC private key format (SEC1)
         if pem_data.contains("BEGIN EC PRIVATE KEY") {
             let der_bytes = pem_to_der(pem_data, "EC PRIVATE KEY")?;
+            let (key_type, pkcs8_der) = ec_sec1_der_to_pkcs8(&der_bytes)?;
             return Ok(Self {
-                key_type: KeyType::EcdsaP256,
-                der_bytes: ec_sec1_der_to_pkcs8(&der_bytes)?,
+                key_type,
+                der_bytes: pkcs8_der,
             });
         }
 
@@ -203,8 +216,8 @@ impl PrivateKey {
 
     /// Loads a private key from PKCS#8 DER bytes.
     fn from_pkcs8_der(der_bytes: &[u8]) -> SignatureResult<Self> {
-        use pkcs8::PrivateKeyInfo;
         use der::Decode;
+        use pkcs8::PrivateKeyInfo;
 
         let key_info = PrivateKeyInfo::from_der(der_bytes).map_err(|e| {
             SignatureError::PrivateKeyLoadFailed(format!("Failed to parse PKCS#8 key: {}", e))
@@ -221,7 +234,12 @@ impl PrivateKey {
         let key_type = if oid == rsa_oid {
             KeyType::Rsa
         } else if oid == ec_oid {
-            KeyType::EcdsaP256
+            // For an EC key, `algorithm.oid` is only the generic
+            // `id-ecPublicKey` -- the actual curve lives in the sibling
+            // `algorithm.parameters` field as a bare `namedCurve` OID
+            // (RFC 5480 §2.1.1), so it must be inspected separately to tell
+            // P-256/P-384/P-521 apart.
+            ec_curve_key_type(&key_info)?
         } else {
             return Err(SignatureError::PrivateKeyLoadFailed(format!(
                 "Unsupported key algorithm OID: {}",
@@ -249,16 +267,18 @@ impl PrivateKey {
     pub fn sign(&self, data: &[u8]) -> SignatureResult<Vec<u8>> {
         match self.key_type {
             KeyType::Rsa => self.sign_rsa(data),
-            KeyType::EcdsaP256 => self.sign_ecdsa(data),
+            KeyType::EcdsaP256 => self.sign_ecdsa_p256(data),
+            KeyType::EcdsaP384 => self.sign_ecdsa_p384(data),
+            KeyType::EcdsaP521 => self.sign_ecdsa_p521(data),
         }
     }
 
     /// Signs data with RSA-SHA256.
     fn sign_rsa(&self, data: &[u8]) -> SignatureResult<Vec<u8>> {
-        use rsa::{RsaPrivateKey, pkcs1v15::SigningKey};
-        use sha2::Sha256;
-        use signature::{Signer, SignatureEncoding};
         use pkcs8::DecodePrivateKey;
+        use rsa::{pkcs1v15::SigningKey, RsaPrivateKey};
+        use sha2::Sha256;
+        use signature::{SignatureEncoding, Signer};
 
         let private_key = RsaPrivateKey::from_pkcs8_der(&self.der_bytes).map_err(|e| {
             SignatureError::SigningFailed(format!("Failed to parse RSA key: {}", e))
@@ -271,12 +291,53 @@ impl PrivateKey {
     }
 
     /// Signs data with ECDSA P-256.
-    fn sign_ecdsa(&self, data: &[u8]) -> SignatureResult<Vec<u8>> {
-        use p256::ecdsa::{SigningKey, Signature};
-        use signature::Signer;
+    fn sign_ecdsa_p256(&self, data: &[u8]) -> SignatureResult<Vec<u8>> {
+        use p256::ecdsa::{Signature, SigningKey};
         use pkcs8::DecodePrivateKey;
+        use signature::Signer;
 
         let signing_key = SigningKey::from_pkcs8_der(&self.der_bytes).map_err(|e| {
+            SignatureError::SigningFailed(format!("Failed to parse ECDSA key: {}", e))
+        })?;
+
+        let signature: Signature = signing_key.sign(data);
+
+        Ok(signature.to_der().as_bytes().to_vec())
+    }
+
+    /// Signs data with ECDSA P-384.
+    fn sign_ecdsa_p384(&self, data: &[u8]) -> SignatureResult<Vec<u8>> {
+        use p384::ecdsa::{Signature, SigningKey};
+        use pkcs8::DecodePrivateKey;
+        use signature::Signer;
+
+        let signing_key = SigningKey::from_pkcs8_der(&self.der_bytes).map_err(|e| {
+            SignatureError::SigningFailed(format!("Failed to parse ECDSA key: {}", e))
+        })?;
+
+        let signature: Signature = signing_key.sign(data);
+
+        Ok(signature.to_der().as_bytes().to_vec())
+    }
+
+    /// Signs data with ECDSA P-521.
+    ///
+    /// Unlike `p256`/`p384`, `p521::ecdsa::SigningKey` is a hand-rolled
+    /// newtype (see that crate's own "TODO: use RFC6979 + upstream types
+    /// from the `ecdsa` crate" comment) which does not implement
+    /// `DecodePrivateKey`/PKCS#8 itself -- only `p521::SecretKey` (a plain
+    /// `elliptic_curve::SecretKey<NistP521>` alias) does. So the PKCS#8 key
+    /// is parsed as a `SecretKey` first and its raw scalar handed to
+    /// `SigningKey::from_bytes`.
+    fn sign_ecdsa_p521(&self, data: &[u8]) -> SignatureResult<Vec<u8>> {
+        use p521::ecdsa::{Signature, SigningKey};
+        use pkcs8::DecodePrivateKey;
+        use signature::Signer;
+
+        let secret_key = p521::SecretKey::from_pkcs8_der(&self.der_bytes).map_err(|e| {
+            SignatureError::SigningFailed(format!("Failed to parse ECDSA key: {}", e))
+        })?;
+        let signing_key = SigningKey::from_bytes(&secret_key.to_bytes()).map_err(|e| {
             SignatureError::SigningFailed(format!("Failed to parse ECDSA key: {}", e))
         })?;
 
@@ -292,6 +353,41 @@ impl std::fmt::Debug for PrivateKey {
             .field("key_type", &self.key_type)
             .field("der_bytes_len", &self.der_bytes.len())
             .finish()
+    }
+}
+
+/// Determines which NIST curve a PKCS#8-encoded EC private key uses.
+///
+/// `key_info.algorithm.oid` for an EC key is only ever the generic
+/// `id-ecPublicKey` (`1.2.840.10045.2.1`) -- the curve itself is carried in
+/// the sibling `algorithm.parameters` field as a bare `namedCurve` OID
+/// (RFC 5480 §2.1.1), which is what this decodes.
+fn ec_curve_key_type(key_info: &pkcs8::PrivateKeyInfo<'_>) -> SignatureResult<KeyType> {
+    let params = key_info.algorithm.parameters.ok_or_else(|| {
+        SignatureError::PrivateKeyLoadFailed(
+            "EC private key is missing its namedCurve parameters".to_string(),
+        )
+    })?;
+
+    let curve_oid = const_oid::ObjectIdentifier::try_from(params).map_err(|e| {
+        SignatureError::PrivateKeyLoadFailed(format!("Failed to parse EC curve OID: {}", e))
+    })?;
+
+    key_type_for_curve_oid(&curve_oid.to_string())
+}
+
+/// Maps a SEC 2 / RFC 5480 `namedCurve` OID (as a string, e.g. from
+/// [`const_oid::ObjectIdentifier::to_string`]) to the [`KeyType`] this crate
+/// supports signing/verifying with.
+fn key_type_for_curve_oid(oid: &str) -> SignatureResult<KeyType> {
+    match oid {
+        OID_P256 => Ok(KeyType::EcdsaP256),
+        OID_P384 => Ok(KeyType::EcdsaP384),
+        OID_P521 => Ok(KeyType::EcdsaP521),
+        other => Err(SignatureError::PrivateKeyLoadFailed(format!(
+            "Unsupported EC curve OID: {}",
+            other
+        ))),
     }
 }
 
@@ -322,18 +418,54 @@ fn rsa_pkcs1_der_to_pkcs8(der_bytes: &[u8]) -> SignatureResult<Vec<u8>> {
         SignatureError::PrivateKeyLoadFailed(format!("Failed to parse PKCS#1 RSA key: {}", e))
     })?;
     let pkcs8_doc = key.to_pkcs8_der().map_err(|e| {
-        SignatureError::PrivateKeyLoadFailed(format!(
-            "Failed to convert RSA key to PKCS#8: {}",
-            e
-        ))
+        SignatureError::PrivateKeyLoadFailed(format!("Failed to convert RSA key to PKCS#8: {}", e))
     })?;
 
     Ok(pkcs8_doc.as_bytes().to_vec())
 }
 
 /// Converts a SEC1-encoded EC private key (`ECPrivateKey` DER, as produced
-/// by e.g. `openssl ecparam -genkey`) to PKCS#8 DER.
-fn ec_sec1_der_to_pkcs8(der_bytes: &[u8]) -> SignatureResult<Vec<u8>> {
+/// by e.g. `openssl ecparam -genkey`) to PKCS#8 DER, also returning which
+/// curve it turned out to be.
+///
+/// Unlike the PKCS#8 case, SEC1's `ECPrivateKey.parameters` `namedCurve` OID
+/// is OPTIONAL (SEC1 §C.4/RFC 5915) -- `openssl ecparam -genkey` always
+/// emits it, but a strictly-conformant producer need not. When present we
+/// use it directly; when absent we fall back to the private-key scalar's
+/// byte length, which is unambiguous for these three curves (32/48/66
+/// bytes for P-256/P-384/P-521 respectively -- each curve's exact-length
+/// case in `elliptic_curve::SecretKey::from_slice` only matches its own
+/// size, so trying curves smallest-first and stopping at the first that
+/// parses can't misidentify a larger key as a smaller curve).
+fn ec_sec1_der_to_pkcs8(der_bytes: &[u8]) -> SignatureResult<(KeyType, Vec<u8>)> {
+    use sec1::EcPrivateKey;
+
+    let ec_key = EcPrivateKey::try_from(der_bytes).map_err(|e| {
+        SignatureError::PrivateKeyLoadFailed(format!("Failed to parse SEC1 EC key: {}", e))
+    })?;
+
+    let key_type = match ec_key.parameters.and_then(|p| p.named_curve()) {
+        Some(oid) => Some(key_type_for_curve_oid(&oid.to_string())?),
+        None => None,
+    };
+
+    match key_type {
+        Some(KeyType::EcdsaP256) => Ok((KeyType::EcdsaP256, sec1_to_pkcs8_p256(der_bytes)?)),
+        Some(KeyType::EcdsaP384) => Ok((KeyType::EcdsaP384, sec1_to_pkcs8_p384(der_bytes)?)),
+        Some(KeyType::EcdsaP521) => Ok((KeyType::EcdsaP521, sec1_to_pkcs8_p521(der_bytes)?)),
+        Some(KeyType::Rsa) => unreachable!("key_type_for_curve_oid never returns KeyType::Rsa"),
+        // No embedded curve OID: try each curve smallest-first (see doc
+        // comment above) and take the first that parses.
+        None => sec1_to_pkcs8_p256(der_bytes)
+            .map(|pkcs8| (KeyType::EcdsaP256, pkcs8))
+            .or_else(|_| sec1_to_pkcs8_p384(der_bytes).map(|pkcs8| (KeyType::EcdsaP384, pkcs8)))
+            .or_else(|_| sec1_to_pkcs8_p521(der_bytes).map(|pkcs8| (KeyType::EcdsaP521, pkcs8))),
+    }
+}
+
+/// Parses a SEC1 `ECPrivateKey` DER blob as a P-256 key and re-encodes it as
+/// PKCS#8 DER.
+fn sec1_to_pkcs8_p256(der_bytes: &[u8]) -> SignatureResult<Vec<u8>> {
     use p256::pkcs8::EncodePrivateKey;
     use p256::SecretKey;
 
@@ -341,10 +473,39 @@ fn ec_sec1_der_to_pkcs8(der_bytes: &[u8]) -> SignatureResult<Vec<u8>> {
         SignatureError::PrivateKeyLoadFailed(format!("Failed to parse SEC1 EC key: {}", e))
     })?;
     let pkcs8_doc = key.to_pkcs8_der().map_err(|e| {
-        SignatureError::PrivateKeyLoadFailed(format!(
-            "Failed to convert EC key to PKCS#8: {}",
-            e
-        ))
+        SignatureError::PrivateKeyLoadFailed(format!("Failed to convert EC key to PKCS#8: {}", e))
+    })?;
+
+    Ok(pkcs8_doc.as_bytes().to_vec())
+}
+
+/// Parses a SEC1 `ECPrivateKey` DER blob as a P-384 key and re-encodes it as
+/// PKCS#8 DER.
+fn sec1_to_pkcs8_p384(der_bytes: &[u8]) -> SignatureResult<Vec<u8>> {
+    use p384::pkcs8::EncodePrivateKey;
+    use p384::SecretKey;
+
+    let key = SecretKey::from_sec1_der(der_bytes).map_err(|e| {
+        SignatureError::PrivateKeyLoadFailed(format!("Failed to parse SEC1 EC key: {}", e))
+    })?;
+    let pkcs8_doc = key.to_pkcs8_der().map_err(|e| {
+        SignatureError::PrivateKeyLoadFailed(format!("Failed to convert EC key to PKCS#8: {}", e))
+    })?;
+
+    Ok(pkcs8_doc.as_bytes().to_vec())
+}
+
+/// Parses a SEC1 `ECPrivateKey` DER blob as a P-521 key and re-encodes it as
+/// PKCS#8 DER.
+fn sec1_to_pkcs8_p521(der_bytes: &[u8]) -> SignatureResult<Vec<u8>> {
+    use p521::pkcs8::EncodePrivateKey;
+    use p521::SecretKey;
+
+    let key = SecretKey::from_sec1_der(der_bytes).map_err(|e| {
+        SignatureError::PrivateKeyLoadFailed(format!("Failed to parse SEC1 EC key: {}", e))
+    })?;
+    let pkcs8_doc = key.to_pkcs8_der().map_err(|e| {
+        SignatureError::PrivateKeyLoadFailed(format!("Failed to convert EC key to PKCS#8: {}", e))
     })?;
 
     Ok(pkcs8_doc.as_bytes().to_vec())
@@ -357,17 +518,11 @@ fn pem_to_der(pem_data: &str, expected_label: &str) -> SignatureResult<Vec<u8>> 
     let end_marker = format!("-----END {}-----", expected_label);
 
     let start = pem_data.find(&begin_marker).ok_or_else(|| {
-        SignatureError::CertificateLoadFailed(format!(
-            "Missing {} PEM header",
-            expected_label
-        ))
+        SignatureError::CertificateLoadFailed(format!("Missing {} PEM header", expected_label))
     })?;
 
     let end = pem_data.find(&end_marker).ok_or_else(|| {
-        SignatureError::CertificateLoadFailed(format!(
-            "Missing {} PEM footer",
-            expected_label
-        ))
+        SignatureError::CertificateLoadFailed(format!("Missing {} PEM footer", expected_label))
     })?;
 
     let base64_data: String = pem_data[start + begin_marker.len()..end]
@@ -438,5 +593,24 @@ mod tests {
     fn test_key_type_debug() {
         assert_eq!(format!("{:?}", KeyType::Rsa), "Rsa");
         assert_eq!(format!("{:?}", KeyType::EcdsaP256), "EcdsaP256");
+        assert_eq!(format!("{:?}", KeyType::EcdsaP384), "EcdsaP384");
+        assert_eq!(format!("{:?}", KeyType::EcdsaP521), "EcdsaP521");
+    }
+
+    #[test]
+    fn test_key_type_for_curve_oid() {
+        assert_eq!(
+            key_type_for_curve_oid(OID_P256).unwrap(),
+            KeyType::EcdsaP256
+        );
+        assert_eq!(
+            key_type_for_curve_oid(OID_P384).unwrap(),
+            KeyType::EcdsaP384
+        );
+        assert_eq!(
+            key_type_for_curve_oid(OID_P521).unwrap(),
+            KeyType::EcdsaP521
+        );
+        assert!(key_type_for_curve_oid("1.2.3.4").is_err());
     }
 }

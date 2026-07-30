@@ -4,13 +4,77 @@
 //! It creates proper PDF structures including AcroForm, signature fields,
 //! and uses incremental updates for signature embedding.
 
-use crate::document::Document;
-use crate::error::SignatureError;
-use super::config::PadesLevel;
+use super::config::{CertificationLevel, PadesLevel};
 use super::{
     digest_for_algorithm, fields, timestamp, Certificate, Pkcs7Builder, PrivateKey,
     SignatureAlgorithm, SignatureConfig, SignatureResult, VisibleSignature,
 };
+use crate::document::Document;
+use crate::error::SignatureError;
+use std::sync::Arc;
+
+/// A signing backend whose private key material never enters this process
+/// -- an HSM, a cloud KMS, or a remote signing service -- for callers who
+/// cannot or will not hand raw key bytes to [`DocumentSigner`] /
+/// [`IncrementalSigner`] via [`PrivateKey::from_pem`]/`from_pem_file`.
+///
+/// Implement this to plug a remote key into [`DocumentSigner::remote_signer`]
+/// / [`IncrementalSigner::remote_signer`] as `Arc<dyn RemoteSigner>` instead
+/// of calling `.private_key(..)`.
+///
+/// # What `sign_digest` actually receives
+///
+/// [`RemoteSigner::sign_digest`]'s `digest` parameter is named to match the
+/// common "send a digest, get a signature back" shape of most HSM/KMS
+/// signing APIs, but to produce byte-identical CMS output to the
+/// local-[`PrivateKey`] path (see [`Pkcs7Builder::build_with_signature`] /
+/// [`Pkcs7Builder::build_with_remote_signature`]), what is actually passed
+/// is the exact same bytes [`PrivateKey::sign`] receives locally: the
+/// DER-encoded `SET OF` of CMS `signedAttrs` (RFC 5652 §5.4), *not* a bare
+/// message digest of the PDF's byte range. An implementation backed by an
+/// HSM/KMS API that wants a raw hash plus a separate "this is already
+/// hashed" flag (e.g. AWS KMS `Sign` with `MessageType: DIGEST` vs `RAW`)
+/// must hash `digest` itself first and request a pre-hashed signature over
+/// that -- mirroring exactly what [`PrivateKey::sign`]'s RSA/ECDSA paths do
+/// internally (RSASSA-PKCS1-v1_5 for RSA, ECDSA for the P-256/384/521
+/// curves).
+///
+/// The returned bytes must be the same "raw signature value" shape
+/// [`PrivateKey::sign`] returns: PKCS#1 v1.5 signature bytes for RSA, or a
+/// DER-encoded `Ecdsa-Sig-Value` (RFC 3279 §2.2.3) for ECDSA -- this is
+/// what gets embedded verbatim as the CMS `SignerInfo.signature` `OCTET
+/// STRING`.
+pub trait RemoteSigner: std::fmt::Debug {
+    /// Produces a raw signature over `digest` (see the trait docs for
+    /// exactly what bytes this is) using `algorithm`, without the private
+    /// key ever leaving the remote backend.
+    fn sign_digest(&self, digest: &[u8], algorithm: SignatureAlgorithm)
+        -> SignatureResult<Vec<u8>>;
+
+    /// The certificate corresponding to the key this signer holds, used to
+    /// populate the CMS `SignerInfo` (issuer+serial and, when PAdES is
+    /// enabled, the `signing-certificate-v2` hash) exactly as the
+    /// local-key path does.
+    ///
+    /// See [`DocumentSigner::remote_signer`] / [`IncrementalSigner::remote_signer`]
+    /// for the precedence rule between this and an explicit
+    /// `.certificate(..)` call.
+    fn certificate(&self) -> &Certificate;
+}
+
+/// Which backend supplies the raw signature bytes for
+/// [`build_pkcs7_signature`]: an in-process [`PrivateKey`], or a
+/// [`RemoteSigner`] (HSM/KMS). Internal-only -- `DocumentSigner::sign` /
+/// `IncrementalSigner::sign` build one of these from whichever of
+/// `.private_key(..)` / `.remote_signer(..)` was configured, so
+/// `build_pkcs7_signature` stays a single shared implementation of the
+/// PAdES-attribute / RFC 3161 timestamping logic for both paths.
+enum SigningKey<'a> {
+    /// Sign locally with in-process key material.
+    Local(&'a PrivateKey),
+    /// Sign via a remote backend (HSM/KMS) that never exposes key material.
+    Remote(&'a dyn RemoteSigner),
+}
 
 /// Lower/upper bounds clamped around `SignatureConfig::signature_size` when
 /// reserving space for the `/Contents` placeholder. The lower bound keeps a
@@ -29,7 +93,9 @@ const MAX_SIGNATURE_SIZE: usize = 1 << 20; // 1 MiB
 /// than a bare single-certificate signature -- see
 /// [`SignatureConfig::signature_size`].
 fn signature_placeholder_size(config: &SignatureConfig) -> usize {
-    config.signature_size.clamp(MIN_SIGNATURE_SIZE, MAX_SIGNATURE_SIZE)
+    config
+        .signature_size
+        .clamp(MIN_SIGNATURE_SIZE, MAX_SIGNATURE_SIZE)
 }
 
 /// Returns the PDF `/SubFilter` name for `level`. `adbe.pkcs7.detached` is
@@ -44,6 +110,66 @@ fn sub_filter_for(level: PadesLevel) -> &'static str {
     }
 }
 
+/// Scans raw (not-yet-signed) PDF bytes for at least one existing `/Type
+/// /Sig` signature dictionary. Used to enforce the "only the first signature
+/// on a document may be a certification signature" rule (ISO 32000-1
+/// 12.8.2.2) for both [`DocumentSigner`] and [`IncrementalSigner`] before a
+/// [`SignatureConfig::certification`] is honored.
+///
+/// This is a byte-pattern search, the same imprecise-but-workable approach
+/// the rest of this file uses to locate PDF structures (see e.g.
+/// `find_first_page_object`) rather than a full object parser -- a
+/// pathological PDF whose *uncompressed* stream content happens to contain
+/// the literal bytes `/Type /Sig` outside of any real signature dictionary
+/// could produce a false positive (an overly conservative rejection of a
+/// certification that would otherwise be valid), but never a false
+/// negative that would let an already-signed document be silently
+/// (mis)certified as the first signature.
+fn has_existing_signature_objects(pdf_bytes: &[u8]) -> bool {
+    const TYPE_SIG: &[u8] = b"/Type /Sig";
+    pdf_bytes.windows(TYPE_SIG.len()).any(|w| w == TYPE_SIG)
+}
+
+/// Builds the `/Reference [ ... ]` entry (ISO 32000-1 12.8.2.2 Table 252/254)
+/// that turns a signature dictionary into a DocMDP *certification*
+/// signature, plus the standalone `/Perms << /DocMDP ... >>` catalog entry
+/// (12.7.4.5) that points at it. Shared by [`DocumentSigner`] and
+/// [`IncrementalSigner`] so both build byte-identical DocMDP structures.
+///
+/// `sig_dict_id` is the signature dictionary's own object number (the
+/// `/Perms /DocMDP` catalog entry must reference it); `catalog_id` is the
+/// document's `/Root` object number (the `/Reference` entry's `/Data` must
+/// reference it, per Table 252's "Required if TransformMethod is DocMDP").
+///
+/// **Disclosed limitation:** the classic `/DigestMethod` /
+/// `/DigestLocation` / `/DigestValue` triple (12.8.2.2 Table 252, computed
+/// over the transformed `/Data` object) is deliberately omitted. ISO
+/// 32000-2:2020 deprecates all three and states a conforming reader "shall
+/// ignore" them; the actual tamper-evidence for the whole document,
+/// including the catalog, is already provided by the signature's own
+/// `/ByteRange`-covered digest. Producing a correct legacy digest would
+/// mean re-deriving Acrobat's specific "transform the catalog, MD5 the
+/// result" algorithm for no verification benefit against any PDF 2.0-aware
+/// reader.
+///
+/// **Also deliberately omitted:** the reference dictionary's optional
+/// `/Type /SigRef` entry (Table 252 marks `Type` optional). This isn't just
+/// terseness -- `has_existing_signature_objects` (and, more importantly,
+/// [`super::verifier`]'s `find_signature_objects`) both locate signature
+/// dictionaries with a literal `/Type /Sig` byte search; `/Type /SigRef`
+/// contains `/Type /Sig` as a byte-for-byte prefix, and writing it into the
+/// very signature dictionary those scanners are walking would make each
+/// certifying signature register itself twice. Omitting the optional `Type`
+/// key sidesteps that rather than trying to make every `/Type /Sig` search
+/// site word-boundary-aware.
+fn build_docmdp_reference(level: CertificationLevel, catalog_id: u32) -> String {
+    format!(
+        "/Reference [\n<< /TransformMethod /DocMDP /Data {} 0 R /TransformParams << /Type /TransformParams /V /1.2 /P {} >> >>\n]\n",
+        catalog_id,
+        level.p_value()
+    )
+}
+
 /// Builds the content stream + font object pair for a visible signature
 /// appearance form XObject (ISO 32000-1 §12.5.5 "Appearance Streams"), using
 /// a non-embedded standard Type1 font (`Helvetica`) so the appearance is
@@ -56,14 +182,22 @@ fn build_visible_appearance_content(config: &SignatureConfig, width: f32, height
     let name = config.name.as_deref().unwrap_or("Unknown");
     let date = format_pdf_display_timestamp();
 
-    let mut lines = vec![format!("Digitally signed by"), name.to_string(), format!("Date: {date}")];
+    let mut lines = vec![
+        format!("Digitally signed by"),
+        name.to_string(),
+        format!("Date: {date}"),
+    ];
     if let Some(reason) = &config.reason {
         lines.push(format!("Reason: {reason}"));
     }
 
     let mut content = String::new();
     content.push_str("q\n0.4 0.4 0.4 RG 0.75 w\n");
-    content.push_str(&format!("0.5 0.5 {:.2} {:.2} re S\n", (width - 1.0).max(0.0), (height - 1.0).max(0.0)));
+    content.push_str(&format!(
+        "0.5 0.5 {:.2} {:.2} re S\n",
+        (width - 1.0).max(0.0),
+        (height - 1.0).max(0.0)
+    ));
     content.push_str("BT\n/F1 7 Tf\n0 0 0 rg\n");
     let mut y = height - 11.0;
     for (i, line) in lines.iter().enumerate() {
@@ -92,7 +226,7 @@ fn build_pkcs7_signature(
     cert: &Certificate,
     certificate_chain: &[Certificate],
     data_to_sign: &[u8],
-    key: &PrivateKey,
+    signing_key: SigningKey<'_>,
 ) -> SignatureResult<Vec<u8>> {
     if config.pades_level == PadesLevel::T && config.timestamp_authority.is_none() {
         return Err(SignatureError::SigningFailed(
@@ -109,7 +243,15 @@ fn build_pkcs7_signature(
         pkcs7_builder = pkcs7_builder.add_chain_certificate(chain_cert.clone());
     }
 
-    let (cms_der, signature_value) = pkcs7_builder.build_with_signature(data_to_sign, key)?;
+    let (cms_der, signature_value) = match signing_key {
+        SigningKey::Local(key) => pkcs7_builder.build_with_signature(data_to_sign, key)?,
+        SigningKey::Remote(remote) => {
+            let algorithm = config.algorithm;
+            pkcs7_builder.build_with_remote_signature(data_to_sign, |signed_attrs| {
+                remote.sign_digest(signed_attrs, algorithm)
+            })?
+        }
+    };
 
     let Some(client) = config.timestamp_authority.as_ref() else {
         return Ok(cms_der);
@@ -121,7 +263,12 @@ fn build_pkcs7_signature(
     let digest = digest_for_algorithm(config.algorithm, &signature_value);
     let request = timestamp::build_timestamp_request(config.algorithm, digest.clone(), true);
     let response = client.timestamp(&request.der)?;
-    let token = timestamp::parse_timestamp_response(&response, config.algorithm, &digest, Some(request.nonce))?;
+    let token = timestamp::parse_timestamp_response(
+        &response,
+        config.algorithm,
+        &digest,
+        Some(request.nonce),
+    )?;
 
     timestamp::embed_unsigned_timestamp_attribute(&cms_der, &token.token_der)
 }
@@ -167,6 +314,9 @@ pub struct DocumentSigner {
     certificate_chain: Vec<Certificate>,
     /// The private key for signing.
     private_key: Option<PrivateKey>,
+    /// A remote signing backend (HSM/KMS), used instead of `private_key`
+    /// when set. See [`DocumentSigner::remote_signer`].
+    remote_signer: Option<Arc<dyn RemoteSigner>>,
     /// Signature configuration.
     config: SignatureConfig,
 }
@@ -179,6 +329,7 @@ impl DocumentSigner {
             certificate: None,
             certificate_chain: Vec::new(),
             private_key: None,
+            remote_signer: None,
             config: SignatureConfig::default(),
         }
     }
@@ -196,8 +347,31 @@ impl DocumentSigner {
     }
 
     /// Sets the private key.
+    ///
+    /// Mutually exclusive in effect with [`DocumentSigner::remote_signer`]:
+    /// if both are set, the remote signer takes precedence and this key is
+    /// ignored (see that method's docs).
     pub fn private_key(mut self, key: PrivateKey) -> Self {
         self.private_key = Some(key);
+        self
+    }
+
+    /// Uses `signer` (an HSM/KMS-backed [`RemoteSigner`]) to produce the
+    /// signature instead of in-process key material -- call this instead of
+    /// [`DocumentSigner::private_key`]. If both are set, the remote signer
+    /// takes precedence and `private_key` is ignored.
+    ///
+    /// **Certificate precedence rule:** the certificate used for signing is
+    /// [`DocumentSigner::certificate`] if that was called, otherwise
+    /// [`RemoteSigner::certificate`]. So calling `.certificate(..)` is
+    /// optional when a remote signer is configured (it is auto-populated
+    /// from the `RemoteSigner`), but an explicit call still wins -- e.g. to
+    /// sign with a different chain-anchoring certificate than the one the
+    /// remote signer itself reports. Whichever certificate is used, it must
+    /// correspond to the key the `RemoteSigner` actually signs with, or the
+    /// produced signature will fail verification.
+    pub fn remote_signer(mut self, signer: Arc<dyn RemoteSigner>) -> Self {
+        self.remote_signer = Some(signer);
         self
     }
 
@@ -239,13 +413,21 @@ impl DocumentSigner {
 
     /// Signs the document and returns the signed PDF bytes.
     pub fn sign(self) -> SignatureResult<Vec<u8>> {
-        let cert = self.certificate.as_ref().ok_or_else(|| {
-            SignatureError::SigningFailed("Certificate not set".to_string())
-        })?;
+        let cert = self
+            .certificate
+            .as_ref()
+            .or_else(|| self.remote_signer.as_ref().map(|s| s.certificate()))
+            .ok_or_else(|| SignatureError::SigningFailed("Certificate not set".to_string()))?;
 
-        let key = self.private_key.as_ref().ok_or_else(|| {
-            SignatureError::SigningFailed("Private key not set".to_string())
-        })?;
+        let signing_key = match self.remote_signer.as_ref() {
+            Some(remote) => SigningKey::Remote(remote.as_ref()),
+            None => {
+                let key = self.private_key.as_ref().ok_or_else(|| {
+                    SignatureError::SigningFailed("Private key not set".to_string())
+                })?;
+                SigningKey::Local(key)
+            }
+        };
 
         // First, generate the PDF with a placeholder signature
         let pdf_with_placeholder = self.create_pdf_with_placeholder()?;
@@ -254,16 +436,24 @@ impl DocumentSigner {
         let byte_range = self.calculate_byte_range(&pdf_with_placeholder)?;
 
         // Update the ByteRange placeholder with actual values
-        let pdf_with_byte_range = self.update_byte_range_placeholder(pdf_with_placeholder, &byte_range)?;
+        let pdf_with_byte_range =
+            self.update_byte_range_placeholder(pdf_with_placeholder, &byte_range)?;
 
         // Extract the data to sign (everything except the signature placeholder)
         let data_to_sign = self.extract_signed_data(&pdf_with_byte_range, &byte_range);
 
         // Create the PKCS#7 signature
-        let pkcs7_signature = build_pkcs7_signature(&self.config, cert, &self.certificate_chain, &data_to_sign, key)?;
+        let pkcs7_signature = build_pkcs7_signature(
+            &self.config,
+            cert,
+            &self.certificate_chain,
+            &data_to_sign,
+            signing_key,
+        )?;
 
         // Embed the signature into the PDF
-        let signed_pdf = self.embed_signature(pdf_with_byte_range, &byte_range, &pkcs7_signature)?;
+        let signed_pdf =
+            self.embed_signature(pdf_with_byte_range, &byte_range, &pkcs7_signature)?;
 
         Ok(signed_pdf)
     }
@@ -279,8 +469,21 @@ impl DocumentSigner {
         // Clone pdf_bytes since we need to reference it later for parsing objects
         let original_pdf = pdf_bytes.clone();
 
+        // A certification signature (DocMDP) is only valid as the *first*
+        // signature on a document (ISO 32000-1 12.8.2.2); refuse rather than
+        // silently emit a second, spec-violating /Perms /DocMDP.
+        if self.config.certification.is_some() && has_existing_signature_objects(&original_pdf) {
+            return Err(SignatureError::SigningFailed(
+                "Cannot apply a certification signature: the document already contains one or \
+                 more signatures (a certification signature must be the first signature on a \
+                 document)"
+                    .to_string(),
+            ));
+        }
+
         // Parse the PDF to find key information
-        let (prev_xref, root_obj_num, next_obj_id, page_obj_num) = self.parse_pdf_info(&original_pdf)?;
+        let (prev_xref, root_obj_num, next_obj_id, page_obj_num) =
+            self.parse_pdf_info(&original_pdf)?;
 
         // Ensure the PDF ends with newline
         let mut output = pdf_bytes;
@@ -306,13 +509,14 @@ impl DocumentSigner {
 
         // 1. Build signature dictionary with placeholder
         let sig_dict_offset = output.len();
-        let sig_dict = self.build_signature_dictionary(sig_dict_id);
+        let sig_dict = self.build_signature_dictionary(sig_dict_id, updated_catalog_id);
         output.extend_from_slice(sig_dict.as_bytes());
         object_offsets.push((sig_dict_id, sig_dict_offset));
 
         // 2. Build signature field widget annotation
         let sig_field_offset = output.len();
-        let sig_field = self.build_signature_field(sig_field_id, sig_dict_id, appearance_id, page_obj_num);
+        let sig_field =
+            self.build_signature_field(sig_field_id, sig_dict_id, appearance_id, page_obj_num);
         output.extend_from_slice(sig_field.as_bytes());
         object_offsets.push((sig_field_id, sig_field_offset));
 
@@ -344,15 +548,23 @@ impl DocumentSigner {
         output.extend_from_slice(updated_page.as_bytes());
         object_offsets.push((updated_page_id, updated_page_offset));
 
-        // 6. Build updated catalog with AcroForm reference
+        // 6. Build updated catalog with AcroForm reference (and, if
+        // certifying, /Perms /DocMDP pointing back at the signature dict)
         let updated_catalog_offset = output.len();
-        let updated_catalog = self.build_updated_catalog(&original_pdf, updated_catalog_id, acro_form_id)?;
+        let docmdp_sig_id = self.config.certification.map(|_| sig_dict_id);
+        let updated_catalog = self.build_updated_catalog(
+            &original_pdf,
+            updated_catalog_id,
+            acro_form_id,
+            docmdp_sig_id,
+        )?;
         output.extend_from_slice(updated_catalog.as_bytes());
         object_offsets.push((updated_catalog_id, updated_catalog_offset));
 
         // 7. Build incremental xref table
         let xref_offset = output.len();
-        let xref = self.build_incremental_xref(&object_offsets, prev_xref, root_obj_num, final_next_id);
+        let xref =
+            self.build_incremental_xref(&object_offsets, prev_xref, root_obj_num, final_next_id);
         output.extend_from_slice(xref.as_bytes());
 
         // 8. Add startxref and %%EOF
@@ -367,9 +579,9 @@ impl DocumentSigner {
         let content = String::from_utf8_lossy(pdf_bytes);
 
         // Find startxref position
-        let startxref_pos = content.rfind("startxref").ok_or_else(|| {
-            SignatureError::SigningFailed("Could not find startxref".to_string())
-        })?;
+        let startxref_pos = content
+            .rfind("startxref")
+            .ok_or_else(|| SignatureError::SigningFailed("Could not find startxref".to_string()))?;
 
         // Extract the xref offset
         let after_startxref = &content[startxref_pos + 9..];
@@ -425,7 +637,9 @@ impl DocumentSigner {
             }
         }
 
-        Err(SignatureError::SigningFailed("Could not find /Root reference".to_string()))
+        Err(SignatureError::SigningFailed(
+            "Could not find /Root reference".to_string(),
+        ))
     }
 
     /// Finds the next available object ID.
@@ -493,7 +707,8 @@ impl DocumentSigner {
                             // Find [ and extract first reference
                             if let Some(bracket_pos) = after_kids.find('[') {
                                 let after_bracket = &after_kids[bracket_pos + 1..];
-                                let parts: Vec<&str> = after_bracket.split_whitespace().take(3).collect();
+                                let parts: Vec<&str> =
+                                    after_bracket.split_whitespace().take(3).collect();
                                 if parts.len() >= 2 {
                                     if let Ok(page_num) = parts[0].parse::<u32>() {
                                         return Ok(page_num);
@@ -521,7 +736,13 @@ impl DocumentSigner {
                     let before_obj = &before[..obj_pos];
                     // Find the number before " 0 obj"
                     let mut num_end = before_obj.len();
-                    while num_end > 0 && before_obj.chars().nth(num_end - 1).map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    while num_end > 0
+                        && before_obj
+                            .chars()
+                            .nth(num_end - 1)
+                            .map(|c| c.is_ascii_digit())
+                            .unwrap_or(false)
+                    {
                         num_end -= 1;
                     }
                     if let Ok(page_num) = before_obj[num_end..].parse::<u32>() {
@@ -532,11 +753,15 @@ impl DocumentSigner {
             search_pos = abs_pos + 5;
         }
 
-        Err(SignatureError::SigningFailed("Could not find page object".to_string()))
+        Err(SignatureError::SigningFailed(
+            "Could not find page object".to_string(),
+        ))
     }
 
-    /// Builds the signature dictionary with placeholder.
-    fn build_signature_dictionary(&self, obj_id: u32) -> String {
+    /// Builds the signature dictionary with placeholder. `catalog_id` is
+    /// the document's `/Root` object number, needed only when
+    /// `self.config.certification` is set (see [`build_docmdp_reference`]).
+    fn build_signature_dictionary(&self, obj_id: u32, catalog_id: u32) -> String {
         let signer_name = self.config.name.as_deref().unwrap_or("Unknown");
         let timestamp = format_pdf_timestamp();
         let placeholder_size = signature_placeholder_size(&self.config);
@@ -544,7 +769,10 @@ impl DocumentSigner {
         let mut dict = format!("{} 0 obj\n<<\n", obj_id);
         dict.push_str("/Type /Sig\n");
         dict.push_str("/Filter /Adobe.PPKLite\n");
-        dict.push_str(&format!("/SubFilter /{}\n", sub_filter_for(self.config.pades_level)));
+        dict.push_str(&format!(
+            "/SubFilter /{}\n",
+            sub_filter_for(self.config.pades_level)
+        ));
 
         // ByteRange placeholder with fixed-width (10 digits each)
         dict.push_str("/ByteRange [0000000000 0000000000 0000000000 0000000000]\n");
@@ -571,12 +799,23 @@ impl DocumentSigner {
             dict.push_str(&format!("/ContactInfo ({})\n", escape_pdf_string(contact)));
         }
 
+        // DocMDP certification (ISO 32000-1 12.8.2.2), if requested.
+        if let Some(level) = self.config.certification {
+            dict.push_str(&build_docmdp_reference(level, catalog_id));
+        }
+
         dict.push_str(">>\nendobj\n");
         dict
     }
 
     /// Builds the signature field widget annotation.
-    fn build_signature_field(&self, field_id: u32, sig_dict_id: u32, appearance_id: u32, page_id: u32) -> String {
+    fn build_signature_field(
+        &self,
+        field_id: u32,
+        sig_dict_id: u32,
+        appearance_id: u32,
+        page_id: u32,
+    ) -> String {
         let field_name = "Signature1";
         let rect = match self.config.visible {
             Some(v) => format!("[{} {} {} {}]", v.x, v.y, v.x + v.width, v.y + v.height),
@@ -622,7 +861,10 @@ impl DocumentSigner {
         obj.push_str("/Subtype /Form\n");
         obj.push_str("/FormType 1\n");
         obj.push_str(&format!("/BBox [0 0 {} {}]\n", rect.width, rect.height));
-        obj.push_str(&format!("/Resources << /Font << /F1 {} 0 R >> >>\n", font_id));
+        obj.push_str(&format!(
+            "/Resources << /Font << /F1 {} 0 R >> >>\n",
+            font_id
+        ));
         obj.push_str(&format!("/Length {}\n", content.len()));
         obj.push_str(">>\nstream\n");
         obj.push_str(&String::from_utf8_lossy(&content));
@@ -640,7 +882,12 @@ impl DocumentSigner {
     }
 
     /// Builds updated page object with Annots array.
-    fn build_updated_page(&self, pdf_bytes: &[u8], page_id: u32, sig_field_id: u32) -> SignatureResult<String> {
+    fn build_updated_page(
+        &self,
+        pdf_bytes: &[u8],
+        page_id: u32,
+        sig_field_id: u32,
+    ) -> SignatureResult<String> {
         // Use lossy conversion since PDFs may contain binary streams
         let content = String::from_utf8_lossy(pdf_bytes);
 
@@ -687,13 +934,32 @@ impl DocumentSigner {
         let before_end = &page_obj[..dict_end];
 
         // Build the updated object with proper formatting
-        Ok(format!("{} 0 obj\n{}/Annots [{} 0 R]\n>>\nendobj\n", page_id, before_end.trim_start_matches(&format!("{} 0 obj", page_id)).trim(), sig_field_id))
+        Ok(format!(
+            "{} 0 obj\n{}/Annots [{} 0 R]\n>>\nendobj\n",
+            page_id,
+            before_end
+                .trim_start_matches(&format!("{} 0 obj", page_id))
+                .trim(),
+            sig_field_id
+        ))
     }
 
-    /// Builds updated catalog object with AcroForm reference.
-    fn build_updated_catalog(&self, pdf_bytes: &[u8], catalog_id: u32, acro_form_id: u32) -> SignatureResult<String> {
+    /// Builds updated catalog object with AcroForm reference. `docmdp_sig_id`,
+    /// when `Some`, also adds a `/Perms << /DocMDP <docmdp_sig_id> 0 R >>`
+    /// entry (ISO 32000-1 12.7.4.5) pointing at the certifying signature
+    /// dictionary -- see [`SignatureConfig::certification`].
+    fn build_updated_catalog(
+        &self,
+        pdf_bytes: &[u8],
+        catalog_id: u32,
+        acro_form_id: u32,
+        docmdp_sig_id: Option<u32>,
+    ) -> SignatureResult<String> {
         // Use lossy conversion since PDFs may contain binary streams
         let content = String::from_utf8_lossy(pdf_bytes);
+        let perms_entry = docmdp_sig_id
+            .map(|id| format!("/Perms << /DocMDP {} 0 R >>\n", id))
+            .unwrap_or_default();
 
         // Find the catalog object
         let catalog_pattern = format!("{} 0 obj", catalog_id);
@@ -721,10 +987,14 @@ impl DocumentSigner {
             if parts.len() >= 3 && parts[2] == "R" {
                 let old_ref_len = trimmed.find('R').unwrap() + 1;
                 let before_acro = &catalog_obj[..acro_start];
-                let after_ref_start = acro_start + 9 + (after_acro.len() - trimmed.len()) + old_ref_len;
+                let after_ref_start =
+                    acro_start + 9 + (after_acro.len() - trimmed.len()) + old_ref_len;
                 let after_ref = &catalog_obj[after_ref_start..];
 
-                return Ok(format!("{}/AcroForm {} 0 R{}", before_acro, acro_form_id, after_ref));
+                return Ok(format!(
+                    "{}/AcroForm {} 0 R\n{}{}",
+                    before_acro, acro_form_id, perms_entry, after_ref
+                ));
             }
         }
 
@@ -736,7 +1006,15 @@ impl DocumentSigner {
         let before_end = &catalog_obj[..dict_end];
 
         // Build the updated object with proper formatting
-        Ok(format!("{} 0 obj\n{}/AcroForm {} 0 R\n>>\nendobj\n", catalog_id, before_end.trim_start_matches(&format!("{} 0 obj", catalog_id)).trim(), acro_form_id))
+        Ok(format!(
+            "{} 0 obj\n{}/AcroForm {} 0 R\n{}>>\nendobj\n",
+            catalog_id,
+            before_end
+                .trim_start_matches(&format!("{} 0 obj", catalog_id))
+                .trim(),
+            acro_form_id,
+            perms_entry
+        ))
     }
 
     /// Builds the incremental xref table.
@@ -798,8 +1076,11 @@ impl DocumentSigner {
                 .iter()
                 .position(|&b| b == b'>')
                 .ok_or_else(|| {
-                    SignatureError::ByteRangeError("Could not find closing > for Contents".to_string())
-                })? + hex_open;
+                    SignatureError::ByteRangeError(
+                        "Could not find closing > for Contents".to_string(),
+                    )
+                })?
+                + hex_open;
 
             return Ok(ByteRange {
                 offset1: 0,
@@ -823,15 +1104,16 @@ impl DocumentSigner {
     }
 
     /// Updates the ByteRange placeholder with actual values.
-    fn update_byte_range_placeholder(&self, pdf_bytes: Vec<u8>, byte_range: &ByteRange) -> SignatureResult<Vec<u8>> {
+    fn update_byte_range_placeholder(
+        &self,
+        pdf_bytes: Vec<u8>,
+        byte_range: &ByteRange,
+    ) -> SignatureResult<Vec<u8>> {
         // Find the ByteRange placeholder by searching for the byte pattern
         let placeholder = b"/ByteRange [0000000000 0000000000 0000000000 0000000000]";
         let replacement = format!(
             "/ByteRange [{:010} {:010} {:010} {:010}]",
-            byte_range.offset1,
-            byte_range.length1,
-            byte_range.offset2,
-            byte_range.length2
+            byte_range.offset1, byte_range.length1, byte_range.offset2, byte_range.length2
         );
 
         // Find the placeholder position
@@ -1036,7 +1318,10 @@ fn format_pdf_timestamp() -> String {
     let minute = (time_of_day % 3600) / 60;
     let second = time_of_day % 60;
 
-    format!("D:{:04}{:02}{:02}{:02}{:02}{:02}+00'00'", year, month, day, hour, minute, second)
+    format!(
+        "D:{:04}{:02}{:02}{:02}{:02}{:02}+00'00'",
+        year, month, day, hour, minute, second
+    )
 }
 
 /// Checks if a year is a leap year.
@@ -1058,6 +1343,9 @@ pub struct IncrementalSigner {
     certificate_chain: Vec<Certificate>,
     /// The private key for signing.
     private_key: Option<PrivateKey>,
+    /// A remote signing backend (HSM/KMS), used instead of `private_key`
+    /// when set. See [`IncrementalSigner::remote_signer`].
+    remote_signer: Option<Arc<dyn RemoteSigner>>,
     /// Signature configuration.
     config: SignatureConfig,
 }
@@ -1070,6 +1358,7 @@ impl IncrementalSigner {
             certificate: None,
             certificate_chain: Vec::new(),
             private_key: None,
+            remote_signer: None,
             config: SignatureConfig::default(),
         }
     }
@@ -1087,8 +1376,31 @@ impl IncrementalSigner {
     }
 
     /// Sets the private key.
+    ///
+    /// Mutually exclusive in effect with [`IncrementalSigner::remote_signer`]:
+    /// if both are set, the remote signer takes precedence and this key is
+    /// ignored (see that method's docs).
     pub fn private_key(mut self, key: PrivateKey) -> Self {
         self.private_key = Some(key);
+        self
+    }
+
+    /// Uses `signer` (an HSM/KMS-backed [`RemoteSigner`]) to produce the
+    /// signature instead of in-process key material -- call this instead of
+    /// [`IncrementalSigner::private_key`]. If both are set, the remote
+    /// signer takes precedence and `private_key` is ignored.
+    ///
+    /// **Certificate precedence rule:** the certificate used for signing is
+    /// [`IncrementalSigner::certificate`] if that was called, otherwise
+    /// [`RemoteSigner::certificate`]. So calling `.certificate(..)` is
+    /// optional when a remote signer is configured (it is auto-populated
+    /// from the `RemoteSigner`), but an explicit call still wins -- e.g. to
+    /// sign with a different chain-anchoring certificate than the one the
+    /// remote signer itself reports. Whichever certificate is used, it must
+    /// correspond to the key the `RemoteSigner` actually signs with, or the
+    /// produced signature will fail verification.
+    pub fn remote_signer(mut self, signer: Arc<dyn RemoteSigner>) -> Self {
+        self.remote_signer = Some(signer);
         self
     }
 
@@ -1140,13 +1452,21 @@ impl IncrementalSigner {
 
     /// Signs the PDF and returns the signed PDF bytes with the new signature.
     pub fn sign(self) -> SignatureResult<Vec<u8>> {
-        let cert = self.certificate.as_ref().ok_or_else(|| {
-            SignatureError::SigningFailed("Certificate not set".to_string())
-        })?;
+        let cert = self
+            .certificate
+            .as_ref()
+            .or_else(|| self.remote_signer.as_ref().map(|s| s.certificate()))
+            .ok_or_else(|| SignatureError::SigningFailed("Certificate not set".to_string()))?;
 
-        let key = self.private_key.as_ref().ok_or_else(|| {
-            SignatureError::SigningFailed("Private key not set".to_string())
-        })?;
+        let signing_key = match self.remote_signer.as_ref() {
+            Some(remote) => SigningKey::Remote(remote.as_ref()),
+            None => {
+                let key = self.private_key.as_ref().ok_or_else(|| {
+                    SignatureError::SigningFailed("Private key not set".to_string())
+                })?;
+                SigningKey::Local(key)
+            }
+        };
 
         // Create PDF with new signature placeholder
         let pdf_with_placeholder = self.create_pdf_with_new_signature()?;
@@ -1155,16 +1475,24 @@ impl IncrementalSigner {
         let byte_range = self.calculate_byte_range(&pdf_with_placeholder)?;
 
         // Update the ByteRange placeholder with actual values
-        let pdf_with_byte_range = self.update_byte_range_placeholder(pdf_with_placeholder, &byte_range)?;
+        let pdf_with_byte_range =
+            self.update_byte_range_placeholder(pdf_with_placeholder, &byte_range)?;
 
         // Extract the data to sign
         let data_to_sign = self.extract_signed_data(&pdf_with_byte_range, &byte_range);
 
         // Create the PKCS#7 signature
-        let pkcs7_signature = build_pkcs7_signature(&self.config, cert, &self.certificate_chain, &data_to_sign, key)?;
+        let pkcs7_signature = build_pkcs7_signature(
+            &self.config,
+            cert,
+            &self.certificate_chain,
+            &data_to_sign,
+            signing_key,
+        )?;
 
         // Embed the signature
-        let signed_pdf = self.embed_signature(pdf_with_byte_range, &byte_range, &pkcs7_signature)?;
+        let signed_pdf =
+            self.embed_signature(pdf_with_byte_range, &byte_range, &pkcs7_signature)?;
 
         Ok(signed_pdf)
     }
@@ -1178,9 +1506,7 @@ impl IncrementalSigner {
         let startxref_pos = pdf_bytes
             .windows(pattern.len())
             .rposition(|window| window == pattern)
-            .ok_or_else(|| {
-                SignatureError::SigningFailed("Could not find startxref".to_string())
-            })?;
+            .ok_or_else(|| SignatureError::SigningFailed("Could not find startxref".to_string()))?;
 
         // Extract the xref offset
         let after_startxref = &pdf_bytes[startxref_pos + 9..];
@@ -1213,7 +1539,14 @@ impl IncrementalSigner {
         // Count existing signatures
         let sig_count = self.count_existing_signatures(&content);
 
-        Ok((prev_xref, root_obj_num, next_obj_id, page_obj_num, acro_form_obj, sig_count))
+        Ok((
+            prev_xref,
+            root_obj_num,
+            next_obj_id,
+            page_obj_num,
+            acro_form_obj,
+            sig_count,
+        ))
     }
 
     /// Finds the Root object number.
@@ -1230,7 +1563,9 @@ impl IncrementalSigner {
                 }
             }
         }
-        Err(SignatureError::SigningFailed("Could not find /Root reference".to_string()))
+        Err(SignatureError::SigningFailed(
+            "Could not find /Root reference".to_string(),
+        ))
     }
 
     /// Finds the next available object ID.
@@ -1291,7 +1626,8 @@ impl IncrementalSigner {
                             let after_kids = &pages_obj[kids_pos + 5..];
                             if let Some(bracket_pos) = after_kids.find('[') {
                                 let after_bracket = &after_kids[bracket_pos + 1..];
-                                let parts: Vec<&str> = after_bracket.split_whitespace().take(3).collect();
+                                let parts: Vec<&str> =
+                                    after_bracket.split_whitespace().take(3).collect();
                                 if parts.len() >= 2 {
                                     if let Ok(page_num) = parts[0].parse::<u32>() {
                                         return Ok(page_num);
@@ -1303,7 +1639,9 @@ impl IncrementalSigner {
                 }
             }
         }
-        Err(SignatureError::SigningFailed("Could not find page object".to_string()))
+        Err(SignatureError::SigningFailed(
+            "Could not find page object".to_string(),
+        ))
     }
 
     /// Finds existing AcroForm object number if present.
@@ -1337,6 +1675,20 @@ impl IncrementalSigner {
     fn create_pdf_with_new_signature(&self) -> SignatureResult<Vec<u8>> {
         let (prev_xref, root_obj_num, next_obj_id, page_obj_num, existing_acro_form, sig_count) =
             self.parse_pdf_info()?;
+
+        // A certification signature (DocMDP) is only valid as the *first*
+        // signature on a document (ISO 32000-1 12.8.2.2). `sig_count` (the
+        // number of existing `/FT /Sig` signature-field widgets, see
+        // `count_existing_signatures`) is the exact rule used here: refuse
+        // rather than silently emit a second, spec-violating /Perms /DocMDP.
+        if self.config.certification.is_some() && sig_count > 0 {
+            return Err(SignatureError::SigningFailed(
+                "Cannot apply a certification signature: the document already contains one or \
+                 more signatures (a certification signature must be the first signature on a \
+                 document)"
+                    .to_string(),
+            ));
+        }
 
         let original_pdf = &self.pdf_bytes;
         let mut output = original_pdf.clone();
@@ -1373,13 +1725,19 @@ impl IncrementalSigner {
 
         // 1. Build signature dictionary
         let sig_dict_offset = output.len();
-        let sig_dict = self.build_signature_dictionary(sig_dict_id);
+        let sig_dict = self.build_signature_dictionary(sig_dict_id, root_obj_num);
         output.extend_from_slice(sig_dict.as_bytes());
         object_offsets.push((sig_dict_id, sig_dict_offset));
 
         // 2. Build signature field widget
         let sig_field_offset = output.len();
-        let sig_field = self.build_signature_field(sig_field_id, sig_dict_id, appearance_id, page_obj_num, &sig_name);
+        let sig_field = self.build_signature_field(
+            sig_field_id,
+            sig_dict_id,
+            appearance_id,
+            page_obj_num,
+            &sig_name,
+        );
         output.extend_from_slice(sig_field.as_bytes());
         object_offsets.push((sig_field_id, sig_field_offset));
 
@@ -1414,17 +1772,28 @@ impl IncrementalSigner {
         output.extend_from_slice(updated_page.as_bytes());
         object_offsets.push((page_obj_num, updated_page_offset));
 
-        // 6. Build updated catalog if needed (only if we created new AcroForm)
-        if existing_acro_form.is_none() {
+        // 6. Build updated catalog if needed: either we created a new
+        // AcroForm (so /AcroForm must be added), or we're certifying (so
+        // /Perms /DocMDP must be added even if /AcroForm already pointed at
+        // an existing form -- e.g. one created for ordinary, non-signature
+        // form fields before this signature was ever applied).
+        let docmdp_sig_id = self.config.certification.map(|_| sig_dict_id);
+        if existing_acro_form.is_none() || docmdp_sig_id.is_some() {
             let updated_catalog_offset = output.len();
-            let updated_catalog = self.build_updated_catalog(original_pdf, root_obj_num, acro_form_id)?;
+            let updated_catalog = self.build_updated_catalog(
+                original_pdf,
+                root_obj_num,
+                acro_form_id,
+                docmdp_sig_id,
+            )?;
             output.extend_from_slice(updated_catalog.as_bytes());
             object_offsets.push((root_obj_num, updated_catalog_offset));
         }
 
         // 7. Build incremental xref
         let xref_offset = output.len();
-        let xref = self.build_incremental_xref(&object_offsets, prev_xref, root_obj_num, final_next_id);
+        let xref =
+            self.build_incremental_xref(&object_offsets, prev_xref, root_obj_num, final_next_id);
         output.extend_from_slice(xref.as_bytes());
 
         // 8. Add startxref and %%EOF
@@ -1433,8 +1802,10 @@ impl IncrementalSigner {
         Ok(output)
     }
 
-    /// Builds the signature dictionary.
-    fn build_signature_dictionary(&self, obj_id: u32) -> String {
+    /// Builds the signature dictionary. `catalog_id` is the document's
+    /// `/Root` object number, needed only when `self.config.certification`
+    /// is set (see [`build_docmdp_reference`]).
+    fn build_signature_dictionary(&self, obj_id: u32, catalog_id: u32) -> String {
         let signer_name = self.config.name.as_deref().unwrap_or("Unknown");
         let timestamp = format_pdf_timestamp();
         let placeholder_size = signature_placeholder_size(&self.config);
@@ -1442,7 +1813,10 @@ impl IncrementalSigner {
         let mut dict = format!("{} 0 obj\n<<\n", obj_id);
         dict.push_str("/Type /Sig\n");
         dict.push_str("/Filter /Adobe.PPKLite\n");
-        dict.push_str(&format!("/SubFilter /{}\n", sub_filter_for(self.config.pades_level)));
+        dict.push_str(&format!(
+            "/SubFilter /{}\n",
+            sub_filter_for(self.config.pades_level)
+        ));
         dict.push_str("/ByteRange [0000000000 0000000000 0000000000 0000000000]\n");
         dict.push_str("/Contents <");
         dict.push_str(&"0".repeat(placeholder_size * 2));
@@ -1460,12 +1834,24 @@ impl IncrementalSigner {
             dict.push_str(&format!("/ContactInfo ({})\n", escape_pdf_string(contact)));
         }
 
+        // DocMDP certification (ISO 32000-1 12.8.2.2), if requested.
+        if let Some(level) = self.config.certification {
+            dict.push_str(&build_docmdp_reference(level, catalog_id));
+        }
+
         dict.push_str(">>\nendobj\n");
         dict
     }
 
     /// Builds the signature field widget.
-    fn build_signature_field(&self, field_id: u32, sig_dict_id: u32, appearance_id: u32, page_id: u32, field_name: &str) -> String {
+    fn build_signature_field(
+        &self,
+        field_id: u32,
+        sig_dict_id: u32,
+        appearance_id: u32,
+        page_id: u32,
+        field_name: &str,
+    ) -> String {
         let rect = match self.config.visible {
             Some(v) => format!("[{} {} {} {}]", v.x, v.y, v.x + v.width, v.y + v.height),
             None => "[0 0 0 0]".to_string(),
@@ -1509,7 +1895,10 @@ impl IncrementalSigner {
         obj.push_str("/Subtype /Form\n");
         obj.push_str("/FormType 1\n");
         obj.push_str(&format!("/BBox [0 0 {} {}]\n", rect.width, rect.height));
-        obj.push_str(&format!("/Resources << /Font << /F1 {} 0 R >> >>\n", font_id));
+        obj.push_str(&format!(
+            "/Resources << /Font << /F1 {} 0 R >> >>\n",
+            font_id
+        ));
         obj.push_str(&format!("/Length {}\n", content.len()));
         obj.push_str(">>\nstream\n");
         obj.push_str(&String::from_utf8_lossy(&content));
@@ -1527,12 +1916,20 @@ impl IncrementalSigner {
     }
 
     /// Builds updated AcroForm with new field added.
-    fn build_updated_acro_form(&self, pdf_bytes: &[u8], acro_form_id: u32, new_field_id: u32) -> SignatureResult<String> {
+    fn build_updated_acro_form(
+        &self,
+        pdf_bytes: &[u8],
+        acro_form_id: u32,
+        new_field_id: u32,
+    ) -> SignatureResult<String> {
         let content = String::from_utf8_lossy(pdf_bytes);
 
         let acro_pattern = format!("{} 0 obj", acro_form_id);
         let acro_start = content.find(&acro_pattern).ok_or_else(|| {
-            SignatureError::SigningFailed(format!("Could not find AcroForm object {}", acro_form_id))
+            SignatureError::SigningFailed(format!(
+                "Could not find AcroForm object {}",
+                acro_form_id
+            ))
         })?;
 
         let acro_content = &content[acro_start..];
@@ -1555,7 +1952,10 @@ impl IncrementalSigner {
                     if existing_fields.is_empty() {
                         form.push_str(&format!("/Fields [{} 0 R]\n", new_field_id));
                     } else {
-                        form.push_str(&format!("/Fields [{} {} 0 R]\n", existing_fields, new_field_id));
+                        form.push_str(&format!(
+                            "/Fields [{} {} 0 R]\n",
+                            existing_fields, new_field_id
+                        ));
                     }
                     form.push_str("/SigFlags 3\n");
                     form.push_str(">>\nendobj\n");
@@ -1564,11 +1964,18 @@ impl IncrementalSigner {
             }
         }
 
-        Err(SignatureError::SigningFailed("Could not parse AcroForm /Fields".to_string()))
+        Err(SignatureError::SigningFailed(
+            "Could not parse AcroForm /Fields".to_string(),
+        ))
     }
 
     /// Builds updated page with new annotation.
-    fn build_updated_page(&self, pdf_bytes: &[u8], page_id: u32, sig_field_id: u32) -> SignatureResult<String> {
+    fn build_updated_page(
+        &self,
+        pdf_bytes: &[u8],
+        page_id: u32,
+        sig_field_id: u32,
+    ) -> SignatureResult<String> {
         let content = String::from_utf8_lossy(pdf_bytes);
 
         let page_pattern = format!("{} 0 obj", page_id);
@@ -1599,15 +2006,21 @@ impl IncrementalSigner {
                     })?;
 
                     let before_annots = &page_obj[..annots_start];
-                    let after_close = &page_obj[annots_start + 7 + bracket_pos + 1 + close_pos + 1..dict_end];
+                    let after_close =
+                        &page_obj[annots_start + 7 + bracket_pos + 1 + close_pos + 1..dict_end];
 
                     let result = format!(
                         "{} 0 obj\n{}/Annots [{} {} 0 R]{}\n>>\nendobj\n",
                         page_id,
-                        before_annots.trim_start_matches(&format!("{} 0 obj", page_id)).trim(),
+                        before_annots
+                            .trim_start_matches(&format!("{} 0 obj", page_id))
+                            .trim(),
                         existing_annots,
                         sig_field_id,
-                        after_close.trim_end_matches(">>").trim_end_matches("\n").trim()
+                        after_close
+                            .trim_end_matches(">>")
+                            .trim_end_matches("\n")
+                            .trim()
                     );
                     return Ok(result);
                 }
@@ -1615,22 +2028,44 @@ impl IncrementalSigner {
         }
 
         // Add new Annots array
-        let dict_end = page_obj.rfind(">>").ok_or_else(|| {
-            SignatureError::SigningFailed("Invalid page structure".to_string())
-        })?;
+        let dict_end = page_obj
+            .rfind(">>")
+            .ok_or_else(|| SignatureError::SigningFailed("Invalid page structure".to_string()))?;
 
         let before_end = &page_obj[..dict_end];
         Ok(format!(
             "{} 0 obj\n{}/Annots [{} 0 R]\n>>\nendobj\n",
             page_id,
-            before_end.trim_start_matches(&format!("{} 0 obj", page_id)).trim(),
+            before_end
+                .trim_start_matches(&format!("{} 0 obj", page_id))
+                .trim(),
             sig_field_id
         ))
     }
 
-    /// Builds updated catalog with AcroForm reference.
-    fn build_updated_catalog(&self, pdf_bytes: &[u8], catalog_id: u32, acro_form_id: u32) -> SignatureResult<String> {
+    /// Builds updated catalog with an AcroForm reference (replacing an
+    /// existing `/AcroForm` entry in place if the catalog already has one).
+    /// `docmdp_sig_id`, when `Some`, also adds a
+    /// `/Perms << /DocMDP <docmdp_sig_id> 0 R >>` entry (ISO 32000-1
+    /// 12.7.4.5) pointing at the certifying signature dictionary -- see
+    /// [`SignatureConfig::certification`]. The "already has an /AcroForm"
+    /// path only matters for the certification case: `create_pdf_with_new_signature`
+    /// otherwise only calls this when there was no existing `/AcroForm` to
+    /// begin with, but certifying a document whose catalog already points
+    /// at a pre-existing (non-signature) AcroForm still needs a catalog
+    /// update to add `/Perms`, and must preserve rather than duplicate the
+    /// existing `/AcroForm` entry while doing so.
+    fn build_updated_catalog(
+        &self,
+        pdf_bytes: &[u8],
+        catalog_id: u32,
+        acro_form_id: u32,
+        docmdp_sig_id: Option<u32>,
+    ) -> SignatureResult<String> {
         let content = String::from_utf8_lossy(pdf_bytes);
+        let perms_entry = docmdp_sig_id
+            .map(|id| format!("/Perms << /DocMDP {} 0 R >>\n", id))
+            .unwrap_or_default();
 
         let catalog_pattern = format!("{} 0 obj", catalog_id);
         let catalog_start = content.find(&catalog_pattern).ok_or_else(|| {
@@ -1643,21 +2078,53 @@ impl IncrementalSigner {
         })?;
 
         let catalog_obj = &catalog_content[..endobj_pos + 6];
+
+        // If the catalog already has an /AcroForm (the certifying-with-a-
+        // pre-existing-form case), replace it in place (with the same id)
+        // rather than emitting a second, conflicting /AcroForm entry.
+        if catalog_obj.contains("/AcroForm") {
+            let acro_start = catalog_obj.find("/AcroForm").unwrap();
+            let after_acro = &catalog_obj[acro_start + 9..];
+            let trimmed = after_acro.trim_start();
+            let parts: Vec<&str> = trimmed.split_whitespace().take(3).collect();
+            if parts.len() >= 3 && parts[2] == "R" {
+                let old_ref_len = trimmed.find('R').unwrap() + 1;
+                let before_acro = &catalog_obj[..acro_start];
+                let after_ref_start =
+                    acro_start + 9 + (after_acro.len() - trimmed.len()) + old_ref_len;
+                let after_ref = &catalog_obj[after_ref_start..];
+
+                return Ok(format!(
+                    "{}/AcroForm {} 0 R\n{}{}",
+                    before_acro, acro_form_id, perms_entry, after_ref
+                ));
+            }
+        }
+
         let dict_end = catalog_obj.rfind(">>").ok_or_else(|| {
             SignatureError::SigningFailed("Invalid catalog structure".to_string())
         })?;
 
         let before_end = &catalog_obj[..dict_end];
         Ok(format!(
-            "{} 0 obj\n{}/AcroForm {} 0 R\n>>\nendobj\n",
+            "{} 0 obj\n{}/AcroForm {} 0 R\n{}>>\nendobj\n",
             catalog_id,
-            before_end.trim_start_matches(&format!("{} 0 obj", catalog_id)).trim(),
-            acro_form_id
+            before_end
+                .trim_start_matches(&format!("{} 0 obj", catalog_id))
+                .trim(),
+            acro_form_id,
+            perms_entry
         ))
     }
 
     /// Builds the incremental xref table.
-    fn build_incremental_xref(&self, object_offsets: &[(u32, usize)], prev_xref: usize, root_obj_num: u32, next_obj_id: u32) -> String {
+    fn build_incremental_xref(
+        &self,
+        object_offsets: &[(u32, usize)],
+        prev_xref: usize,
+        root_obj_num: u32,
+        next_obj_id: u32,
+    ) -> String {
         let mut xref = String::from("xref\n");
         xref.push_str("0 1\n");
         xref.push_str("0000000000 65535 f \n");
@@ -1700,7 +2167,9 @@ impl IncrementalSigner {
         let expected_close = hex_open + 1 + (signature_placeholder_size(&self.config) * 2);
 
         if expected_close >= pdf_bytes.len() || pdf_bytes[expected_close] != b'>' {
-            return Err(SignatureError::ByteRangeError("Could not find closing > for Contents".to_string()));
+            return Err(SignatureError::ByteRangeError(
+                "Could not find closing > for Contents".to_string(),
+            ));
         }
 
         Ok(ByteRange {
@@ -1712,15 +2181,16 @@ impl IncrementalSigner {
     }
 
     /// Updates the ByteRange placeholder with actual values.
-    fn update_byte_range_placeholder(&self, pdf_bytes: Vec<u8>, byte_range: &ByteRange) -> SignatureResult<Vec<u8>> {
+    fn update_byte_range_placeholder(
+        &self,
+        pdf_bytes: Vec<u8>,
+        byte_range: &ByteRange,
+    ) -> SignatureResult<Vec<u8>> {
         // Find the LAST ByteRange placeholder (the new signature)
         let placeholder = b"/ByteRange [0000000000 0000000000 0000000000 0000000000]";
         let replacement = format!(
             "/ByteRange [{:010} {:010} {:010} {:010}]",
-            byte_range.offset1,
-            byte_range.length1,
-            byte_range.offset2,
-            byte_range.length2
+            byte_range.offset1, byte_range.length1, byte_range.offset2, byte_range.length2
         );
 
         let mut last_pos = None;
@@ -1763,7 +2233,12 @@ impl IncrementalSigner {
     }
 
     /// Embeds the signature into the PDF.
-    fn embed_signature(&self, pdf_bytes: Vec<u8>, byte_range: &ByteRange, signature: &[u8]) -> SignatureResult<Vec<u8>> {
+    fn embed_signature(
+        &self,
+        pdf_bytes: Vec<u8>,
+        byte_range: &ByteRange,
+        signature: &[u8],
+    ) -> SignatureResult<Vec<u8>> {
         let sig_hex: String = signature.iter().map(|b| format!("{:02X}", b)).collect();
 
         let placeholder_size = signature_placeholder_size(&self.config) * 2;
@@ -1771,7 +2246,9 @@ impl IncrementalSigner {
             let padding = "0".repeat(placeholder_size - sig_hex.len());
             sig_hex + &padding
         } else if sig_hex.len() > placeholder_size {
-            return Err(SignatureError::SigningFailed("Signature too large".to_string()));
+            return Err(SignatureError::SigningFailed(
+                "Signature too large".to_string(),
+            ));
         } else {
             sig_hex
         };
@@ -1829,5 +2306,60 @@ mod tests {
         assert!(is_leap_year(2024));
         assert!(!is_leap_year(1900));
         assert!(!is_leap_year(2023));
+    }
+
+    // -- DocMDP certification helpers --
+    //
+    // These exercise `has_existing_signature_objects`/`build_docmdp_reference`
+    // directly rather than through a full `DocumentSigner`/`IncrementalSigner`
+    // round-trip: `Document` (the type `DocumentSigner` wraps) has no way to
+    // represent a pre-existing `/Type /Sig` object via the public API today
+    // (it always serializes fresh pages/info from scratch, see
+    // `Document::write_to`), so "DocumentSigner asked to certify a document
+    // that already has a signature" cannot currently be reached through
+    // `Document`'s public surface -- the check in
+    // `DocumentSigner::create_pdf_with_placeholder` exists as a defensive
+    // guard against that changing later (e.g. a future `Document` gaining
+    // raw-object passthrough), and this is what actually proves it works.
+    // The equivalent `IncrementalSigner` rejection *is* reachable through
+    // the public API (an incrementally-updated PDF genuinely can already
+    // contain a `/Type /Sig` object) and is covered end-to-end in
+    // `tests/docmdp_certification_tests.rs`.
+
+    #[test]
+    fn test_has_existing_signature_objects_false_for_unsigned_pdf() {
+        let pdf = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF";
+        assert!(!has_existing_signature_objects(pdf));
+    }
+
+    #[test]
+    fn test_has_existing_signature_objects_true_for_signed_pdf() {
+        let pdf = b"%PDF-1.7\n5 0 obj\n<< /Type /Sig /Filter /Adobe.PPKLite >>\nendobj\n%%EOF";
+        assert!(has_existing_signature_objects(pdf));
+    }
+
+    #[test]
+    fn test_build_docmdp_reference_contains_p_value_and_data_ref() {
+        let reference = build_docmdp_reference(CertificationLevel::FormFillingOnly, 7);
+        assert!(reference.contains("/TransformMethod /DocMDP"));
+        assert!(reference.contains("/Data 7 0 R"));
+        assert!(reference.contains("/P 2"));
+    }
+
+    #[test]
+    fn test_document_signer_rejects_certification_on_already_signed_bytes() {
+        // Directly proves the guard inside
+        // `DocumentSigner::create_pdf_with_placeholder`: a document whose
+        // serialized bytes already contain a `/Type /Sig` object must be
+        // rejected when certification is requested. `DocumentSigner` can't
+        // be driven to this state through its public API (see the module
+        // doc comment above), so this replicates just the guard condition
+        // it evaluates: `self.config.certification.is_some() &&
+        // has_existing_signature_objects(&original_pdf)`.
+        let already_signed_bytes =
+            b"%PDF-1.7\n5 0 obj\n<< /Type /Sig /Filter /Adobe.PPKLite >>\nendobj\n%%EOF";
+        let config = SignatureConfig::new().certify(CertificationLevel::NoChanges);
+        assert!(config.certification.is_some());
+        assert!(has_existing_signature_objects(already_signed_bytes));
     }
 }

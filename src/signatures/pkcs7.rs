@@ -1,7 +1,7 @@
 //! PKCS#7 (CMS) signature container building.
 
-use crate::error::SignatureError;
 use super::{Certificate, PrivateKey, SignatureAlgorithm, SignatureResult};
+use crate::error::SignatureError;
 
 /// The `id-aa-signingCertificateV2` attribute OID (RFC 5035 §3):
 /// `1.2.840.113549.1.9.16.2.47`.
@@ -14,8 +14,9 @@ use super::{Certificate, PrivateKey, SignatureAlgorithm, SignatureResult};
 /// `ETSI.CAdES.detached`, see ETSI EN 319 142-1 "PAdES digital signatures").
 /// Without it, a CMS SignedData is a plain PKCS#7 signature
 /// (`adbe.pkcs7.detached`) but not a conformant CAdES/PAdES signature.
-const OID_SIGNING_CERTIFICATE_V2: &[u8] =
-    &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F];
+const OID_SIGNING_CERTIFICATE_V2: &[u8] = &[
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F,
+];
 
 /// Builder for creating PKCS#7 (CMS) SignedData structures.
 #[derive(Debug)]
@@ -82,12 +83,9 @@ impl Pkcs7Builder {
     /// (the `SignatureValue` inside `SignerInfo`), since an RFC 3161
     /// timestamp-over-the-signature (PAdES "B-T") needs the latter as its
     /// message-imprint input.
-    pub fn build(
-        &self,
-        data_to_sign: &[u8],
-        private_key: &PrivateKey,
-    ) -> SignatureResult<Vec<u8>> {
-        self.build_with_signature(data_to_sign, private_key).map(|(der, _sig)| der)
+    pub fn build(&self, data_to_sign: &[u8], private_key: &PrivateKey) -> SignatureResult<Vec<u8>> {
+        self.build_with_signature(data_to_sign, private_key)
+            .map(|(der, _sig)| der)
     }
 
     /// Same as [`Pkcs7Builder::build`], but also returns the raw signature
@@ -98,9 +96,10 @@ impl Pkcs7Builder {
         data_to_sign: &[u8],
         private_key: &PrivateKey,
     ) -> SignatureResult<(Vec<u8>, Vec<u8>)> {
-        let cert = self.certificate.as_ref().ok_or_else(|| {
-            SignatureError::SigningFailed("Certificate not set".to_string())
-        })?;
+        let cert = self
+            .certificate
+            .as_ref()
+            .ok_or_else(|| SignatureError::SigningFailed("Certificate not set".to_string()))?;
 
         // Compute message digest
         let digest = self.compute_digest(data_to_sign);
@@ -115,13 +114,50 @@ impl Pkcs7Builder {
         Ok((cms_data, signature))
     }
 
+    /// Same as [`Pkcs7Builder::build_with_signature`], but obtains the raw
+    /// signature bytes from `sign_fn` instead of a local [`PrivateKey`].
+    ///
+    /// This is the hook `signer.rs` uses to route through a `RemoteSigner`
+    /// (HSM/KMS) rather than in-process key material: every other step
+    /// (digest, signed attributes, CMS structure) delegates to the exact
+    /// same private helpers `build_with_signature` uses, so for the same
+    /// `data_to_sign`/certificate/algorithm, a `sign_fn` that returns the
+    /// same raw signature bytes a local `PrivateKey::sign` call would
+    /// produces byte-identical output to the local-key path.
+    pub(crate) fn build_with_remote_signature(
+        &self,
+        data_to_sign: &[u8],
+        sign_fn: impl FnOnce(&[u8]) -> SignatureResult<Vec<u8>>,
+    ) -> SignatureResult<(Vec<u8>, Vec<u8>)> {
+        let cert = self
+            .certificate
+            .as_ref()
+            .ok_or_else(|| SignatureError::SigningFailed("Certificate not set".to_string()))?;
+
+        // Compute message digest
+        let digest = self.compute_digest(data_to_sign);
+
+        // Create the signed attributes and sign them via the remote backend
+        let signed_attrs = self.build_signed_attributes(cert, &digest)?;
+        let signature = sign_fn(&signed_attrs)?;
+
+        // Build the CMS SignedData structure
+        let cms_data = self.build_cms_signed_data(cert, &digest, &signature)?;
+
+        Ok((cms_data, signature))
+    }
+
     /// Computes the message digest.
     fn compute_digest(&self, data: &[u8]) -> Vec<u8> {
         super::digest_for_algorithm(self.algorithm, data)
     }
 
     /// Builds the signed attributes to be signed (as SET for signing).
-    fn build_signed_attributes(&self, cert: &Certificate, digest: &[u8]) -> SignatureResult<Vec<u8>> {
+    fn build_signed_attributes(
+        &self,
+        cert: &Certificate,
+        digest: &[u8],
+    ) -> SignatureResult<Vec<u8>> {
         // Build a DER-encoded SET of attributes for signing
         let attrs = self.build_signed_attributes_content(cert, digest)?;
         Ok(build_set(&attrs))
@@ -303,7 +339,8 @@ impl Pkcs7Builder {
     /// (which is the property CAdES-BES / PAdES-B-B needs).
     fn build_signing_certificate_v2_attribute(&self, cert: &Certificate) -> Vec<u8> {
         // certHash = SHA-256(entire DER-encoded certificate).
-        let cert_hash = super::digest_for_algorithm(SignatureAlgorithm::RsaSha256, cert.der_bytes());
+        let cert_hash =
+            super::digest_for_algorithm(SignatureAlgorithm::RsaSha256, cert.der_bytes());
 
         // hashAlgorithm is technically DEFAULT sha256 (and DER purists would
         // omit it), but it is included explicitly here for maximum
@@ -347,6 +384,14 @@ impl Pkcs7Builder {
                 // ecdsa-with-SHA256: 1.2.840.10045.4.3.2
                 vec![0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]
             }
+            SignatureAlgorithm::EcdsaP384Sha384 => {
+                // ecdsa-with-SHA384: 1.2.840.10045.4.3.3
+                vec![0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03]
+            }
+            SignatureAlgorithm::EcdsaP521Sha512 => {
+                // ecdsa-with-SHA512: 1.2.840.10045.4.3.4
+                vec![0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04]
+            }
         };
 
         let mut alg_id = Vec::new();
@@ -358,8 +403,8 @@ impl Pkcs7Builder {
 
     /// Builds the issuer and serial number from the certificate.
     fn build_issuer_and_serial(&self, cert: &Certificate) -> SignatureResult<Vec<u8>> {
-        use x509_cert::Certificate as X509Cert;
         use der::{Decode, Encode};
+        use x509_cert::Certificate as X509Cert;
 
         let x509 = X509Cert::from_der(cert.der_bytes()).map_err(|e| {
             SignatureError::SigningFailed(format!("Failed to parse certificate: {}", e))
@@ -399,11 +444,11 @@ pub(super) fn build_digest_algorithm_identifier_for(algo: SignatureAlgorithm) ->
             // SHA-256: 2.16.840.1.101.3.4.2.1
             &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]
         }
-        SignatureAlgorithm::RsaSha384 => {
+        SignatureAlgorithm::RsaSha384 | SignatureAlgorithm::EcdsaP384Sha384 => {
             // SHA-384: 2.16.840.1.101.3.4.2.2
             &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02]
         }
-        SignatureAlgorithm::RsaSha512 => {
+        SignatureAlgorithm::RsaSha512 | SignatureAlgorithm::EcdsaP521Sha512 => {
             // SHA-512: 2.16.840.1.101.3.4.2.3
             &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03]
         }
