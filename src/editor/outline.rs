@@ -53,7 +53,9 @@ impl Destination {
 
     fn page_index(&self) -> usize {
         match self {
-            Destination::FitPage { page_index } | Destination::Xyz { page_index, .. } => *page_index,
+            Destination::FitPage { page_index } | Destination::Xyz { page_index, .. } => {
+                *page_index
+            }
         }
     }
 
@@ -65,7 +67,9 @@ impl Destination {
             Destination::FitPage { .. } => {
                 arr.push(Object::Name(PdfName::new_unchecked("Fit")));
             }
-            Destination::Xyz { left, top, zoom, .. } => {
+            Destination::Xyz {
+                left, top, zoom, ..
+            } => {
                 arr.push(Object::Name(PdfName::new_unchecked("XYZ")));
                 arr.push(num_or_null(left));
                 arr.push(num_or_null(top));
@@ -76,9 +80,17 @@ impl Destination {
     }
 
     fn from_array(doc: &EditableDocument, arr: &PdfArray) -> Option<Destination> {
-        let Object::Reference(page_id) = arr.get(0)? else { return None };
-        let page_index = doc.page_ids().ok()?.into_iter().position(|id| id == *page_id)?;
-        let Object::Name(kind) = arr.get(1)? else { return None };
+        let Object::Reference(page_id) = arr.get(0)? else {
+            return None;
+        };
+        let page_index = doc
+            .page_ids()
+            .ok()?
+            .into_iter()
+            .position(|id| id == *page_id)?;
+        let Object::Name(kind) = arr.get(1)? else {
+            return None;
+        };
         match kind.as_str() {
             "Fit" | "FitB" => Some(Destination::FitPage { page_index }),
             "XYZ" => Some(Destination::Xyz {
@@ -121,22 +133,36 @@ impl EditableDocument {
 
     /// Returns the full outline (bookmark) tree, in document order.
     pub fn list_bookmarks(&self) -> PdfResult<Vec<BookmarkNode>> {
-        let Ok(catalog) = self.catalog() else { return Ok(Vec::new()) };
-        let Some(Object::Reference(outlines_id)) = catalog.get("Outlines") else { return Ok(Vec::new()) };
-        let Ok(outlines) = self.get_dictionary(*outlines_id) else { return Ok(Vec::new()) };
-        let Some(Object::Reference(first)) = outlines.get("First") else { return Ok(Vec::new()) };
+        let Ok(catalog) = self.catalog() else {
+            return Ok(Vec::new());
+        };
+        let Some(Object::Reference(outlines_id)) = catalog.get("Outlines") else {
+            return Ok(Vec::new());
+        };
+        let Ok(outlines) = self.get_dictionary(*outlines_id) else {
+            return Ok(Vec::new());
+        };
+        let Some(Object::Reference(first)) = outlines.get("First") else {
+            return Ok(Vec::new());
+        };
 
         let mut visited = std::collections::HashSet::new();
         self.list_siblings(*first, &mut visited)
     }
 
-    fn list_siblings(&self, mut node_id: ObjectId, visited: &mut std::collections::HashSet<ObjectId>) -> PdfResult<Vec<BookmarkNode>> {
+    fn list_siblings(
+        &self,
+        mut node_id: ObjectId,
+        visited: &mut std::collections::HashSet<ObjectId>,
+    ) -> PdfResult<Vec<BookmarkNode>> {
         let mut out = Vec::new();
         loop {
             if visited.len() >= MAX_OUTLINE_NODES || !visited.insert(node_id) {
                 break;
             }
-            let Ok(dict) = self.get_dictionary(node_id) else { break };
+            let Ok(dict) = self.get_dictionary(node_id) else {
+                break;
+            };
             let title = match dict.get("Title") {
                 Some(Object::String(s)) => from_pdf_text_string(s),
                 _ => String::new(),
@@ -146,7 +172,12 @@ impl EditableDocument {
                 Some(Object::Reference(first)) => self.list_siblings(*first, visited)?,
                 _ => Vec::new(),
             };
-            out.push(BookmarkNode { id: node_id, title, dest, children });
+            out.push(BookmarkNode {
+                id: node_id,
+                title,
+                dest,
+                children,
+            });
 
             match dict.get("Next") {
                 Some(Object::Reference(next)) => node_id = *next,
@@ -182,7 +213,10 @@ impl EditableDocument {
                 _ => None,
             },
             Object::Name(n) => self.get_named_destination(n.as_str()).ok().flatten(),
-            Object::String(s) => self.get_named_destination(&from_pdf_text_string(s)).ok().flatten(),
+            Object::String(s) => self
+                .get_named_destination(&from_pdf_text_string(s))
+                .ok()
+                .flatten(),
             _ => None,
         }
     }
@@ -192,16 +226,41 @@ impl EditableDocument {
     /// `parent` is `None`). Creates the `/Outlines` root (and sets
     /// `Catalog /Outlines`) if this is the document's first bookmark.
     /// Returns the new item's object id.
-    pub fn add_bookmark(&mut self, parent: Option<ObjectId>, title: &str, dest: Destination) -> PdfResult<ObjectId> {
+    pub fn add_bookmark(
+        &mut self,
+        parent: Option<ObjectId>,
+        title: &str,
+        dest: Destination,
+    ) -> PdfResult<ObjectId> {
+        self.add_bookmark_opt(parent, title, Some(dest))
+    }
+
+    /// Shared implementation behind [`EditableDocument::add_bookmark`]
+    /// (always `Some`) and [`EditableDocument::append_document`]'s outline
+    /// import (`src/editor/pages.rs`), where a copied source bookmark's
+    /// destination might not be one of the shapes [`Destination`] round-
+    /// trips (see its doc comment) - in which case dropping just the
+    /// *destination* (`dest: None`, i.e. an outline item with no `/Dest`,
+    /// which ISO 32000-1 12.3.3/Table 153 does not require) is preferable
+    /// to dropping the whole bookmark. `pub(super)` rather than private so
+    /// `pages.rs`, a sibling module under `editor`, can call it.
+    pub(super) fn add_bookmark_opt(
+        &mut self,
+        parent: Option<ObjectId>,
+        title: &str,
+        dest: Option<Destination>,
+    ) -> PdfResult<ObjectId> {
         let outlines_id = self.outlines_root_id()?;
         let parent_id = parent.unwrap_or(outlines_id);
 
-        let dest_array = dest.to_array(self)?;
         let item_id = self.allocate_id();
         let mut item = PdfDictionary::new();
         item.set("Title", Object::String(to_pdf_text_string(title)));
         item.set("Parent", Object::Reference(parent_id));
-        item.set("Dest", Object::Array(dest_array));
+        if let Some(dest) = dest {
+            let dest_array = dest.to_array(self)?;
+            item.set("Dest", Object::Array(dest_array));
+        }
         self.set_object(item_id, Object::Dictionary(item));
 
         let mut parent_dict = self.get_dictionary(parent_id)?;
@@ -341,7 +400,11 @@ impl EditableDocument {
         self.count_subtree_inner(id, &mut visited)
     }
 
-    fn count_subtree_inner(&self, id: ObjectId, visited: &mut std::collections::HashSet<ObjectId>) -> PdfResult<usize> {
+    fn count_subtree_inner(
+        &self,
+        id: ObjectId,
+        visited: &mut std::collections::HashSet<ObjectId>,
+    ) -> PdfResult<usize> {
         if visited.len() >= MAX_OUTLINE_NODES || !visited.insert(id) {
             return Ok(0);
         }
@@ -409,12 +472,24 @@ impl EditableDocument {
 
     /// Looks up a named destination by name.
     pub fn get_named_destination(&self, name: &str) -> PdfResult<Option<Destination>> {
-        let Ok(catalog) = self.catalog() else { return Ok(None) };
-        let Some(Object::Reference(names_id)) = catalog.get("Names") else { return Ok(None) };
-        let Ok(names_dict) = self.get_dictionary(*names_id) else { return Ok(None) };
-        let Some(Object::Reference(dests_id)) = names_dict.get("Dests") else { return Ok(None) };
-        let Ok(dests) = self.get_dictionary(*dests_id) else { return Ok(None) };
-        let Some(Object::Array(arr)) = dests.get("Names") else { return Ok(None) };
+        let Ok(catalog) = self.catalog() else {
+            return Ok(None);
+        };
+        let Some(Object::Reference(names_id)) = catalog.get("Names") else {
+            return Ok(None);
+        };
+        let Ok(names_dict) = self.get_dictionary(*names_id) else {
+            return Ok(None);
+        };
+        let Some(Object::Reference(dests_id)) = names_dict.get("Dests") else {
+            return Ok(None);
+        };
+        let Ok(dests) = self.get_dictionary(*dests_id) else {
+            return Ok(None);
+        };
+        let Some(Object::Array(arr)) = dests.get("Names") else {
+            return Ok(None);
+        };
 
         for pair in arr.as_slice().chunks_exact(2) {
             if let Object::String(s) = &pair[0] {
@@ -428,12 +503,24 @@ impl EditableDocument {
 
     /// Lists every named destination's name, in tree (sorted) order.
     pub fn named_destinations(&self) -> PdfResult<Vec<String>> {
-        let Ok(catalog) = self.catalog() else { return Ok(Vec::new()) };
-        let Some(Object::Reference(names_id)) = catalog.get("Names") else { return Ok(Vec::new()) };
-        let Ok(names_dict) = self.get_dictionary(*names_id) else { return Ok(Vec::new()) };
-        let Some(Object::Reference(dests_id)) = names_dict.get("Dests") else { return Ok(Vec::new()) };
-        let Ok(dests) = self.get_dictionary(*dests_id) else { return Ok(Vec::new()) };
-        let Some(Object::Array(arr)) = dests.get("Names") else { return Ok(Vec::new()) };
+        let Ok(catalog) = self.catalog() else {
+            return Ok(Vec::new());
+        };
+        let Some(Object::Reference(names_id)) = catalog.get("Names") else {
+            return Ok(Vec::new());
+        };
+        let Ok(names_dict) = self.get_dictionary(*names_id) else {
+            return Ok(Vec::new());
+        };
+        let Some(Object::Reference(dests_id)) = names_dict.get("Dests") else {
+            return Ok(Vec::new());
+        };
+        let Ok(dests) = self.get_dictionary(*dests_id) else {
+            return Ok(Vec::new());
+        };
+        let Some(Object::Array(arr)) = dests.get("Names") else {
+            return Ok(Vec::new());
+        };
 
         Ok(arr
             .as_slice()
@@ -493,23 +580,35 @@ mod tests {
     #[test]
     fn test_add_and_list_top_level_bookmarks() {
         let mut doc = doc_with_pages(3);
-        doc.add_bookmark(None, "Chapter 1", Destination::fit(0)).unwrap();
-        doc.add_bookmark(None, "Chapter 2", Destination::fit(1)).unwrap();
+        doc.add_bookmark(None, "Chapter 1", Destination::fit(0))
+            .unwrap();
+        doc.add_bookmark(None, "Chapter 2", Destination::fit(1))
+            .unwrap();
 
         let bookmarks = doc.list_bookmarks().unwrap();
         assert_eq!(bookmarks.len(), 2);
         assert_eq!(bookmarks[0].title, "Chapter 1");
-        assert_eq!(bookmarks[0].dest, Some(Destination::FitPage { page_index: 0 }));
+        assert_eq!(
+            bookmarks[0].dest,
+            Some(Destination::FitPage { page_index: 0 })
+        );
         assert_eq!(bookmarks[1].title, "Chapter 2");
-        assert_eq!(bookmarks[1].dest, Some(Destination::FitPage { page_index: 1 }));
+        assert_eq!(
+            bookmarks[1].dest,
+            Some(Destination::FitPage { page_index: 1 })
+        );
     }
 
     #[test]
     fn test_add_nested_bookmark() {
         let mut doc = doc_with_pages(3);
-        let parent = doc.add_bookmark(None, "Part I", Destination::fit(0)).unwrap();
-        doc.add_bookmark(Some(parent), "Section 1.1", Destination::fit(1)).unwrap();
-        doc.add_bookmark(Some(parent), "Section 1.2", Destination::fit(2)).unwrap();
+        let parent = doc
+            .add_bookmark(None, "Part I", Destination::fit(0))
+            .unwrap();
+        doc.add_bookmark(Some(parent), "Section 1.1", Destination::fit(1))
+            .unwrap();
+        doc.add_bookmark(Some(parent), "Section 1.2", Destination::fit(2))
+            .unwrap();
 
         let bookmarks = doc.list_bookmarks().unwrap();
         assert_eq!(bookmarks.len(), 1);
@@ -521,19 +620,34 @@ mod tests {
     #[test]
     fn test_xyz_destination_round_trips() {
         let mut doc = doc_with_pages(1);
-        doc.add_bookmark(None, "Top", Destination::Xyz { page_index: 0, left: Some(10.0), top: Some(700.0), zoom: Some(1.5) })
-            .unwrap();
+        doc.add_bookmark(
+            None,
+            "Top",
+            Destination::Xyz {
+                page_index: 0,
+                left: Some(10.0),
+                top: Some(700.0),
+                zoom: Some(1.5),
+            },
+        )
+        .unwrap();
         let bookmarks = doc.list_bookmarks().unwrap();
         assert_eq!(
             bookmarks[0].dest,
-            Some(Destination::Xyz { page_index: 0, left: Some(10.0), top: Some(700.0), zoom: Some(1.5) })
+            Some(Destination::Xyz {
+                page_index: 0,
+                left: Some(10.0),
+                top: Some(700.0),
+                zoom: Some(1.5)
+            })
         );
     }
 
     #[test]
     fn test_bookmark_survives_incremental_save() {
         let mut doc = doc_with_pages(2);
-        doc.add_bookmark(None, "Intro", Destination::fit(0)).unwrap();
+        doc.add_bookmark(None, "Intro", Destination::fit(0))
+            .unwrap();
         let saved = doc.save_incremental_to_bytes().unwrap();
 
         let lopdf_doc = lopdf::Document::load_mem(&saved).expect("lopdf must open the file");
@@ -550,7 +664,8 @@ mod tests {
         let mut doc = doc_with_pages(3);
         doc.add_bookmark(None, "One", Destination::fit(0)).unwrap();
         let two = doc.add_bookmark(None, "Two", Destination::fit(1)).unwrap();
-        doc.add_bookmark(None, "Three", Destination::fit(2)).unwrap();
+        doc.add_bookmark(None, "Three", Destination::fit(2))
+            .unwrap();
 
         doc.remove_bookmark(two).unwrap();
         let bookmarks = doc.list_bookmarks().unwrap();
@@ -580,10 +695,15 @@ mod tests {
     #[test]
     fn test_named_destination_round_trip() {
         let mut doc = doc_with_pages(3);
-        doc.add_named_destination("chapter2", Destination::fit(1)).unwrap();
-        doc.add_named_destination("appendix", Destination::fit(2)).unwrap();
+        doc.add_named_destination("chapter2", Destination::fit(1))
+            .unwrap();
+        doc.add_named_destination("appendix", Destination::fit(2))
+            .unwrap();
 
-        assert_eq!(doc.get_named_destination("chapter2").unwrap(), Some(Destination::FitPage { page_index: 1 }));
+        assert_eq!(
+            doc.get_named_destination("chapter2").unwrap(),
+            Some(Destination::FitPage { page_index: 1 })
+        );
         let mut names = doc.named_destinations().unwrap();
         names.sort();
         assert_eq!(names, vec!["appendix", "chapter2"]);
@@ -593,18 +713,27 @@ mod tests {
     #[test]
     fn test_named_destination_survives_incremental_save() {
         let mut doc = doc_with_pages(2);
-        doc.add_named_destination("start", Destination::fit(0)).unwrap();
+        doc.add_named_destination("start", Destination::fit(0))
+            .unwrap();
         let saved = doc.save_incremental_to_bytes().unwrap();
         let reopened = EditableDocument::from_bytes(saved).unwrap();
-        assert_eq!(reopened.get_named_destination("start").unwrap(), Some(Destination::FitPage { page_index: 0 }));
+        assert_eq!(
+            reopened.get_named_destination("start").unwrap(),
+            Some(Destination::FitPage { page_index: 0 })
+        );
     }
 
     #[test]
     fn test_add_named_destination_replaces_existing() {
         let mut doc = doc_with_pages(3);
-        doc.add_named_destination("target", Destination::fit(0)).unwrap();
-        doc.add_named_destination("target", Destination::fit(2)).unwrap();
-        assert_eq!(doc.get_named_destination("target").unwrap(), Some(Destination::FitPage { page_index: 2 }));
+        doc.add_named_destination("target", Destination::fit(0))
+            .unwrap();
+        doc.add_named_destination("target", Destination::fit(2))
+            .unwrap();
+        assert_eq!(
+            doc.get_named_destination("target").unwrap(),
+            Some(Destination::FitPage { page_index: 2 })
+        );
         assert_eq!(doc.named_destinations().unwrap().len(), 1);
     }
 
@@ -621,11 +750,17 @@ mod tests {
         let a = doc.allocate_id();
         let b = doc.allocate_id();
         let mut a_dict = PdfDictionary::new();
-        a_dict.set("Title", Object::String(crate::object::PdfString::literal("A")));
+        a_dict.set(
+            "Title",
+            Object::String(crate::object::PdfString::literal("A")),
+        );
         a_dict.set("Next", Object::Reference(b));
         doc.set_object(a, Object::Dictionary(a_dict));
         let mut b_dict = PdfDictionary::new();
-        b_dict.set("Title", Object::String(crate::object::PdfString::literal("B")));
+        b_dict.set(
+            "Title",
+            Object::String(crate::object::PdfString::literal("B")),
+        );
         b_dict.set("Next", Object::Reference(a));
         doc.set_object(b, Object::Dictionary(b_dict));
 

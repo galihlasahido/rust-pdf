@@ -15,6 +15,7 @@
 //! garbage-collects them.
 
 use super::graph::EditableDocument;
+use super::{BookmarkNode, Destination};
 use crate::error::{EditorError, PdfResult};
 use crate::object::{Object, PdfArray, PdfDictionary, PdfName};
 use crate::types::ObjectId;
@@ -103,7 +104,12 @@ impl EditableDocument {
     /// Inserts a new, blank page at `index` (0-based; `index ==
     /// page_count()` appends at the end) with the given media box size in
     /// PDF points, and returns its object id.
-    pub fn insert_blank_page(&mut self, index: usize, width: f64, height: f64) -> PdfResult<ObjectId> {
+    pub fn insert_blank_page(
+        &mut self,
+        index: usize,
+        width: f64,
+        height: f64,
+    ) -> PdfResult<ObjectId> {
         let (pages_root, mut leaves) = self.flatten_page_tree()?;
         if index > leaves.len() {
             return Err(EditorError::InvalidPageIndex {
@@ -273,10 +279,22 @@ impl EditableDocument {
 
     /// Appends every page of `other` to the end of this document
     /// ("merge"), copying along whatever resources and (best-effort,
-    /// merged widget/field-dictionary) form fields those pages depend on.
+    /// merged widget/field-dictionary) form fields those pages depend on,
+    /// plus `other`'s own outline (bookmark) tree - imported as new
+    /// top-level node(s) appended after `self`'s existing top-level
+    /// bookmarks, with every destination repointed at the corresponding
+    /// newly-imported page. See [`EditableDocument::import_outline_from`].
     pub fn append_document(&mut self, other: &EditableDocument) -> PdfResult<()> {
+        // Captured *before* the merge: `import_pages_from` always appends
+        // `other`'s pages (in `other.page_ids()` order, which is what we
+        // pass below) after `self`'s existing ones, so a source page at
+        // index `i` ends up at `self` index `dest_page_offset + i` -
+        // exactly the translation `import_outline_from` needs to apply to
+        // every copied bookmark's destination.
+        let dest_page_offset = self.page_ids()?.len();
         let page_ids = other.page_ids()?;
         self.import_pages_from(other, &page_ids)?;
+        self.import_outline_from(other, dest_page_offset)?;
         Ok(())
     }
 
@@ -296,9 +314,10 @@ impl EditableDocument {
 
         let mut new_ids = Vec::with_capacity(source_page_ids.len());
         for old_id in source_page_ids {
-            let new_id = *id_map
-                .get(old_id)
-                .ok_or(EditorError::UnresolvedObject(old_id.number, old_id.generation))?;
+            let new_id = *id_map.get(old_id).ok_or(EditorError::UnresolvedObject(
+                old_id.number,
+                old_id.generation,
+            ))?;
             let mut dict = self.get_dictionary(new_id)?;
             dict.set("Parent", Object::Reference(pages_root));
             self.set_object(new_id, Object::Dictionary(dict));
@@ -308,6 +327,57 @@ impl EditableDocument {
         self.rewrite_kids(pages_root, &leaves)?;
         self.merge_acroform_fields(source, &id_map)?;
         Ok(new_ids)
+    }
+
+    /// Imports `source`'s entire outline (bookmark) tree into `self`'s, as
+    /// new top-level node(s) appended after `self`'s own existing
+    /// top-level outline items (never interleaved into, or replacing,
+    /// them - reuses [`EditableDocument::add_bookmark_opt`], which always
+    /// appends as the last child of a given parent, exactly like
+    /// [`EditableDocument::add_bookmark`] does for a caller-driven add).
+    ///
+    /// Every destination's page index is translated from `source`'s page
+    /// order to `self`'s post-merge page order via `dest_page_offset` -
+    /// see the call site in [`EditableDocument::append_document`] for why
+    /// a flat `+ offset` is exactly right (rather than needing the
+    /// `id_map` merge/split's page-subgraph import produces) whenever the
+    /// entire source document was imported in `other.page_ids()` order,
+    /// which is the only way this is currently called.
+    ///
+    /// A no-op (not an error) when `source` has no outline: `list_bookmarks`
+    /// returns an empty `Vec` in that case and the loop below simply does
+    /// nothing. A bookmark whose destination [`Destination`] cannot
+    /// represent - see its own doc comment on which destination shapes
+    /// round-trip through [`EditableDocument::list_bookmarks`] in the
+    /// first place - is still copied (title and children preserved), just
+    /// without a `/Dest` (ISO 32000-1 12.3.3/Table 153 does not require
+    /// one); losing only the jump target beats losing the whole bookmark.
+    fn import_outline_from(
+        &mut self,
+        source: &EditableDocument,
+        dest_page_offset: usize,
+    ) -> PdfResult<()> {
+        let bookmarks = source.list_bookmarks()?;
+        self.import_bookmark_siblings(&bookmarks, None, dest_page_offset)
+    }
+
+    /// Recursive helper for [`EditableDocument::import_outline_from`]:
+    /// copies `nodes` (siblings, in order) as children of `parent` (`None`
+    /// = top-level), then recurses into each node's own children.
+    fn import_bookmark_siblings(
+        &mut self,
+        nodes: &[BookmarkNode],
+        parent: Option<ObjectId>,
+        dest_page_offset: usize,
+    ) -> PdfResult<()> {
+        for node in nodes {
+            let dest = node
+                .dest
+                .map(|d| remap_destination_page_index(d, dest_page_offset));
+            let new_id = self.add_bookmark_opt(parent, &node.title, dest)?;
+            self.import_bookmark_siblings(&node.children, Some(new_id), dest_page_offset)?;
+        }
+        Ok(())
     }
 
     /// Deep-copies the subgraph reachable from `roots` (within `source`)
@@ -582,6 +652,29 @@ fn parse_media_box(arr: &PdfArray) -> Option<Rectangle> {
     Some(Rectangle::new(llx, lly, urx, ury))
 }
 
+/// Shifts a [`Destination`]'s page index by `offset`, used by
+/// [`EditableDocument::import_bookmark_siblings`] to translate a copied
+/// bookmark's target from the source document's page order to the
+/// newly-imported pages' position in the destination document.
+fn remap_destination_page_index(dest: Destination, offset: usize) -> Destination {
+    match dest {
+        Destination::FitPage { page_index } => Destination::FitPage {
+            page_index: page_index + offset,
+        },
+        Destination::Xyz {
+            page_index,
+            left,
+            top,
+            zoom,
+        } => Destination::Xyz {
+            page_index: page_index + offset,
+            left,
+            top,
+            zoom,
+        },
+    }
+}
+
 /// Collects every [`Object::Reference`] reachable from `obj` without
 /// descending through [`SKIP_IMPORT_KEYS`] dictionary entries.
 fn collect_refs(obj: &Object, out: &mut Vec<ObjectId>) {
@@ -761,7 +854,10 @@ mod tests {
 
         let outline_item_id = doc.allocate_id();
         let mut item = PdfDictionary::new();
-        item.set("Title", Object::String(crate::object::PdfString::literal("Go to p2")));
+        item.set(
+            "Title",
+            Object::String(crate::object::PdfString::literal("Go to p2")),
+        );
         let mut dest = PdfArray::new();
         dest.push(Object::Reference(target));
         dest.push(Object::Name(PdfName::new_unchecked("Fit")));
@@ -784,7 +880,10 @@ mod tests {
         doc.delete_page(1).unwrap();
 
         let item_after = doc.get_dictionary(outline_item_id).unwrap();
-        assert!(item_after.get("Dest").is_none(), "dangling /Dest must be stripped");
+        assert!(
+            item_after.get("Dest").is_none(),
+            "dangling /Dest must be stripped"
+        );
     }
 
     // ---- `effective_media_box` / `parse_media_box` (valid + adversarial) ----
@@ -836,7 +935,11 @@ mod tests {
     #[cfg(feature = "render")]
     fn parse_media_box_rejects_adversarial_arrays() {
         // Wrong element count.
-        let too_few = PdfArray::from_objects(vec![Object::Real(0.0), Object::Real(0.0), Object::Real(1.0)]);
+        let too_few = PdfArray::from_objects(vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(1.0),
+        ]);
         assert!(parse_media_box(&too_few).is_none());
 
         // Non-numeric entry.
