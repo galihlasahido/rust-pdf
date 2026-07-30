@@ -45,6 +45,8 @@
 //! [`std::sync::RwLock`], not a per-thread copy, so a page resolved by one
 //! thread is visible (and not re-parsed) by another.
 
+#[cfg(feature = "encryption")]
+mod decrypt;
 mod inline_image;
 mod lexer;
 mod objects;
@@ -190,6 +192,19 @@ pub struct PdfReader {
     /// Cache of already-decoded object streams (ISO 32000-1 7.5.7), keyed
     /// by the stream's own object number. See [`DecodedObjectStream`].
     object_stream_cache: RwLock<HashMap<u32, Arc<DecodedObjectStream>>>,
+    /// The recovered file encryption key/algorithm for an encrypted
+    /// document opened via [`PdfReader::from_bytes_with_password`]/
+    /// [`PdfReader::from_file_with_password`], or `None` for an
+    /// unencrypted document (or one opened via the plain
+    /// [`PdfReader::from_bytes`]/[`PdfReader::from_file`] constructors,
+    /// which reject any `/Encrypt` trailer entry outright -- see
+    /// [`PdfReader::finish`]). When set, every object handed back by
+    /// [`PdfReader::resolve_reference`]/[`PdfReader::resolve_compressed_object`]
+    /// has already been transparently decrypted (see `decrypt` module
+    /// docs for the two supported algorithms and why this can't reuse
+    /// `crate::encryption::EncryptionHandler` directly).
+    #[cfg(feature = "encryption")]
+    decryptor: Option<decrypt::Decryptor>,
 }
 
 // Compile-time guarantee that `PdfReader` can be shared across threads
@@ -239,6 +254,44 @@ impl PdfReader {
         Self::open(DataSource::Owned(data))
     }
 
+    /// Like [`PdfReader::from_file`], but for an encrypted document: `password`
+    /// is used to derive the file encryption key from the trailer's
+    /// `/Encrypt` dictionary (ISO 32000-1 §7.6 / ISO 32000-2 §7.6), and every
+    /// string/stream subsequently resolved is transparently decrypted.
+    ///
+    /// Only the two algorithms [`crate::editor::EditableDocument::save_encrypted_to_bytes`]
+    /// can itself produce are supported: AES-128 (`/V 4 /R 4`, `AESV2`) and
+    /// AES-256 (`/V 5 /R 6`, `AESV3`) -- see the crate-internal `decrypt`
+    /// module's docs for why, and for the exact scope. Anything else fails
+    /// with [`ParserError::UnsupportedEncryption`] rather than being
+    /// silently mis-decrypted.
+    ///
+    /// If the document is **not** actually encrypted, `password` is simply
+    /// ignored and this behaves exactly like [`PdfReader::from_file`].
+    ///
+    /// # Errors
+    /// - [`ParserError::IncorrectPassword`] if the document *is* encrypted
+    ///   and `password` does not match.
+    /// - [`ParserError::UnsupportedEncryption`] if the document uses an
+    ///   encryption scheme this crate does not implement (e.g. legacy RC4,
+    ///   `/V 1`/`/V 2`).
+    #[cfg(feature = "encryption")]
+    pub fn from_file_with_password(path: impl AsRef<Path>, password: &str) -> PdfResult<Self> {
+        let file = fs::File::open(path)?;
+        // SAFETY: see [`PdfReader::from_file`]'s identical `Mmap::map` call.
+        let mmap = unsafe { Mmap::map(&file)? };
+        Self::open_with_password(DataSource::Mapped(mmap), password)
+    }
+
+    /// Like [`PdfReader::from_bytes`], but for an encrypted document -- see
+    /// [`PdfReader::from_file_with_password`]'s docs for the full contract
+    /// (supported algorithms, error cases, and the no-op behavior on an
+    /// unencrypted document).
+    #[cfg(feature = "encryption")]
+    pub fn from_bytes_with_password(data: Vec<u8>, password: &str) -> PdfResult<Self> {
+        Self::open_with_password(DataSource::Owned(data), password)
+    }
+
     /// Shared implementation of [`PdfReader::from_file`]/
     /// [`PdfReader::from_bytes`].
     ///
@@ -250,19 +303,36 @@ impl PdfReader {
     /// simply give up on a broken xref table when the objects themselves
     /// are still present in the file.
     fn open(data: DataSource) -> PdfResult<Self> {
-        // Parse header
-        let version = Self::parse_header(&data)?;
+        let (version, xref, trailer) = Self::parse_structure(&data)?;
+        Self::finish(data, version, xref, trailer)
+    }
 
-        let parsed = find_startxref(&data)
+    /// Shared implementation of [`PdfReader::from_file_with_password`]/
+    /// [`PdfReader::from_bytes_with_password`]. See [`Self::open`] for the
+    /// xref/trailer-parsing (with recovery-mode fallback) this shares.
+    #[cfg(feature = "encryption")]
+    fn open_with_password(data: DataSource, password: &str) -> PdfResult<Self> {
+        let (version, xref, trailer) = Self::parse_structure(&data)?;
+        Self::finish_with_password(data, version, xref, trailer, password)
+    }
+
+    /// Locates and parses the header/cross-reference table/trailer shared
+    /// by every constructor (falling back to recovery mode -- see
+    /// [`Self::open`]'s docs -- when the xref table itself can't be
+    /// located/parsed).
+    fn parse_structure(data: &DataSource) -> PdfResult<(PdfVersion, XrefTable, Trailer)> {
+        let version = Self::parse_header(data)?;
+
+        let parsed = find_startxref(data)
             .ok()
-            .and_then(|offset| Self::parse_xref_and_trailer(&data, offset).ok());
+            .and_then(|offset| Self::parse_xref_and_trailer(data, offset).ok());
 
         let (xref, trailer) = match parsed {
             Some(result) => result,
-            None => recovery::recover(&data).ok_or(ParserError::InvalidTrailer)?,
+            None => recovery::recover(data).ok_or(ParserError::InvalidTrailer)?,
         };
 
-        Self::finish(data, version, xref, trailer)
+        Ok((version, xref, trailer))
     }
 
     /// Like [`PdfReader::from_bytes`], but always uses recovery-mode
@@ -278,9 +348,14 @@ impl PdfReader {
         Self::finish(data, version, xref, trailer)
     }
 
-    /// Final validation (rejects encrypted documents -- not yet supported
-    /// by this reader) and struct construction shared by every
-    /// constructor.
+    /// Final validation (rejects encrypted documents -- no password was
+    /// supplied to decrypt them) and struct construction shared by every
+    /// no-password constructor ([`PdfReader::from_file`]/
+    /// [`PdfReader::from_bytes`]/[`PdfReader::from_bytes_recovery_only`]).
+    /// Unchanged from before password support existed: these constructors'
+    /// behavior on an encrypted document is deliberately left exactly as
+    /// it was (fail with [`ParserError::EncryptedPdf`]) -- see
+    /// [`PdfReader::finish_with_password`] for the new password-aware path.
     fn finish(
         data: DataSource,
         version: PdfVersion,
@@ -298,7 +373,66 @@ impl PdfReader {
             trailer,
             object_cache: RwLock::new(HashMap::new()),
             object_stream_cache: RwLock::new(HashMap::new()),
+            #[cfg(feature = "encryption")]
+            decryptor: None,
         })
+    }
+
+    /// Struct construction for the password-aware constructors
+    /// ([`PdfReader::from_file_with_password`]/
+    /// [`PdfReader::from_bytes_with_password`]).
+    ///
+    /// If the trailer has no `/Encrypt` entry at all, `password` is simply
+    /// unused (matches [`PdfReader::finish`]'s behavior for an unencrypted
+    /// document, just without rejecting anything). Otherwise, resolves the
+    /// `/Encrypt` dictionary itself (never encrypted, so this is safe to do
+    /// with `decryptor` still unset) and attempts to recover the file
+    /// encryption key for `password` via [`decrypt::Decryptor::from_encrypt_dict`].
+    #[cfg(feature = "encryption")]
+    fn finish_with_password(
+        data: DataSource,
+        version: PdfVersion,
+        xref: XrefTable,
+        trailer: Trailer,
+        password: &str,
+    ) -> PdfResult<Self> {
+        let mut reader = Self {
+            data,
+            version,
+            xref,
+            trailer,
+            object_cache: RwLock::new(HashMap::new()),
+            object_stream_cache: RwLock::new(HashMap::new()),
+            decryptor: None,
+        };
+
+        let Some(encrypt_id) = reader.trailer.encrypt else {
+            return Ok(reader);
+        };
+
+        // Safe to resolve normally: `decryptor` is still `None`, so this
+        // one call returns the dictionary's raw (correctly, always
+        // unencrypted -- ISO 32000-1 7.6.1) bytes, and the result is
+        // cached under `encrypt_id` for the lifetime of `reader`, so no
+        // later `resolve_reference(encrypt_id)` call can accidentally run
+        // it back through a (by-then-populated) decryptor either.
+        let encrypt_obj = reader
+            .resolve_reference(encrypt_id)
+            .ok_or(ParserError::InvalidTrailer)?;
+        let dict = match encrypt_obj {
+            Object::Dictionary(d) => d,
+            _ => return Err(ParserError::InvalidTrailer.into()),
+        };
+
+        let file_id = reader
+            .trailer
+            .id
+            .as_ref()
+            .map(|(first, _)| first.as_slice());
+        let decryptor = decrypt::Decryptor::from_encrypt_dict(&dict, file_id, password)?;
+        reader.decryptor = Some(decryptor);
+
+        Ok(reader)
     }
 
     /// Parses the PDF header to get the version.
@@ -312,11 +446,10 @@ impl PdfReader {
             return Err(ParserError::InvalidHeader);
         }
 
-        let version_str = std::str::from_utf8(&data[5..8])
-            .map_err(|_| ParserError::InvalidHeader)?;
+        let version_str =
+            std::str::from_utf8(&data[5..8]).map_err(|_| ParserError::InvalidHeader)?;
 
-        PdfVersion::try_from(version_str)
-            .map_err(|_| ParserError::InvalidHeader)
+        PdfVersion::try_from(version_str).map_err(|_| ParserError::InvalidHeader)
     }
 
     /// Parses the xref table and trailer, following the chain of
@@ -508,8 +641,7 @@ impl PdfReader {
                     Self::read_int(&data[data_offset..data_offset + w1])
                 };
                 let field2 = Self::read_int(&data[data_offset + w1..data_offset + w1 + w2]);
-                let field3 =
-                    Self::read_int(&data[data_offset + w1 + w2..data_offset + entry_size]);
+                let field3 = Self::read_int(&data[data_offset + w1 + w2..data_offset + entry_size]);
 
                 let entry = match entry_type {
                     0 => XrefEntry::Free {
@@ -627,12 +759,38 @@ impl PdfReader {
         let entry = self.xref.get(id.number)?;
 
         let obj = match entry {
-            XrefEntry::InUse { offset, .. } => {
+            // `_generation` (not `generation`): only actually read when the
+            // `encryption` feature is enabled (below); the leading
+            // underscore keeps it from being an `unused_variables` warning
+            // when that feature is off, while still being usable when it's
+            // on.
+            XrefEntry::InUse {
+                offset,
+                generation: _generation,
+            } => {
                 // Parse object at offset. `offset` comes straight from the
                 // (untrusted) xref table/stream, so it must be checked
                 // against the file length rather than indexed directly.
                 let data = self.data.get(*offset as usize..)?;
                 let (_, (_, _, obj)) = parse_indirect_object(data).ok()?;
+
+                // Decrypt (ISO 32000-1 §7.6): every string/stream must be
+                // transparently decrypted using *this* object's own
+                // number/generation, except the `/Encrypt` dictionary
+                // itself, which is never encrypted (7.6.1) -- and is only
+                // ever resolved through this exact path once, while
+                // `decryptor` is still `None` (see
+                // `PdfReader::finish_with_password`), so this check is
+                // mostly documentation of that invariant rather than
+                // something expected to actually trigger here.
+                #[cfg(feature = "encryption")]
+                let obj = match &self.decryptor {
+                    Some(d) if self.trailer.encrypt != Some(id) => {
+                        d.decrypt_object(obj, id.number, *_generation)
+                    }
+                    _ => obj,
+                };
+
                 obj
             }
             XrefEntry::Compressed {
@@ -732,10 +890,29 @@ impl PdfReader {
         let data = self.data.get(offset as usize..)?;
         let (_, (_, _, stream_obj)) = parse_indirect_object(data).ok()?;
 
-        let stream = match stream_obj {
+        #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
+        let mut stream = match stream_obj {
             Object::Stream(s) => s,
             _ => return None,
         };
+
+        // Decrypt the object stream's own raw (still filter-encoded) bytes
+        // *before* decompressing (ISO 32000-1 7.6.2: encryption is the
+        // outermost transformation, applied after filtering when writing,
+        // so it must be undone before filtering when reading). The
+        // individual compressed objects extracted from `stream_data` below
+        // are *not* separately re-decrypted -- per 7.5.7, an object stream
+        // may not itself contain streams, and its member objects' strings
+        // are already plaintext once the containing `/ObjStm` has been
+        // decrypted here.
+        #[cfg(feature = "encryption")]
+        if let Some(d) = &self.decryptor {
+            let generation = match stream_entry {
+                XrefEntry::InUse { generation, .. } => *generation,
+                _ => 0,
+            };
+            stream.data = d.decrypt_stream_data(&stream.data, stream_num, generation);
+        }
 
         // Get N (number of objects) and First (offset to first object)
         let dict = &stream.dictionary;
@@ -881,7 +1058,12 @@ impl PdfReader {
     /// `depth`/`budget`, same as the caller) only when `/Count` is missing
     /// or not a valid non-negative integer -- i.e. only for a
     /// non-conformant producer, never for a spec-conformant file.
-    fn subtree_leaf_count(&self, node_id: ObjectId, depth: u32, budget: &mut usize) -> Option<usize> {
+    fn subtree_leaf_count(
+        &self,
+        node_id: ObjectId,
+        depth: u32,
+        budget: &mut usize,
+    ) -> Option<usize> {
         if depth > MAX_PAGE_TREE_WALK_DEPTH {
             return None;
         }
@@ -902,8 +1084,11 @@ impl PdfReader {
                     let mut total = 0usize;
                     for kid in kids.iter() {
                         if let Object::Reference(kid_id) = kid {
-                            total = total
-                                .checked_add(self.subtree_leaf_count(*kid_id, depth + 1, budget)?)?;
+                            total = total.checked_add(self.subtree_leaf_count(
+                                *kid_id,
+                                depth + 1,
+                                budget,
+                            )?)?;
                         }
                     }
                     Some(total)
@@ -1028,8 +1213,13 @@ mod tests {
         fn stream_object(&mut self, num: u32, extra_dict: &str, data: &[u8]) -> u64 {
             let off = self.offset();
             self.buf.extend_from_slice(
-                format!("{} 0 obj\n<< /Length {} {} >>\nstream\n", num, data.len(), extra_dict)
-                    .as_bytes(),
+                format!(
+                    "{} 0 obj\n<< /Length {} {} >>\nstream\n",
+                    num,
+                    data.len(),
+                    extra_dict
+                )
+                .as_bytes(),
             );
             self.buf.extend_from_slice(data);
             self.buf.extend_from_slice(b"\nendstream\nendobj\n");
@@ -1054,7 +1244,8 @@ mod tests {
                 table.insert(num, off);
             }
 
-            self.buf.extend_from_slice(format!("xref\n0 {}\n", size).as_bytes());
+            self.buf
+                .extend_from_slice(format!("xref\n0 {}\n", size).as_bytes());
             for n in 0..size {
                 if n == 0 {
                     self.buf.extend_from_slice(b"0000000000 65535 f \n");
@@ -1225,7 +1416,10 @@ mod tests {
                 let resolved = reader.resolve_reference(*id).unwrap();
                 match resolved {
                     Object::Dictionary(d) => {
-                        assert_eq!(d.get("Type"), Some(&Object::Name(PdfName::new_unchecked("Pages"))));
+                        assert_eq!(
+                            d.get("Type"),
+                            Some(&Object::Name(PdfName::new_unchecked("Pages")))
+                        );
                     }
                     _ => panic!("expected Pages dictionary resolved from object stream"),
                 }
@@ -1386,7 +1580,10 @@ mod tests {
             page_offsets.push(off);
         }
         let catalog_off = b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
-        let kids = (0..count).map(|i| format!("{} 0 R", 3 + i)).collect::<Vec<_>>().join(" ");
+        let kids = (0..count)
+            .map(|i| format!("{} 0 R", 3 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
         let pages_off = b.object(
             pages_obj_num,
             &format!("<< /Type /Pages /Kids [{kids}] /Count {count} >>"),
@@ -1426,7 +1623,10 @@ mod tests {
 
         let cached = reader.object_cache.read().unwrap().len();
         // Catalog + /Pages root + the one target leaf page.
-        assert!(cached <= 3, "expected only the path-to-target objects cached, got {cached}");
+        assert!(
+            cached <= 3,
+            "expected only the path-to-target objects cached, got {cached}"
+        );
     }
 
     /// Builds a two-level balanced tree: a root `/Pages` node with two
@@ -1446,15 +1646,15 @@ mod tests {
         for i in 0..total {
             let off = b.object(
                 4 + i,
-                &format!(
-                    "<< /Type /Page /Idx {i} /MediaBox [0 0 612 792] /Resources << >> >>"
-                ),
+                &format!("<< /Type /Page /Idx {i} /MediaBox [0 0 612 792] /Resources << >> >>"),
             );
             leaf_offsets.push(off);
         }
 
-        let branch_a_kids: String =
-            (0..per_branch).map(|i| format!("{} 0 R", 4 + i)).collect::<Vec<_>>().join(" ");
+        let branch_a_kids: String = (0..per_branch)
+            .map(|i| format!("{} 0 R", 4 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
         let branch_b_kids: String = (per_branch..total)
             .map(|i| format!("{} 0 R", 4 + i))
             .collect::<Vec<_>>()
@@ -1464,11 +1664,15 @@ mod tests {
         let branch_b_num = branch_a_num + 1;
         let branch_a_off = b.object(
             branch_a_num,
-            &format!("<< /Type /Pages /Parent 2 0 R /Kids [{branch_a_kids}] /Count {per_branch} >>"),
+            &format!(
+                "<< /Type /Pages /Parent 2 0 R /Kids [{branch_a_kids}] /Count {per_branch} >>"
+            ),
         );
         let branch_b_off = b.object(
             branch_b_num,
-            &format!("<< /Type /Pages /Parent 2 0 R /Kids [{branch_b_kids}] /Count {per_branch} >>"),
+            &format!(
+                "<< /Type /Pages /Parent 2 0 R /Kids [{branch_b_kids}] /Count {per_branch} >>"
+            ),
         );
 
         let catalog_off = b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
@@ -1539,9 +1743,18 @@ mod tests {
         );
 
         let reader = PdfReader::from_bytes(b.finish()).unwrap();
-        assert_eq!(reader.get_page(0).unwrap().get("Idx"), Some(&Object::Integer(0)));
-        assert_eq!(reader.get_page(1).unwrap().get("Idx"), Some(&Object::Integer(1)));
-        assert_eq!(reader.get_page(2).unwrap().get("Idx"), Some(&Object::Integer(2)));
+        assert_eq!(
+            reader.get_page(0).unwrap().get("Idx"),
+            Some(&Object::Integer(0))
+        );
+        assert_eq!(
+            reader.get_page(1).unwrap().get("Idx"),
+            Some(&Object::Integer(1))
+        );
+        assert_eq!(
+            reader.get_page(2).unwrap().get("Idx"),
+            Some(&Object::Integer(2))
+        );
         assert!(reader.get_page(3).is_none());
     }
 
@@ -1559,14 +1772,25 @@ mod tests {
         // No /Count at all on the Pages node.
         let pages_off = b.object(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] >>");
         b.xref_and_trailer(
-            &[(1, catalog_off), (2, pages_off), (3, leaf0_off), (4, leaf1_off)],
+            &[
+                (1, catalog_off),
+                (2, pages_off),
+                (3, leaf0_off),
+                (4, leaf1_off),
+            ],
             5,
             "/Root 1 0 R",
         );
 
         let reader = PdfReader::from_bytes(b.finish()).unwrap();
-        assert_eq!(reader.get_page(0).unwrap().get("Idx"), Some(&Object::Integer(0)));
-        assert_eq!(reader.get_page(1).unwrap().get("Idx"), Some(&Object::Integer(1)));
+        assert_eq!(
+            reader.get_page(0).unwrap().get("Idx"),
+            Some(&Object::Integer(0))
+        );
+        assert_eq!(
+            reader.get_page(1).unwrap().get("Idx"),
+            Some(&Object::Integer(1))
+        );
         assert!(reader.get_page(2).is_none());
     }
 
@@ -1602,8 +1826,7 @@ mod tests {
         full.push(b' ');
         full.extend_from_slice(objstm_body);
         let first = header.len() + 1;
-        let objstm_off =
-            b.stream_object(3, &format!("/Type /ObjStm /N 2 /First {}", first), &full);
+        let objstm_off = b.stream_object(3, &format!("/Type /ObjStm /N 2 /First {}", first), &full);
 
         let (w1, w2, w3) = (1usize, 4usize, 2usize);
         let mut entries = Vec::new();

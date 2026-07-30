@@ -222,6 +222,32 @@ pub enum ParserError {
     #[error("Encrypted PDF requires password")]
     EncryptedPdf,
 
+    /// A password *was* supplied to open an encrypted PDF (see
+    /// [`crate::parser::PdfReader::from_bytes_with_password`]/
+    /// [`crate::parser::PdfReader::from_file_with_password`]), but it did
+    /// not match: the recovered file encryption key failed the
+    /// standard-security-handler validation check (ISO 32000-1 7.6.3.4
+    /// Algorithm 3.6 for AES-128/R4, ISO 32000-2 Algorithm 2.B for
+    /// AES-256/R6). Kept distinct from [`ParserError::EncryptedPdf`] (no
+    /// password supplied at all) so a caller can tell "prompt for a
+    /// password" apart from "that password was wrong, prompt again".
+    #[cfg(feature = "encryption")]
+    #[error("incorrect password for encrypted PDF")]
+    IncorrectPassword,
+
+    /// The document's `/Encrypt` dictionary uses a `/Filter`, `/V`, `/R`,
+    /// or crypt filter method (`/CFM`) this crate's decryptor does not
+    /// implement. Only AES-128 (`/V 4 /R 4`, `/CFM /AESV2`) and AES-256
+    /// (`/V 5 /R 6`, `/CFM /AESV3`) -- the same two algorithms
+    /// [`crate::editor::EditableDocument::save_encrypted_to_bytes`] can
+    /// produce -- are supported. Anything else (legacy RC4, `/V 1`/`/V 2`,
+    /// a non-`Standard` security handler, ...) fails closed with this
+    /// distinct error rather than being silently mis-decrypted into
+    /// garbage.
+    #[cfg(feature = "encryption")]
+    #[error("unsupported encryption scheme: {0}")]
+    UnsupportedEncryption(String),
+
     /// Invalid cross-reference stream.
     #[error("Invalid cross-reference stream")]
     InvalidXrefStream,
@@ -456,19 +482,30 @@ pub enum RenderError {
     #[error("failed to open PDF document: {0}")]
     DocumentLoad(#[source] Box<PdfError>),
 
-    /// The document is encrypted (ISO 32000-1 §7.6). This crate's
-    /// pure-Rust parser ([`crate::parser::PdfReader`]) does not implement
-    /// any decryption filter (RC4/AES) at all -- a pre-existing limitation
-    /// of this crate's whole structural-editing pipeline, not something
-    /// newly introduced by this rendering backend -- so *no* password,
-    /// correct or not, allows opening an encrypted document here. (The
-    /// previous, now-removed renderer (an FFI binding to a third-party
-    /// native rendering engine) *could* decrypt a password-protected
-    /// document; this is a real, accepted compatibility trade-off of the
-    /// migration to a pure-Rust engine, not an oversight.)
+    /// The document is encrypted (ISO 32000-1 §7.6) and
+    /// [`crate::render::PdfRenderer::open_bytes`]/[`crate::render::PdfRenderer::open_file`]
+    /// (the no-password entry points) were used, which -- like
+    /// [`crate::parser::PdfReader::from_bytes`]/[`crate::parser::PdfReader::from_file`]
+    /// underneath them -- reject *any* encrypted document outright,
+    /// regardless of whether a correct password even exists, simply
+    /// because no password was offered.
+    ///
+    /// This crate's pure-Rust parser does now implement AES-128 (`/V 4
+    /// /R 4`) and AES-256 (`/V 5 /R 6`) decryption -- the same two
+    /// algorithms [`crate::editor::EditableDocument::save_encrypted_to_bytes`]
+    /// can itself produce -- via
+    /// [`crate::render::PdfRenderer::open_bytes_with_password`]/
+    /// [`crate::render::PdfRenderer::open_file_with_password`]
+    /// (`encryption` feature); use one of those instead to actually supply
+    /// a password. A wrong password there, or an encryption scheme this
+    /// crate doesn't implement (legacy RC4, `/V 1`/`/V 2`, ...), surfaces
+    /// as [`RenderError::DocumentLoad`] (wrapping
+    /// [`crate::error::ParserError::IncorrectPassword`]/
+    /// [`crate::error::ParserError::UnsupportedEncryption`] respectively),
+    /// not this variant.
     #[error(
-        "document is encrypted; decryption is not supported by this pure-Rust engine \
-         (no password can open it)"
+        "document is encrypted; call PdfRenderer::open_bytes_with_password/open_file_with_password \
+         with a password instead"
     )]
     PasswordRequired,
 

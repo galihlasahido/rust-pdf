@@ -57,9 +57,10 @@ impl PdfRenderer {
     /// Opens a PDF document from an in-memory byte buffer.
     ///
     /// Returns [`RenderError::PasswordRequired`] if the document is
-    /// encrypted (ISO 32000-1 §7.6) -- this pure-Rust engine does not
-    /// implement any decryption filter at all (see that error variant's
-    /// docs), so there is no password parameter to accept here.
+    /// encrypted (ISO 32000-1 §7.6) -- this entry point has no password
+    /// parameter to accept, so an encrypted document is rejected
+    /// unconditionally; see [`Self::open_bytes_with_password`] to actually
+    /// supply one.
     pub fn open_bytes(bytes: Vec<u8>) -> Result<Self, RenderError> {
         let document = EditableDocument::from_bytes(bytes).map_err(Self::map_open_error)?;
         Ok(Self::from_document(document))
@@ -68,9 +69,45 @@ impl PdfRenderer {
     /// Opens a PDF document from a file path.
     ///
     /// Returns [`RenderError::PasswordRequired`] if the document is
-    /// encrypted; see [`Self::open_bytes`]'s docs.
+    /// encrypted; see [`Self::open_bytes`]'s docs (and
+    /// [`Self::open_file_with_password`] to actually supply a password).
     pub fn open_file(path: impl AsRef<Path>) -> Result<Self, RenderError> {
         let document = EditableDocument::open(path).map_err(Self::map_open_error)?;
+        Ok(Self::from_document(document))
+    }
+
+    /// Opens a (possibly encrypted) PDF document from an in-memory byte
+    /// buffer, supplying `password` to derive the file encryption key if
+    /// the document turns out to be encrypted (ISO 32000-1 §7.6 / ISO
+    /// 32000-2 §7.6). If the document is *not* encrypted, `password` is
+    /// simply ignored -- this behaves exactly like [`Self::open_bytes`].
+    ///
+    /// Only the two algorithms
+    /// [`crate::editor::EditableDocument::save_encrypted_to_bytes`] can
+    /// itself produce are supported (AES-128 `/V 4 /R 4`/AESV2 and AES-256
+    /// `/V 5 /R 6`/AESV3); anything else still fails (with a generic
+    /// [`RenderError::DocumentLoad`] wrapping
+    /// [`crate::error::ParserError::UnsupportedEncryption`], not
+    /// [`RenderError::PasswordRequired`], since no password would help).
+    /// A wrong password fails the same way, wrapping
+    /// [`crate::error::ParserError::IncorrectPassword`].
+    #[cfg(feature = "encryption")]
+    pub fn open_bytes_with_password(bytes: Vec<u8>, password: &str) -> Result<Self, RenderError> {
+        let document = EditableDocument::from_bytes_with_password(bytes, password)
+            .map_err(Self::map_open_error)?;
+        Ok(Self::from_document(document))
+    }
+
+    /// Opens a (possibly encrypted) PDF document from a file path,
+    /// supplying `password`. See [`Self::open_bytes_with_password`]'s docs
+    /// for the full contract.
+    #[cfg(feature = "encryption")]
+    pub fn open_file_with_password(
+        path: impl AsRef<Path>,
+        password: &str,
+    ) -> Result<Self, RenderError> {
+        let document =
+            EditableDocument::open_with_password(path, password).map_err(Self::map_open_error)?;
         Ok(Self::from_document(document))
     }
 
@@ -83,12 +120,14 @@ impl PdfRenderer {
 
     /// Translates a raw [`PdfError`] from document loading into the more
     /// specific [`RenderError::PasswordRequired`] when that is what
-    /// actually happened (an encrypted document, ISO 32000-1 §7.6 --
-    /// [`crate::parser::PdfReader`] rejects these outright, regardless of
-    /// any password, since it implements no decryption filter), since that
-    /// is the one case a caller is likely to want to handle specially
-    /// (e.g. by telling the user this file can't be opened at all rather
-    /// than a generic parse failure).
+    /// actually happened: an encrypted document (ISO 32000-1 §7.6) opened
+    /// through one of the *no-password* entry points
+    /// ([`Self::open_bytes`]/[`Self::open_file`]), which reject any
+    /// `/Encrypt`-bearing document outright since they have no password to
+    /// offer it. That is the one case a caller is likely to want to handle
+    /// specially (e.g. by prompting for a password and retrying via
+    /// [`Self::open_bytes_with_password`]/[`Self::open_file_with_password`]
+    /// rather than reporting a generic parse failure).
     fn map_open_error(err: PdfError) -> RenderError {
         if matches!(err, PdfError::Parser(ParserError::EncryptedPdf)) {
             RenderError::PasswordRequired

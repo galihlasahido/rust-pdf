@@ -89,6 +89,28 @@ impl EditableDocument {
         Self::from_reader(reader)
     }
 
+    /// Loads an encrypted PDF file for editing, deriving the file
+    /// encryption key from the trailer's `/Encrypt` dictionary and
+    /// `password` (ISO 32000-1 §7.6 / ISO 32000-2 §7.6). See
+    /// [`crate::parser::PdfReader::from_file_with_password`] for the exact
+    /// contract (supported algorithms, error cases, and the no-op behavior
+    /// when the file turns out not to be encrypted at all).
+    #[cfg(feature = "encryption")]
+    pub fn open_with_password(path: impl AsRef<Path>, password: &str) -> PdfResult<Self> {
+        let reader = PdfReader::from_file_with_password(path, password)?;
+        Self::from_reader(reader)
+    }
+
+    /// Loads an encrypted PDF already held in memory for editing. See
+    /// [`Self::open_with_password`]/
+    /// [`crate::parser::PdfReader::from_bytes_with_password`] for the full
+    /// contract.
+    #[cfg(feature = "encryption")]
+    pub fn from_bytes_with_password(data: Vec<u8>, password: &str) -> PdfResult<Self> {
+        let reader = PdfReader::from_bytes_with_password(data, password)?;
+        Self::from_reader(reader)
+    }
+
     fn from_reader(reader: PdfReader) -> PdfResult<Self> {
         let root = reader.trailer().root;
 
@@ -111,22 +133,17 @@ impl EditableDocument {
         // base file (across its full /Prev incremental-update chain), so
         // seed the allocator from the highest one seen anywhere in the
         // merged xref table.
-        let next_object_number = reader
-            .xref()
-            .iter()
-            .map(|(num, _)| *num)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let next_object_number = reader.xref().iter().map(|(num, _)| *num).max().unwrap_or(0) + 1;
 
         let audit_log_object_id = match catalog.get(audit::AUDIT_LOG_CATALOG_KEY) {
             Some(Object::Reference(id)) => Some(*id),
             _ => None,
         };
-        let audit_log = audit::load_from_catalog(&catalog, |id| match reader.resolve_reference(id) {
-            Some(Object::Stream(s)) => s.decode_all().ok(),
-            _ => None,
-        });
+        let audit_log =
+            audit::load_from_catalog(&catalog, |id| match reader.resolve_reference(id) {
+                Some(Object::Stream(s)) => s.decode_all().ok(),
+                _ => None,
+            });
 
         Ok(Self {
             reader,
@@ -275,7 +292,11 @@ impl EditableDocument {
     /// 7.7.3.3, Table 30), creating the array if the page doesn't have
     /// one yet. Shared by the AcroForm widget, annotation and outline
     /// submodules, which all add entries to a page's annotation list.
-    pub(crate) fn add_annot_to_page(&mut self, page_id: ObjectId, annot_id: ObjectId) -> PdfResult<()> {
+    pub(crate) fn add_annot_to_page(
+        &mut self,
+        page_id: ObjectId,
+        annot_id: ObjectId,
+    ) -> PdfResult<()> {
         let mut page = self.get_dictionary(page_id)?;
         let mut annots = match page.get("Annots") {
             Some(Object::Array(a)) => a.clone(),
@@ -296,7 +317,11 @@ impl EditableDocument {
     /// dc:title" requirement) - both need "does this document already
     /// have a title", just for different reasons.
     pub(crate) fn classic_info_title(&self) -> Option<String> {
-        let info_dict = self.reader.trailer().info.and_then(|id| self.get_dictionary(id).ok())?;
+        let info_dict = self
+            .reader
+            .trailer()
+            .info
+            .and_then(|id| self.get_dictionary(id).ok())?;
         match info_dict.get("Title") {
             Some(Object::String(s)) => Some(super::util::from_pdf_text_string(s)),
             _ => None,
@@ -336,7 +361,10 @@ impl EditableDocument {
     /// so the [`MAX_REACHABLE_OBJECTS`] bound protects all of them
     /// identically rather than each reimplementing (and each having to be
     /// independently proven to bound) its own walk.
-    pub(crate) fn reachable_objects(&self, roots: &[ObjectId]) -> PdfResult<(Vec<ObjectId>, HashMap<ObjectId, Object>)> {
+    pub(crate) fn reachable_objects(
+        &self,
+        roots: &[ObjectId],
+    ) -> PdfResult<(Vec<ObjectId>, HashMap<ObjectId, Object>)> {
         let mut order = Vec::new();
         let mut objects = HashMap::new();
         let mut queued: HashSet<ObjectId> = HashSet::new();
