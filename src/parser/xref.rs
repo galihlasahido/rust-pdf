@@ -75,9 +75,16 @@ impl XrefTable {
         self.entries.get(&obj_num)
     }
 
-    /// Inserts an entry.
+    /// Inserts an entry, overwriting any existing entry for `obj_num`.
     pub fn insert(&mut self, obj_num: u32, entry: XrefEntry) {
         self.entries.insert(obj_num, entry);
+    }
+
+    /// Inserts an entry only if `obj_num` is not already present. Used
+    /// when merging lower-priority data (e.g. recovered compressed-object
+    /// entries) that must not shadow a higher-priority entry.
+    pub fn insert_if_absent(&mut self, obj_num: u32, entry: XrefEntry) {
+        self.entries.entry(obj_num).or_insert(entry);
     }
 
     /// Returns the number of entries.
@@ -127,10 +134,14 @@ pub fn parse_xref_table(input: &[u8]) -> IResult<&[u8], XrefTable> {
         let (input, count) = parse_xref_integer(input)?;
         let (input, _) = skip_whitespace(input)?;
 
-        // Parse entries
+        // Parse entries. `first_obj` comes straight from the file, so
+        // guard the addition against overflow rather than panicking on a
+        // crafted subsection header like `4294967295 10`.
         let mut current_input = input;
         for i in 0..count {
-            let obj_num = first_obj + i as u32;
+            let obj_num = first_obj.checked_add(i).ok_or_else(|| {
+                nom::Err::Error(nom::error::Error::new(current_input, nom::error::ErrorKind::Verify))
+            })?;
             let (input, entry) = parse_xref_entry(current_input)?;
             table.insert(obj_num, entry);
             current_input = input;

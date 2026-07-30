@@ -98,11 +98,8 @@ impl AppearanceBuilder {
             stream.push_str(&format_color_stroke(bc));
             stream.push_str(&format!("{} w\n", self.border_width));
 
-            match self.border_style {
-                BorderStyle::Dashed => {
-                    stream.push_str("[3] 0 d\n");
-                }
-                _ => {}
+            if self.border_style == BorderStyle::Dashed {
+                stream.push_str("[3] 0 d\n");
             }
 
             let offset = self.border_width / 2.0;

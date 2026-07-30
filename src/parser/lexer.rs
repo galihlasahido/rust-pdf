@@ -196,11 +196,17 @@ pub fn parse_literal_string(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
                         }
                     }
                     b'0'..=b'7' => {
-                        // Octal escape
-                        let mut octal_val = (escaped - b'0') as u8;
+                        // Octal escape (up to 3 digits). Per ISO 32000-1
+                        // 7.3.4.2: "if the value is greater than 255, the
+                        // high-order overflow shall be ignored" - i.e. this
+                        // arithmetic is defined to wrap, not saturate or
+                        // panic, so `wrapping_*` is spec-correct here (and
+                        // also what keeps this safe on adversarial input
+                        // like `\777\777`).
+                        let mut octal_val = escaped - b'0';
                         for _ in 0..2 {
                             if !input.is_empty() && input[0] >= b'0' && input[0] <= b'7' {
-                                octal_val = octal_val * 8 + (input[0] - b'0');
+                                octal_val = octal_val.wrapping_mul(8).wrapping_add(input[0] - b'0');
                                 input = &input[1..];
                             } else {
                                 break;
@@ -343,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_parse_real() {
-        assert_eq!(parse_real(b"3.14"), Ok((&b""[..], 3.14)));
+        assert_eq!(parse_real(b"3.25"), Ok((&b""[..], 3.25)));
         assert_eq!(parse_real(b"-1.5"), Ok((&b""[..], -1.5)));
         assert_eq!(parse_real(b".5"), Ok((&b""[..], 0.5)));
     }
@@ -368,6 +374,20 @@ mod tests {
             parse_literal_string(b"(Nested (parens) here)"),
             Ok((&b""[..], b"Nested (parens) here".to_vec()))
         );
+    }
+
+    /// Regression test for a `cargo fuzz` finding: an octal escape whose
+    /// value exceeds 255 (e.g. `\553`, or the maximum `\777`) must wrap
+    /// per ISO 32000-1 7.3.4.2 ("high-order overflow shall be ignored"),
+    /// not panic with an integer-overflow trap.
+    #[test]
+    fn test_parse_literal_string_octal_overflow_does_not_panic() {
+        let (_, s) = parse_literal_string(b"(\\553)").unwrap();
+        // 0o553 = 363, which wraps mod 256 to 107 (0x6b).
+        assert_eq!(s, vec![0o553u16 as u8]);
+
+        let (_, s) = parse_literal_string(b"(\\777\\777)").unwrap();
+        assert_eq!(s, vec![0o777u16 as u8, 0o777u16 as u8]);
     }
 
     #[test]

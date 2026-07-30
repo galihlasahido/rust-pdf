@@ -61,19 +61,29 @@
 pub mod color;
 pub mod content;
 pub mod document;
+#[cfg(feature = "parser")]
+pub mod editor;
 #[cfg(feature = "encryption")]
 pub mod encryption;
 pub mod error;
+#[cfg(feature = "compression")]
+pub mod filter;
 pub mod font;
 pub mod forms;
+#[cfg(feature = "native-gui")]
+pub mod gui;
 #[cfg(feature = "images")]
 pub mod image;
 pub mod object;
 pub mod page;
 #[cfg(feature = "parser")]
 pub mod parser;
+#[cfg(any(feature = "render", feature = "native-render"))]
+pub mod render;
 #[cfg(feature = "signatures")]
 pub mod signatures;
+#[cfg(feature = "tauri")]
+pub mod tauri_commands;
 pub mod types;
 pub mod writer;
 
@@ -84,13 +94,17 @@ pub mod ffi;
 pub use color::{CmykColor, Color, GrayColor, RgbColor};
 pub use content::{ContentBuilder, GraphicsBuilder, Operator, TextBuilder, TextElement};
 pub use document::{Document, DocumentBuilder, DocumentInfo, PdfVersion};
+#[cfg(feature = "parser")]
+pub use editor::{AnnotationInfo, AnnotationKind, BookmarkNode, Destination, EditableDocument, StructNode, StructType};
 pub use error::{ContentError, DocumentError, FormError, ObjectError, PdfError, PdfResult, WriterError};
 #[cfg(feature = "compression")]
 pub use error::CompressionError;
 #[cfg(feature = "images")]
 pub use error::ImageError;
 #[cfg(feature = "parser")]
-pub use error::ParserError;
+pub use error::{EditorError, ParserError};
+#[cfg(feature = "render")]
+pub use error::RenderError;
 #[cfg(feature = "encryption")]
 pub use error::EncryptionError;
 #[cfg(feature = "signatures")]
@@ -98,7 +112,10 @@ pub use error::SignatureError;
 #[cfg(feature = "encryption")]
 pub use encryption::{EncryptionConfig, EncryptionHandler, Permissions};
 #[cfg(feature = "signatures")]
-pub use signatures::{ByteRange, Certificate, DocumentSigner, PrivateKey, SignatureAlgorithm, SignatureConfig, SignatureInfo};
+pub use signatures::{
+    ByteRange, Certificate, DocumentSigner, IncrementalSigner, PrivateKey, SignatureAlgorithm,
+    SignatureConfig, SignatureInfo, SignatureVerifier, VerifiedSignature,
+};
 pub use font::{Font, FontMetrics, Standard14Font};
 pub use forms::{
     AppearanceBuilder, BorderStyle, CheckBox, ComboBox, FieldFlags, FormField, FormFieldTrait,
@@ -107,12 +124,14 @@ pub use forms::{
 #[cfg(feature = "images")]
 pub use image::{ColorSpace, Image, ImageFilter, ImageXObject};
 #[cfg(feature = "parser")]
-pub use parser::{PdfReader, Trailer, XrefEntry, XrefTable};
+pub use parser::{parse_inline_image, InlineImage, PdfReader, Trailer, XrefEntry, XrefTable};
 pub use object::{
     DictionaryBuilder, Object, PdfArray, PdfDictionary, PdfName, PdfStream, PdfString,
     StreamBuilder,
 };
 pub use page::{Page, PageBuilder};
+#[cfg(feature = "render")]
+pub use render::{PdfRenderer, RgbaImage, Viewport};
 pub use types::{Matrix, ObjectId, Rectangle};
 pub use writer::PdfWriter;
 
@@ -125,13 +144,20 @@ pub mod prelude {
         kern, text, ContentBuilder, GraphicsBuilder, Operator, TextBuilder, TextElement,
     };
     pub use crate::document::{Document, DocumentBuilder, DocumentInfo, PdfVersion};
+    #[cfg(feature = "parser")]
+    pub use crate::editor::{
+        AnnotationInfo, AnnotationKind, BookmarkNode, Destination, EditableDocument, IccColorSpace, IccError,
+        OutputIntentInfo, OutputIntentSubtype, PdfAConversionOptions, PdfAConversionSummary, PdfAFlavor, PdfAReport,
+        PdfAViolation, PdfUaReport, PdfUaViolation, PdfXColorReport, PdfXViolation, RedactionAuditEntry, StructNode,
+        StructType, XmpFields,
+    };
     pub use crate::error::{PdfError, PdfResult};
     #[cfg(feature = "compression")]
     pub use crate::error::CompressionError;
     #[cfg(feature = "images")]
     pub use crate::error::ImageError;
     #[cfg(feature = "parser")]
-    pub use crate::error::ParserError;
+    pub use crate::error::{EditorError, ParserError};
     #[cfg(feature = "encryption")]
     pub use crate::error::EncryptionError;
     #[cfg(feature = "signatures")]
@@ -139,8 +165,15 @@ pub mod prelude {
     #[cfg(feature = "encryption")]
     pub use crate::encryption::{EncryptionConfig, EncryptionHandler, Permissions};
     #[cfg(feature = "signatures")]
-    pub use crate::signatures::{ByteRange, Certificate, DocumentSigner, PrivateKey, SignatureAlgorithm, SignatureConfig, SignatureInfo};
+    pub use crate::signatures::{
+        ByteRange, Certificate, DocumentSigner, IncrementalSigner, PrivateKey, SignatureAlgorithm,
+        SignatureConfig, SignatureInfo, SignatureVerifier, VerifiedSignature,
+    };
     pub use crate::font::{Font, FontMetrics, Standard14Font};
+    #[cfg(feature = "fonts")]
+    pub use crate::font::CompositeFont;
+    #[cfg(feature = "fonts")]
+    pub use crate::error::FontError;
     pub use crate::forms::{
         AppearanceBuilder, BorderStyle, CheckBox, ComboBox, FieldFlags, FormField,
         FormFieldTrait, FormFieldType, ListBox, PushButton, RadioButton, RadioGroup, TextField,
@@ -151,6 +184,10 @@ pub mod prelude {
     #[cfg(feature = "parser")]
     pub use crate::parser::PdfReader;
     pub use crate::page::{Page, PageBuilder};
+    #[cfg(feature = "render")]
+    pub use crate::render::{PdfRenderer, RgbaImage, Viewport};
+    #[cfg(feature = "render")]
+    pub use crate::error::RenderError;
     pub use crate::types::{Matrix, ObjectId, Rectangle};
 }
 

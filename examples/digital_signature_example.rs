@@ -23,7 +23,10 @@ use rust_pdf::prelude::*;
 use std::path::Path;
 
 #[cfg(feature = "signatures")]
-use rust_pdf::signatures::{Certificate, DocumentSigner, PrivateKey, SignatureAlgorithm};
+use rust_pdf::signatures::{
+    Certificate, DocumentSigner, IncrementalSigner, PrivateKey, SignatureAlgorithm,
+    SignatureVerifier,
+};
 
 const OUTPUT_DIR: &str = "tests/output";
 
@@ -181,6 +184,9 @@ fn create_single_signed_pdf() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&output_path, &signed_pdf)?;
     println!("Saved: {} ({} bytes)", output_path, signed_pdf.len());
 
+    // Verify the signature we just created
+    print_verification(&signed_pdf);
+
     Ok(())
 }
 
@@ -255,46 +261,16 @@ fn create_multi_signed_pdf() -> Result<(), Box<dyn std::error::Error>> {
         .algorithm(SignatureAlgorithm::RsaSha256)
         .sign()?;
 
-    // For the second signature, we need to parse the signed PDF and sign again
-    // Note: This demonstrates the concept - in practice, you'd use incremental updates
-    println!("Applying second signature (Jane Smith)...");
+    // Save the single-signed version
+    let single_path = format!("{}/signed_by_signer1.pdf", OUTPUT_DIR);
+    std::fs::write(&single_path, &signed_once)?;
+    println!("Saved: {} ({} bytes)", single_path, signed_once.len());
 
-    // Parse the first signed PDF and create a new document for second signature
-    // For demonstration, we'll save the first signature and note that proper
-    // multi-signature requires incremental PDF updates
+    // Second signature using IncrementalSigner
+    // This adds a new signature to the already-signed PDF using incremental update
+    println!("Applying second signature (Jane Smith) using incremental update...");
 
-    // In a production implementation, you would:
-    // 1. Parse the signed PDF
-    // 2. Add a new signature field
-    // 3. Create an incremental update with the new signature
-
-    // For now, we demonstrate by signing the original document with the second signer
-    // and noting this limitation
-
-    let doc2 = DocumentBuilder::new()
-        .title("Multi-Signature Document")
-        .author("John Doe, Jane Smith")
-        .subject("Digital Signature Example - Multiple Signers")
-        .page(PageBuilder::a4()
-            .font("F1", Standard14Font::HelveticaBold)
-            .font("F2", Standard14Font::Helvetica)
-            .font("F3", Standard14Font::HelveticaOblique)
-            .content(ContentBuilder::new()
-                .text("F1", 28.0, 72.0, 750.0, "Multi-Signature Document")
-                .text("F2", 14.0, 72.0, 700.0, "This document has been signed by multiple parties.")
-                .text("F2", 14.0, 72.0, 650.0, "Agreement Terms:")
-                .text("F2", 12.0, 90.0, 620.0, "1. Both parties agree to the terms outlined in this document.")
-                .text("F2", 12.0, 90.0, 600.0, "2. This agreement is binding upon digital signature.")
-                .text("F2", 12.0, 90.0, 580.0, "3. All parties have reviewed and understood the contents.")
-                .text("F1", 14.0, 72.0, 520.0, "Signers:")
-                .text("F2", 12.0, 90.0, 490.0, "1. John Doe (Example Corp) - Initial approval")
-                .text("F2", 12.0, 90.0, 470.0, "2. Jane Smith (Partner Inc) - Final approval")
-                .text("F3", 10.0, 72.0, 400.0, "Note: This PDF demonstrates the final approval signature.")
-                .text("F3", 10.0, 72.0, 385.0, "In production, multiple signatures would use incremental updates."))
-            .build())
-        .build()?;
-
-    let signed_multi = DocumentSigner::new(doc2)
+    let signed_multi = IncrementalSigner::new(signed_once)
         .certificate(cert2)
         .private_key(key2)
         .name("Jane Smith")
@@ -304,15 +280,45 @@ fn create_multi_signed_pdf() -> Result<(), Box<dyn std::error::Error>> {
         .algorithm(SignatureAlgorithm::RsaSha256)
         .sign()?;
 
-    // Save both versions
-    let single_path = format!("{}/signed_by_signer1.pdf", OUTPUT_DIR);
-    std::fs::write(&single_path, &signed_once)?;
-    println!("Saved: {} ({} bytes)", single_path, signed_once.len());
-
     std::fs::write(&output_path, &signed_multi)?;
     println!("Saved: {} ({} bytes)", output_path, signed_multi.len());
 
+    // Verify both signatures on the final, twice-signed document
+    print_verification(&signed_multi);
+
     Ok(())
+}
+
+/// Verifies every signature found in `pdf_bytes` and prints a short report.
+#[cfg(feature = "signatures")]
+fn print_verification(pdf_bytes: &[u8]) {
+    println!("\nVerifying signatures...");
+
+    let results = match SignatureVerifier::new(pdf_bytes.to_vec()).verify() {
+        Ok(results) => results,
+        Err(e) => {
+            println!("  Verification failed to run: {}", e);
+            return;
+        }
+    };
+
+    if results.is_empty() {
+        println!("  No signatures found.");
+        return;
+    }
+
+    for (i, sig) in results.iter().enumerate() {
+        println!(
+            "  Signature {}: signer={:?}, reason={:?}, valid={}",
+            i + 1,
+            sig.signer_name,
+            sig.reason,
+            sig.is_valid
+        );
+        if let Some(ref err) = sig.error {
+            println!("    error: {}", err);
+        }
+    }
 }
 
 #[cfg(not(feature = "signatures"))]

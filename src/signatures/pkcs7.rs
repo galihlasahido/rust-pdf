@@ -1,8 +1,22 @@
 //! PKCS#7 (CMS) signature container building.
 
-use crate::error::SignatureError;
 use super::{Certificate, PrivateKey, SignatureAlgorithm, SignatureResult};
-use sha2::{Sha256, Sha384, Sha512, Digest};
+use crate::error::SignatureError;
+
+/// The `id-aa-signingCertificateV2` attribute OID (RFC 5035 §3):
+/// `1.2.840.113549.1.9.16.2.47`.
+///
+/// A signed attribute added when [`Pkcs7Builder::pades`] is enabled. It
+/// binds the signer's certificate into the signed data (via a hash of the
+/// certificate), which is the mandatory "signing-certificate reference"
+/// required for CAdES-BES / ETSI EN 319 122-1 CAdES-B-B, which is what PDF
+/// carries as the PAdES "B-B" baseline profile (SubFilter
+/// `ETSI.CAdES.detached`, see ETSI EN 319 142-1 "PAdES digital signatures").
+/// Without it, a CMS SignedData is a plain PKCS#7 signature
+/// (`adbe.pkcs7.detached`) but not a conformant CAdES/PAdES signature.
+const OID_SIGNING_CERTIFICATE_V2: &[u8] = &[
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F,
+];
 
 /// Builder for creating PKCS#7 (CMS) SignedData structures.
 #[derive(Debug)]
@@ -13,6 +27,9 @@ pub struct Pkcs7Builder {
     certificate_chain: Vec<Certificate>,
     /// The signature algorithm.
     algorithm: SignatureAlgorithm,
+    /// Whether to add the CAdES-BES `signing-certificate-v2` signed
+    /// attribute (PAdES "B-B" baseline). See [`OID_SIGNING_CERTIFICATE_V2`].
+    pades: bool,
 }
 
 impl Pkcs7Builder {
@@ -22,6 +39,7 @@ impl Pkcs7Builder {
             certificate: None,
             certificate_chain: Vec::new(),
             algorithm: SignatureAlgorithm::default(),
+            pades: false,
         }
     }
 
@@ -43,6 +61,15 @@ impl Pkcs7Builder {
         self
     }
 
+    /// Enables the CAdES-BES `signing-certificate-v2` signed attribute
+    /// (PAdES "B-B" baseline, RFC 5035 §3). Does not by itself change the
+    /// PDF `/SubFilter` -- that is set by the caller (see
+    /// `SignatureConfig::pades`).
+    pub fn pades(mut self, enabled: bool) -> Self {
+        self.pades = enabled;
+        self
+    }
+
     /// Builds a PKCS#7 SignedData structure.
     ///
     /// This creates a CMS SignedData structure with:
@@ -51,76 +78,89 @@ impl Pkcs7Builder {
     /// - Encapsulated content (none for detached signature)
     /// - Certificates
     /// - Signer infos
-    pub fn build(
+    ///
+    /// Returns both the encoded `SignedData` and the raw signature bytes
+    /// (the `SignatureValue` inside `SignerInfo`), since an RFC 3161
+    /// timestamp-over-the-signature (PAdES "B-T") needs the latter as its
+    /// message-imprint input.
+    pub fn build(&self, data_to_sign: &[u8], private_key: &PrivateKey) -> SignatureResult<Vec<u8>> {
+        self.build_with_signature(data_to_sign, private_key)
+            .map(|(der, _sig)| der)
+    }
+
+    /// Same as [`Pkcs7Builder::build`], but also returns the raw signature
+    /// bytes computed over the signed attributes (needed by callers that
+    /// want to request an RFC 3161 timestamp over the signature value).
+    pub(crate) fn build_with_signature(
         &self,
         data_to_sign: &[u8],
         private_key: &PrivateKey,
-    ) -> SignatureResult<Vec<u8>> {
-        let cert = self.certificate.as_ref().ok_or_else(|| {
-            SignatureError::SigningFailed("Certificate not set".to_string())
-        })?;
+    ) -> SignatureResult<(Vec<u8>, Vec<u8>)> {
+        let cert = self
+            .certificate
+            .as_ref()
+            .ok_or_else(|| SignatureError::SigningFailed("Certificate not set".to_string()))?;
 
         // Compute message digest
         let digest = self.compute_digest(data_to_sign);
 
         // Create the signed attributes and sign them
-        let signed_attrs = self.build_signed_attributes(&digest)?;
+        let signed_attrs = self.build_signed_attributes(cert, &digest)?;
         let signature = private_key.sign(&signed_attrs)?;
 
         // Build the CMS SignedData structure
         let cms_data = self.build_cms_signed_data(cert, &digest, &signature)?;
 
-        Ok(cms_data)
+        Ok((cms_data, signature))
+    }
+
+    /// Same as [`Pkcs7Builder::build_with_signature`], but obtains the raw
+    /// signature bytes from `sign_fn` instead of a local [`PrivateKey`].
+    ///
+    /// This is the hook `signer.rs` uses to route through a `RemoteSigner`
+    /// (HSM/KMS) rather than in-process key material: every other step
+    /// (digest, signed attributes, CMS structure) delegates to the exact
+    /// same private helpers `build_with_signature` uses, so for the same
+    /// `data_to_sign`/certificate/algorithm, a `sign_fn` that returns the
+    /// same raw signature bytes a local `PrivateKey::sign` call would
+    /// produces byte-identical output to the local-key path.
+    pub(crate) fn build_with_remote_signature(
+        &self,
+        data_to_sign: &[u8],
+        sign_fn: impl FnOnce(&[u8]) -> SignatureResult<Vec<u8>>,
+    ) -> SignatureResult<(Vec<u8>, Vec<u8>)> {
+        let cert = self
+            .certificate
+            .as_ref()
+            .ok_or_else(|| SignatureError::SigningFailed("Certificate not set".to_string()))?;
+
+        // Compute message digest
+        let digest = self.compute_digest(data_to_sign);
+
+        // Create the signed attributes and sign them via the remote backend
+        let signed_attrs = self.build_signed_attributes(cert, &digest)?;
+        let signature = sign_fn(&signed_attrs)?;
+
+        // Build the CMS SignedData structure
+        let cms_data = self.build_cms_signed_data(cert, &digest, &signature)?;
+
+        Ok((cms_data, signature))
     }
 
     /// Computes the message digest.
     fn compute_digest(&self, data: &[u8]) -> Vec<u8> {
-        match self.algorithm {
-            SignatureAlgorithm::RsaSha256 | SignatureAlgorithm::EcdsaP256Sha256 => {
-                let mut hasher = Sha256::new();
-                hasher.update(data);
-                hasher.finalize().to_vec()
-            }
-            SignatureAlgorithm::RsaSha384 => {
-                let mut hasher = Sha384::new();
-                hasher.update(data);
-                hasher.finalize().to_vec()
-            }
-            SignatureAlgorithm::RsaSha512 => {
-                let mut hasher = Sha512::new();
-                hasher.update(data);
-                hasher.finalize().to_vec()
-            }
-        }
+        super::digest_for_algorithm(self.algorithm, data)
     }
 
-    /// Builds the signed attributes to be signed.
-    fn build_signed_attributes(&self, digest: &[u8]) -> SignatureResult<Vec<u8>> {
-        // Build a DER-encoded SET of attributes:
-        // - Content type (OID for data)
-        // - Signing time
-        // - Message digest
-        let mut attrs = Vec::new();
-
-        // Content type attribute (OID 1.2.840.113549.1.9.3)
-        // Value: OID for data (1.2.840.113549.1.7.1)
-        let content_type_attr = build_attribute(
-            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03], // 1.2.840.113549.1.9.3
-            &build_oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01]), // data OID
-        );
-        attrs.extend_from_slice(&content_type_attr);
-
-        // Message digest attribute (OID 1.2.840.113549.1.9.4)
-        let digest_attr = build_attribute(
-            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04], // 1.2.840.113549.1.9.4
-            &build_octet_string(digest),
-        );
-        attrs.extend_from_slice(&digest_attr);
-
-        // Wrap as SET
-        let set = build_set(&attrs);
-
-        Ok(set)
+    /// Builds the signed attributes to be signed (as SET for signing).
+    fn build_signed_attributes(
+        &self,
+        cert: &Certificate,
+        digest: &[u8],
+    ) -> SignatureResult<Vec<u8>> {
+        // Build a DER-encoded SET of attributes for signing
+        let attrs = self.build_signed_attributes_content(cert, digest)?;
+        Ok(build_set(&attrs))
     }
 
     /// Builds the CMS SignedData structure.
@@ -183,26 +223,7 @@ impl Pkcs7Builder {
 
     /// Builds the digest algorithm identifier.
     fn build_digest_algorithm_identifier(&self) -> Vec<u8> {
-        let oid_bytes = match self.algorithm {
-            SignatureAlgorithm::RsaSha256 | SignatureAlgorithm::EcdsaP256Sha256 => {
-                // SHA-256: 2.16.840.1.101.3.4.2.1
-                vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]
-            }
-            SignatureAlgorithm::RsaSha384 => {
-                // SHA-384: 2.16.840.1.101.3.4.2.2
-                vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02]
-            }
-            SignatureAlgorithm::RsaSha512 => {
-                // SHA-512: 2.16.840.1.101.3.4.2.3
-                vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03]
-            }
-        };
-
-        let mut alg_id = Vec::new();
-        alg_id.extend_from_slice(&build_oid(&oid_bytes));
-        alg_id.extend_from_slice(&[0x05, 0x00]); // NULL parameters
-
-        build_sequence(&alg_id)
+        build_digest_algorithm_identifier_for(self.algorithm)
     }
 
     /// Builds the encapsulated content info (for detached signature).
@@ -246,8 +267,10 @@ impl Pkcs7Builder {
         signer_info.extend_from_slice(&self.build_digest_algorithm_identifier());
 
         // SignedAttrs [0] IMPLICIT
-        let signed_attrs = self.build_signed_attributes(digest)?;
-        let signed_attrs_implicit = build_context_specific(0, &signed_attrs[1..], true); // Skip SET tag
+        // Build the attributes as raw content (not wrapped in SET yet)
+        let signed_attrs_content = self.build_signed_attributes_content(cert, digest)?;
+        // Wrap with context-specific [0] tag
+        let signed_attrs_implicit = build_context_specific(0, &signed_attrs_content, true);
         signer_info.extend_from_slice(&signed_attrs_implicit);
 
         // SignatureAlgorithm
@@ -257,6 +280,89 @@ impl Pkcs7Builder {
         signer_info.extend_from_slice(&build_octet_string(signature));
 
         Ok(build_sequence(&signer_info))
+    }
+
+    /// Builds the raw content for signed attributes (without SET wrapper).
+    fn build_signed_attributes_content(
+        &self,
+        cert: &Certificate,
+        digest: &[u8],
+    ) -> SignatureResult<Vec<u8>> {
+        // Build attributes without SET wrapper:
+        // - Content type (OID for data)
+        // - Message digest
+        // - (PAdES only) signing-certificate-v2
+        let mut attrs = Vec::new();
+
+        // Content type attribute (OID 1.2.840.113549.1.9.3)
+        // Value: OID for data (1.2.840.113549.1.7.1)
+        let content_type_attr = build_attribute(
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03], // 1.2.840.113549.1.9.3
+            &build_oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01]), // data OID
+        );
+        attrs.extend_from_slice(&content_type_attr);
+
+        // Message digest attribute (OID 1.2.840.113549.1.9.4)
+        let digest_attr = build_attribute(
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04], // 1.2.840.113549.1.9.4
+            &build_octet_string(digest),
+        );
+        attrs.extend_from_slice(&digest_attr);
+
+        if self.pades {
+            attrs.extend_from_slice(&self.build_signing_certificate_v2_attribute(cert));
+        }
+
+        Ok(attrs)
+    }
+
+    /// Builds the `signing-certificate-v2` signed attribute (RFC 5035 §3,
+    /// required for CAdES-BES / PAdES "B-B"):
+    ///
+    /// ```text
+    /// SigningCertificateV2 ::= SEQUENCE {
+    ///     certs        SEQUENCE OF ESSCertIDv2,
+    ///     policies     SEQUENCE OF PolicyInformation OPTIONAL }
+    /// ESSCertIDv2 ::= SEQUENCE {
+    ///     hashAlgorithm    AlgorithmIdentifier DEFAULT {algorithm id-sha256},
+    ///     certHash         OCTET STRING, -- hash of the entire certificate
+    ///     issuerSerial     IssuerSerial OPTIONAL }
+    /// ```
+    ///
+    /// `issuerSerial` is deliberately omitted here: it requires encoding a
+    /// `GeneralName` (an ASN.1 `CHOICE`, which per X.680 forces `[4]` to be
+    /// applied as EXPLICIT rather than IMPLICIT tagging even though RFC 5035
+    /// doesn't spell that out inline) and we are not confident enough in
+    /// that corner of the encoding to add it without a reference vector to
+    /// test against. `issuerSerial` is OPTIONAL per RFC 5035, and `certHash`
+    /// alone is sufficient to bind the signature to this exact certificate
+    /// (which is the property CAdES-BES / PAdES-B-B needs).
+    fn build_signing_certificate_v2_attribute(&self, cert: &Certificate) -> Vec<u8> {
+        // certHash = SHA-256(entire DER-encoded certificate).
+        let cert_hash =
+            super::digest_for_algorithm(SignatureAlgorithm::RsaSha256, cert.der_bytes());
+
+        // hashAlgorithm is technically DEFAULT sha256 (and DER purists would
+        // omit it), but it is included explicitly here for maximum
+        // interop with validators that don't special-case the default.
+        let sha256_alg_id = {
+            let mut alg_id = Vec::new();
+            alg_id.extend_from_slice(&build_oid(&[
+                0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+            ]));
+            alg_id.extend_from_slice(&[0x05, 0x00]); // NULL parameters
+            build_sequence(&alg_id)
+        };
+
+        let mut ess_cert_id_v2 = Vec::new();
+        ess_cert_id_v2.extend_from_slice(&sha256_alg_id);
+        ess_cert_id_v2.extend_from_slice(&build_octet_string(&cert_hash));
+        let ess_cert_id_v2 = build_sequence(&ess_cert_id_v2);
+
+        let certs = build_sequence(&ess_cert_id_v2); // SEQUENCE OF ESSCertIDv2 { one entry }
+        let signing_certificate_v2 = build_sequence(&certs); // policies omitted (OPTIONAL)
+
+        build_attribute(OID_SIGNING_CERTIFICATE_V2, &signing_certificate_v2)
     }
 
     /// Builds the signature algorithm identifier.
@@ -278,6 +384,14 @@ impl Pkcs7Builder {
                 // ecdsa-with-SHA256: 1.2.840.10045.4.3.2
                 vec![0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]
             }
+            SignatureAlgorithm::EcdsaP384Sha384 => {
+                // ecdsa-with-SHA384: 1.2.840.10045.4.3.3
+                vec![0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03]
+            }
+            SignatureAlgorithm::EcdsaP521Sha512 => {
+                // ecdsa-with-SHA512: 1.2.840.10045.4.3.4
+                vec![0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04]
+            }
         };
 
         let mut alg_id = Vec::new();
@@ -289,8 +403,8 @@ impl Pkcs7Builder {
 
     /// Builds the issuer and serial number from the certificate.
     fn build_issuer_and_serial(&self, cert: &Certificate) -> SignatureResult<Vec<u8>> {
-        use x509_cert::Certificate as X509Cert;
         use der::{Decode, Encode};
+        use x509_cert::Certificate as X509Cert;
 
         let x509 = X509Cert::from_der(cert.der_bytes()).map_err(|e| {
             SignatureError::SigningFailed(format!("Failed to parse certificate: {}", e))
@@ -320,10 +434,37 @@ impl Default for Pkcs7Builder {
     }
 }
 
+/// Builds a DER-encoded `AlgorithmIdentifier` (OID + NULL parameters) for
+/// the digest algorithm underlying `algo`. Shared by [`Pkcs7Builder`] (CMS
+/// `digestAlgorithms`/`DigestAlgorithm`) and `timestamp.rs` (RFC 3161
+/// `MessageImprint.hashAlgorithm`) so both use the identical encoding.
+pub(super) fn build_digest_algorithm_identifier_for(algo: SignatureAlgorithm) -> Vec<u8> {
+    let oid_bytes: &[u8] = match algo {
+        SignatureAlgorithm::RsaSha256 | SignatureAlgorithm::EcdsaP256Sha256 => {
+            // SHA-256: 2.16.840.1.101.3.4.2.1
+            &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]
+        }
+        SignatureAlgorithm::RsaSha384 | SignatureAlgorithm::EcdsaP384Sha384 => {
+            // SHA-384: 2.16.840.1.101.3.4.2.2
+            &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02]
+        }
+        SignatureAlgorithm::RsaSha512 | SignatureAlgorithm::EcdsaP521Sha512 => {
+            // SHA-512: 2.16.840.1.101.3.4.2.3
+            &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03]
+        }
+    };
+
+    let mut alg_id = Vec::new();
+    alg_id.extend_from_slice(&build_oid(oid_bytes));
+    alg_id.extend_from_slice(&[0x05, 0x00]); // NULL parameters
+
+    build_sequence(&alg_id)
+}
+
 // Helper functions for DER encoding
 
 /// Builds a DER-encoded INTEGER.
-fn build_integer(value: i64) -> Vec<u8> {
+pub(super) fn build_integer(value: i64) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.push(0x02); // INTEGER tag
 
@@ -353,7 +494,7 @@ fn build_integer(value: i64) -> Vec<u8> {
 }
 
 /// Builds a DER-encoded SEQUENCE.
-fn build_sequence(content: &[u8]) -> Vec<u8> {
+pub(super) fn build_sequence(content: &[u8]) -> Vec<u8> {
     let mut seq = Vec::new();
     seq.push(0x30); // SEQUENCE tag
     seq.extend_from_slice(&encode_length(content.len()));
@@ -371,7 +512,7 @@ fn build_set(content: &[u8]) -> Vec<u8> {
 }
 
 /// Builds a DER-encoded OCTET STRING.
-fn build_octet_string(content: &[u8]) -> Vec<u8> {
+pub(super) fn build_octet_string(content: &[u8]) -> Vec<u8> {
     let mut os = Vec::new();
     os.push(0x04); // OCTET STRING tag
     os.extend_from_slice(&encode_length(content.len()));
@@ -379,8 +520,13 @@ fn build_octet_string(content: &[u8]) -> Vec<u8> {
     os
 }
 
+/// Builds a DER-encoded BOOLEAN.
+pub(super) fn build_boolean(value: bool) -> Vec<u8> {
+    vec![0x01, 0x01, if value { 0xFF } else { 0x00 }]
+}
+
 /// Builds a DER-encoded OID.
-fn build_oid(oid_bytes: &[u8]) -> Vec<u8> {
+pub(super) fn build_oid(oid_bytes: &[u8]) -> Vec<u8> {
     let mut oid = Vec::new();
     oid.push(0x06); // OID tag
     oid.push(oid_bytes.len() as u8);
@@ -389,6 +535,14 @@ fn build_oid(oid_bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Builds a DER-encoded context-specific tag.
+//
+// NOTE(rust-pdf parser-robustness task): clippy flags this `if`/`else` as
+// producing identical output on both arms (`implicit` currently has no
+// effect on the emitted tag byte). This predates this task, is unrelated
+// to PDF parsing, and touches signature/DER-encoding correctness, so it is
+// intentionally left behaviourally unchanged here rather than "fixed"
+// without dedicated signature-module verification; flagged for follow-up.
+#[allow(clippy::if_same_then_else)]
 fn build_context_specific(tag_num: u8, content: &[u8], implicit: bool) -> Vec<u8> {
     let mut cs = Vec::new();
     let tag = if implicit {
@@ -403,7 +557,7 @@ fn build_context_specific(tag_num: u8, content: &[u8], implicit: bool) -> Vec<u8
 }
 
 /// Builds a DER-encoded attribute.
-fn build_attribute(oid_bytes: &[u8], value: &[u8]) -> Vec<u8> {
+pub(super) fn build_attribute(oid_bytes: &[u8], value: &[u8]) -> Vec<u8> {
     let mut attr = Vec::new();
     attr.extend_from_slice(&build_oid(oid_bytes));
     attr.extend_from_slice(&build_set(value));
@@ -481,5 +635,30 @@ mod tests {
         let builder = Pkcs7Builder::new();
         assert!(builder.certificate.is_none());
         assert!(builder.certificate_chain.is_empty());
+        assert!(!builder.pades);
+    }
+
+    #[test]
+    fn test_build_boolean() {
+        assert_eq!(build_boolean(true), vec![0x01, 0x01, 0xFF]);
+        assert_eq!(build_boolean(false), vec![0x01, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn test_pades_builder_flag() {
+        let builder = Pkcs7Builder::new().pades(true);
+        assert!(builder.pades);
+    }
+
+    #[test]
+    fn test_build_digest_algorithm_identifier_for_matches_method() {
+        // SHA-256 OID content should be identical whether reached via the
+        // shared free function or the `Pkcs7Builder` method that now
+        // delegates to it.
+        let builder = Pkcs7Builder::new().algorithm(SignatureAlgorithm::RsaSha256);
+        assert_eq!(
+            builder.build_digest_algorithm_identifier(),
+            build_digest_algorithm_identifier_for(SignatureAlgorithm::RsaSha256)
+        );
     }
 }

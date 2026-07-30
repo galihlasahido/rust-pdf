@@ -6,16 +6,87 @@ edition = "2021"
 [lib]
 crate-type = ["rlib", "cdylib"]  # rlib for Rust, cdylib for C/FFI
 
+[[bin]]
+name = "rust-pdf-gui"
+path = "src/gui/main.rs"
+required-features = ["native-gui"]
+
 [features]
 default = []
 compression = ["flate2"]
 images = ["image", "compression"]
-parser = ["nom", "compression"]
+parser = ["nom", "compression", "jpeg-decoder", "dep:memmap2"]
 encryption = ["aes", "cbc", "sha2", "md-5", "rand", "zeroize"]
-signatures = ["encryption", "cms", "x509-cert", "rsa", "p256", "ecdsa", "const-oid", "der", "spki", "pkcs8", "signature"]
+signatures = ["encryption", "cms", "x509-cert", "rsa", "p256", "p384", "p521", "ecdsa", "const-oid", "der", "spki", "pkcs8", "signature", "dep:sec1"]
 html = []
 office = []
-full = ["compression", "images", "parser", "encryption", "signatures", "html", "office"]
+# Embedded TrueType/OpenType font loading (ttf-parser), Type0/CID composite
+# fonts, and font subsetting (subsetter) for PDF generation. See
+# src/font/truetype.rs and src/font/subset.rs.
+fonts = ["dep:ttf-parser", "dep:subsetter"]
+full = ["compression", "images", "parser", "encryption", "signatures", "html", "office", "fonts"]
+# Pure-Rust content-stream interpreter and 2D rasterizer (no native/FFI
+# dependency at all): graphics-state stack, path construction/painting,
+# clipping, ExtGState (alpha/line width/dash/blend mode/soft mask),
+# DeviceGray/RGB/CMYK/Indexed/Separation/DeviceN/ICCBased-approximated
+# color, text showing (TrueType/OpenType simple + CID/Type0 fonts via
+# `fonts`'s `ttf-parser`, plus Type3 glyph procedures), image and Form
+# XObjects (including transparency groups and per-image soft masks), and
+# blend modes (all 16 standard ISO 32000-1 §11.3.5 modes). See
+# `src/render/native/mod.rs` for the exact scope and its
+# explicitly-documented gaps (no JBIG2/JPX, no Type1/bare-CFF font
+# programs, no true ICC color management, no Patterns/shadings, group
+# isolation/knockout and soft-mask `/BC`/`/TR` are approximated -- all
+# fail closed with a structured `NativeRenderError`/`RenderWarning`
+# rather than silently mis-rendering). A non-embedded simple font (no
+# `FontFile`/`FontFile2`/`FontFile3`) is substituted with a matching
+# font already installed on the host OS when `system-fonts` is enabled
+# (see that feature) -- extremely common for real-world business PDFs
+# (Word/Excel/PowerPoint exports referencing "Arial"/"Times New Roman"/
+# "Courier New" by name to save file size) -- or fails closed the same
+# way as the gaps above if `system-fonts` is off or no match is found.
+# Pulls in `fonts` (ttf-parser) for glyph outline extraction -- see
+# `src/render/native/font.rs`. This is the lowest-level,
+# single-content-stream entry point
+# (`render::native::render_content_stream`); see the `render` feature
+# below for the whole-document `PdfRenderer` API built on top of it.
+native-render = ["dep:tiny-skia", "parser", "fonts", "system-fonts"]
+# Resolves a non-embedded simple font's `/BaseFont` name (e.g.
+# "Arial-BoldMT", "TimesNewRomanPSMT,Italic") to a font already installed
+# on the host OS via `font-kit` (Core Text on macOS, DirectWrite on
+# Windows, fontconfig on Linux), then parses/renders its outlines through
+# this crate's own `ttf-parser`-based pipeline exactly like an embedded
+# font -- `font-kit` is used ONLY for OS-level font *discovery*, never for
+# parsing or rasterizing. Deliberately does NOT bundle/redistribute any
+# font file of its own: Arial/Times New Roman/Courier New are proprietary
+# (Monotype, licensed to OS vendors for on-device use), so reading
+# whatever copy is already legitimately installed on the host is the only
+# licensing-clean way to substitute them -- see `src/font/system.rs`.
+# Falls back to this crate's prior "not embedded, don't render" behavior
+# if disabled or no matching system font is found.
+system-fonts = ["dep:font-kit"]
+# Whole-document page rasterization (`render::PdfRenderer`): resolves a
+# page's effective `/MediaBox`/`/Rotate`/`/Resources`/content streams
+# (ISO 32000-1 Table 30, §7.8.3) via this crate's own pure-Rust parser/
+# editor (`parser`/`EditableDocument`) and rasterizes them via
+# `native-render`'s content-stream interpreter, producing an
+# `image::RgbaImage` (hence `images`). No native binary or FFI dependency
+# of any kind -- see `src/render/mod.rs` for the (now-completed) migration
+# away from an earlier FFI-to-Pdfium design and the compatibility/
+# performance trade-offs that migration explicitly accepted.
+render = ["native-render", "images"]
+# Async Tauri desktop-app command layer (open_document, render_page,
+# extract_text, search_text, apply_edit, save_document, fill_form,
+# add_annotation, sign_document) plus a dedicated worker thread pool and
+# Tauri-event progress reporting. See src/tauri_commands/mod.rs. Requires
+# `parser` (structural editing), `render` (rasterization) and
+# `signatures` (digital signing), so pulls all three in.
+tauri = ["dep:tauri", "dep:tokio", "dep:serde", "parser", "render", "signatures"]
+# Native desktop GUI shell (egui/eframe), gui/mod.rs and its siblings. Built
+# directly on `render::PdfRenderer`/`editor::EditableDocument` -- both are
+# already plain synchronous, Tauri-free APIs -- so this pulls in `render`
+# and `parser` only, no `tauri`/`tokio`/`serde` at all. See src/gui/mod.rs.
+native-gui = ["dep:eframe", "dep:egui", "dep:rfd", "render", "parser", "signatures"]
 
 [dependencies]
 thiserror = "2.0"
@@ -24,6 +95,14 @@ bitflags = "2.4"
 flate2 = { version = "1.0", optional = true, default-features = false, features = ["rust_backend"] }
 image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png"] }
 nom = { version = "7.1", optional = true }
+# Memory-mapped file I/O for `PdfReader::from_file` (see src/parser/mod.rs,
+# `DataSource`): lets opening a multi-gigabyte PDF avoid reading the whole
+# file into the process heap up front, and lets the OS page cache (not this
+# process's private memory) back pages the caller never actually touches.
+memmap2 = { version = "0.9", optional = true }
+# DCTDecode filter (ISO 32000-1 7.4.8): decodes baseline/progressive JPEG
+# stream data embedded in PDF image XObjects.
+jpeg-decoder = { version = "0.3", optional = true, default-features = false }
 # Encryption dependencies
 aes = { version = "0.8", optional = true }
 cbc = { version = "0.1", optional = true }
@@ -36,12 +115,87 @@ cms = { version = "0.2", optional = true, features = ["std"] }
 x509-cert = { version = "0.2", optional = true, features = ["std", "pem"] }
 rsa = { version = "0.9", optional = true, features = ["sha2"] }
 p256 = { version = "0.13", optional = true, features = ["ecdsa"] }
+# ECDSA P-384 and P-521 curves (same RustCrypto family/versions as `p256`
+# above), for the `EcdsaP384Sha384`/`EcdsaP521Sha512` signature algorithms
+# (see src/signatures/mod.rs::SignatureAlgorithm).
+p384 = { version = "0.13", optional = true, features = ["ecdsa"] }
+p521 = { version = "0.13", optional = true, features = ["ecdsa"] }
 ecdsa = { version = "0.16", optional = true }
+# Parses the SEC1 `ECPrivateKey` ASN.1 structure (`BEGIN EC PRIVATE KEY`
+# PEM) directly, so `PrivateKey::from_pem` (src/signatures/certificate.rs)
+# can read the key's embedded `namedCurve` OID and pick the matching curve
+# (P-256/P-384/P-521) before parsing it with that curve's own
+# `p256`/`p384`/`p521::SecretKey`. Already an implicit transitive
+# dependency of `p256`/`p384`/`p521`/`elliptic-curve` (same version, no new
+# code pulled in) -- declaring it directly just lets us call its decoder.
+sec1 = { version = "0.7", optional = true, features = ["std"] }
 const-oid = { version = "0.9", optional = true }
 der = { version = "0.7", optional = true, features = ["std", "pem", "alloc"] }
 spki = { version = "0.7", optional = true, features = ["std"] }
 pkcs8 = { version = "0.10", optional = true, features = ["std", "pem"] }
 signature = { version = "2.2", optional = true }
+# Pure-Rust 2D rasterizer (path fill/stroke, clipping via alpha masks) used
+# by the `native-render` feature's content-stream interpreter
+# (src/render/native/). No native/FFI dependency: this and its own
+# transitive deps (arrayref, arrayvec, bytemuck, cfg-if, log) are all pure
+# Rust. `png-format` is disabled -- this crate doesn't need tiny-skia's own
+# PNG codec, only its rasterizer.
+tiny-skia = { version = "0.12", optional = true, default-features = false, features = ["std"] }
+# Embedded TrueType/OpenType font parsing (glyph metrics, cmap, name table).
+# We deliberately parse fonts only through this crate rather than hand-rolling
+# our own sfnt/OpenType parser over untrusted font bytes (see CLAUDE workflow
+# rule: don't reimplement mature C/C++-grade parsers).
+ttf-parser = { version = "0.25", optional = true }
+# TrueType/OpenType font subsetting (glyf/CFF table rebuilding, glyph
+# remapping) for PDF font embedding. `variable-fonts` is disabled: it pulls
+# in `skrifa`/`write-fonts`/`kurbo` to support font-variation instancing,
+# which this crate does not need (embedded fonts are always instanced to a
+# single set of outlines).
+subsetter = { version = "0.2", optional = true, default-features = false }
+# OS-level font *discovery* only (feature `system-fonts`) - finds a font
+# family/weight/style already installed on the host (Core Text/DirectWrite/
+# fontconfig) so a non-embedded simple font can be substituted; this
+# crate's own `ttf-parser` still does all the actual parsing/rasterizing
+# of whatever bytes font-kit locates. Default features pull in a
+# `source-fontconfig` backend on Linux only; macOS/Windows use their own
+# native APIs unconditionally, no extra system library required there.
+font-kit = { version = "0.14", optional = true }
+# Desktop-app command layer (feature `tauri`, see src/tauri_commands).
+tauri = { version = "2", optional = true }
+# Async runtime used only for the oneshot result channel between an async
+# Tauri command and this crate's own worker thread pool (src/tauri_commands/worker.rs),
+# and for `#[tokio::test]` in that module's own test suite. Tauri itself
+# already depends on tokio for its command dispatch, so this adds no new
+# runtime to an app that already uses Tauri.
+tokio = { version = "1", optional = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+serde = { version = "1", optional = true, features = ["derive"] }
+# Native GUI shell (feature `native-gui`, see src/gui): immediate-mode UI
+# toolkit + its native windowing/rendering backend. Pure Rust, no webview.
+egui = { version = "0.35", optional = true }
+# `glow` (OpenGL) renderer only -- lighter/faster to compile than pulling in
+# `wgpu` as well, and sufficient for 2D document rendering.
+eframe = { version = "0.35", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+# Native "Open File" dialog (feature `native-gui`) -- OS-native picker
+# (NSOpenPanel/IFileOpenDialog/GTK), no custom-built file browser UI.
+rfd = { version = "0.17", optional = true }
 
 [dev-dependencies]
+lopdf = "0.43.0"
 tempfile = "3.0"
+# Only exercised by src/tauri_commands's own test suite (feature `tauri`),
+# to assert on the JSON shape of `CommandError`/DTOs and to drive
+# `#[tokio::test]`s against `tauri::test`'s `MockRuntime`.
+serde_json = "1"
+
+# `native-render`'s content-stream interpreter is CPU-bound pixel/image-decode
+# work (path rasterization, JPEG/Flate decode, per-pixel colour-space
+# conversion) -- at opt-level 0 (plain `cargo build`/`cargo run`'s default)
+# this runs roughly an order of magnitude slower than optimized, since none
+# of that numeric code gets vectorized/inlined. A real page with a couple of
+# megapixel-scale embedded images has been measured at ~30x slower to render
+# at opt-level 0 than at opt-level 3 for the exact same content. `opt-level 2`
+# keeps `debug-assertions`/`overflow-checks` on (still a real debug build,
+# still fast to iterate on/compile) while making a plain `cargo run --bin
+# rust-pdf-gui` usable without every user needing to remember `--release`.
+[profile.dev]
+opt-level = 2

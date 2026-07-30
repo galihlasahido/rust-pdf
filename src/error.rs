@@ -53,6 +53,23 @@ pub enum PdfError {
     /// Error during form field operations.
     #[error("Form error: {0}")]
     Form(#[from] FormError),
+
+    /// Error during page rasterization/rendering.
+    #[cfg(feature = "render")]
+    #[error("Render error: {0}")]
+    Render(#[from] RenderError),
+
+    /// Error during in-place document editing (content-stream edits, page
+    /// tree surgery, incremental or full-rewrite save).
+    #[cfg(feature = "parser")]
+    #[error("Editor error: {0}")]
+    Editor(#[from] EditorError),
+
+    /// Error during embedded TrueType/OpenType font loading, subsetting, or
+    /// CID/Type0 composite font construction.
+    #[cfg(feature = "fonts")]
+    #[error("Font error: {0}")]
+    Font(#[from] FontError),
 }
 
 /// Errors related to PDF object handling.
@@ -205,6 +222,32 @@ pub enum ParserError {
     #[error("Encrypted PDF requires password")]
     EncryptedPdf,
 
+    /// A password *was* supplied to open an encrypted PDF (see
+    /// [`crate::parser::PdfReader::from_bytes_with_password`]/
+    /// [`crate::parser::PdfReader::from_file_with_password`]), but it did
+    /// not match: the recovered file encryption key failed the
+    /// standard-security-handler validation check (ISO 32000-1 7.6.3.4
+    /// Algorithm 3.6 for AES-128/R4, ISO 32000-2 Algorithm 2.B for
+    /// AES-256/R6). Kept distinct from [`ParserError::EncryptedPdf`] (no
+    /// password supplied at all) so a caller can tell "prompt for a
+    /// password" apart from "that password was wrong, prompt again".
+    #[cfg(feature = "encryption")]
+    #[error("incorrect password for encrypted PDF")]
+    IncorrectPassword,
+
+    /// The document's `/Encrypt` dictionary uses a `/Filter`, `/V`, `/R`,
+    /// or crypt filter method (`/CFM`) this crate's decryptor does not
+    /// implement. Only AES-128 (`/V 4 /R 4`, `/CFM /AESV2`) and AES-256
+    /// (`/V 5 /R 6`, `/CFM /AESV3`) -- the same two algorithms
+    /// [`crate::editor::EditableDocument::save_encrypted_to_bytes`] can
+    /// produce -- are supported. Anything else (legacy RC4, `/V 1`/`/V 2`,
+    /// a non-`Standard` security handler, ...) fails closed with this
+    /// distinct error rather than being silently mis-decrypted into
+    /// garbage.
+    #[cfg(feature = "encryption")]
+    #[error("unsupported encryption scheme: {0}")]
+    UnsupportedEncryption(String),
+
     /// Invalid cross-reference stream.
     #[error("Invalid cross-reference stream")]
     InvalidXrefStream,
@@ -213,6 +256,110 @@ pub enum ParserError {
     #[cfg(feature = "compression")]
     #[error("Decompression failed: {0}")]
     Decompression(#[from] CompressionError),
+}
+
+/// Errors related to editing an already-loaded document
+/// ([`crate::editor::EditableDocument`]): content-stream rewriting, page
+/// tree surgery (insert/delete/move/rotate/split/merge) and incremental /
+/// full-rewrite saving.
+#[cfg(feature = "parser")]
+#[derive(Debug, Error)]
+pub enum EditorError {
+    /// The document's trailer `/Root` does not resolve to a dictionary,
+    /// or that dictionary has no usable `/Pages` entry (ISO 32000-1
+    /// 7.7.2, Table 28).
+    #[error("document catalog is missing or malformed (no usable /Pages)")]
+    MissingCatalog,
+
+    /// The page tree could not be walked: a node was neither a `/Pages`
+    /// node (has `/Kids`) nor a `/Page` leaf, or referenced an object
+    /// that does not resolve to a dictionary (ISO 32000-1 7.7.3).
+    #[error("malformed page tree: {0}")]
+    MalformedPageTree(String),
+
+    /// Page tree recursion/fan-out exceeded the safety bound while
+    /// walking a (possibly adversarial/corrupt) `/Kids` structure.
+    #[error("page tree exceeds the maximum supported depth/size ({0})")]
+    PageTreeTooLarge(&'static str),
+
+    /// `index` was out of range for the document's current page count.
+    #[error("page index {index} out of range (document has {count} pages)")]
+    InvalidPageIndex {
+        /// The requested zero-based page index.
+        index: usize,
+        /// The document's actual page count.
+        count: usize,
+    },
+
+    /// A content stream (or the reachable-object graph during a
+    /// full-rewrite save) exceeded a sanity size bound, most likely
+    /// because of a corrupt or adversarial `/Length`/`/Kids`/`/Count`
+    /// value in the source file.
+    #[error("{0}")]
+    ResourceLimitExceeded(String),
+
+    /// Incremental save requires the byte offset of the base file's
+    /// existing final cross-reference section (to populate `/Prev`), but
+    /// it could not be located.
+    #[error("could not locate base file's startxref offset for incremental save")]
+    MissingBaseXref,
+
+    /// A referenced indirect object could not be resolved (dangling
+    /// reference, or object not present in this document's object
+    /// space).
+    #[error("object {0} {1} R could not be resolved")]
+    UnresolvedObject(u32, u16),
+
+    /// A caller-supplied argument was rejected (e.g. a rotation not a
+    /// multiple of 90 degrees, ISO 32000-1 Table 30).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// No AcroForm field (ISO 32000-1 12.7.3) with the given fully
+    /// qualified name (12.7.3.2) exists in the document.
+    #[error("no form field named {0:?}")]
+    FieldNotFound(String),
+
+    /// A form field exists but is not of the type the operation requires
+    /// (e.g. calling a checkbox setter on a text field).
+    #[error("form field {name:?} is not a {expected} field")]
+    WrongFieldType {
+        /// The fully qualified field name.
+        name: String,
+        /// The field type the operation required (e.g. "text", "checkbox").
+        expected: &'static str,
+    },
+
+    /// A new form field was requested with a name that already identifies
+    /// an existing field (ISO 32000-1 12.7.3.2 requires field names be
+    /// unique among siblings; this crate requires full-document
+    /// uniqueness, which is always sufficient and simpler to reason
+    /// about).
+    #[error("a form field named {0:?} already exists")]
+    DuplicateFieldName(String),
+
+    /// No outline (bookmark) item with the given object id exists.
+    #[error("no outline item {0} {1} R in the document")]
+    OutlineItemNotFound(u32, u16),
+
+    /// No annotation with the given object id exists on the expected page.
+    #[error("no annotation {0} {1} R found")]
+    AnnotationNotFound(u32, u16),
+
+    /// [`crate::editor::EditableDocument::save_incremental`] (or
+    /// `save_incremental_to_bytes`) was called after a `redact_*`/
+    /// `strip_document_metadata` call this session. An incremental
+    /// update only *appends* bytes (ISO 32000-1 7.5.6), so the
+    /// pre-redaction content those calls removed from the object graph
+    /// would still be fully recoverable in the file's earlier bytes -
+    /// exactly the "hidden revision" problem redaction must not
+    /// reintroduce. Use `save_full_rewrite`/`save_full_rewrite_to_bytes`
+    /// instead.
+    #[error(
+        "cannot save incrementally after redaction: the pre-redaction content would remain \
+         recoverable in the file's earlier bytes; use save_full_rewrite/save_full_rewrite_to_bytes instead"
+    )]
+    RedactionRequiresFullRewrite,
 }
 
 /// Errors related to PDF encryption.
@@ -283,6 +430,12 @@ pub enum SignatureError {
     /// PKCS#7 encoding error.
     #[error("PKCS#7 encoding error: {0}")]
     Pkcs7Error(String),
+
+    /// RFC 3161 timestamp request/response error (malformed request,
+    /// malformed/untrusted TSA response, or a transport error surfaced by
+    /// the caller-supplied [`crate::signatures::TimestampAuthorityClient`]).
+    #[error("Timestamp error: {0}")]
+    TimestampError(String),
 }
 
 /// Errors related to form fields.
@@ -307,6 +460,141 @@ pub enum FormError {
     /// Invalid option index.
     #[error("Invalid option index: {0}")]
     InvalidOptionIndex(usize),
+}
+
+/// Errors related to page rasterization via this crate's pure-Rust
+/// rendering pipeline (`render` feature: [`crate::render::PdfRenderer`],
+/// built on [`crate::editor::EditableDocument`] for document structure and
+/// [`crate::render::native`] for content-stream interpretation/
+/// rasterization).
+///
+/// See the [`crate::render`] module documentation for this backend's
+/// explicitly-documented scope and gaps (this type intentionally does not
+/// wrap a third-party FFI error type -- there is no native/FFI dependency
+/// anywhere in this rendering pipeline).
+#[cfg(feature = "render")]
+#[derive(Debug, Error)]
+pub enum RenderError {
+    /// Failed to load/parse the document's structure (corrupt file,
+    /// unsupported/malformed cross-reference table, missing catalog,
+    /// truncated data, etc). See [`crate::error::PdfError`]'s `Display`
+    /// for the underlying cause.
+    #[error("failed to open PDF document: {0}")]
+    DocumentLoad(#[source] Box<PdfError>),
+
+    /// The document is encrypted (ISO 32000-1 §7.6) and
+    /// [`crate::render::PdfRenderer::open_bytes`]/[`crate::render::PdfRenderer::open_file`]
+    /// (the no-password entry points) were used, which -- like
+    /// [`crate::parser::PdfReader::from_bytes`]/[`crate::parser::PdfReader::from_file`]
+    /// underneath them -- reject *any* encrypted document outright,
+    /// regardless of whether a correct password even exists, simply
+    /// because no password was offered.
+    ///
+    /// This crate's pure-Rust parser does now implement AES-128 (`/V 4
+    /// /R 4`) and AES-256 (`/V 5 /R 6`) decryption -- the same two
+    /// algorithms [`crate::editor::EditableDocument::save_encrypted_to_bytes`]
+    /// can itself produce -- via
+    /// [`crate::render::PdfRenderer::open_bytes_with_password`]/
+    /// [`crate::render::PdfRenderer::open_file_with_password`]
+    /// (`encryption` feature); use one of those instead to actually supply
+    /// a password. A wrong password there, or an encryption scheme this
+    /// crate doesn't implement (legacy RC4, `/V 1`/`/V 2`, ...), surfaces
+    /// as [`RenderError::DocumentLoad`] (wrapping
+    /// [`crate::error::ParserError::IncorrectPassword`]/
+    /// [`crate::error::ParserError::UnsupportedEncryption`] respectively),
+    /// not this variant.
+    #[error(
+        "document is encrypted; call PdfRenderer::open_bytes_with_password/open_file_with_password \
+         with a password instead"
+    )]
+    PasswordRequired,
+
+    /// `page_index` was out of range for the document's page count.
+    #[error("page index {index} out of range (document has {page_count} pages)")]
+    InvalidPageIndex {
+        /// The requested zero-based page index.
+        index: usize,
+        /// The document's actual page count.
+        page_count: usize,
+    },
+
+    /// The native content-stream interpreter reported a hard failure while
+    /// rendering a specific page (see
+    /// [`crate::render::native::NativeRenderError`] for the exhaustive list
+    /// -- all structurally-impossible-request cases, never a panic).
+    #[error("failed to render page {page_index}: {source}")]
+    PageRender {
+        /// The zero-based page index that failed to render.
+        page_index: usize,
+        /// Underlying interpreter error.
+        #[source]
+        source: crate::render::native::NativeRenderError,
+    },
+
+    /// The requested output raster would exceed the configured maximum
+    /// pixel budget. This guards against unbounded allocation driven by a
+    /// (possibly adversarial) page `/MediaBox` combined with caller-supplied
+    /// DPI -- untrusted-input input sizes must be bounds-checked before
+    /// allocating, per this crate's mandatory rules.
+    #[error(
+        "requested render of {width}x{height} px ({pixels} px total) exceeds the \
+         maximum of {max_pixels} px; lower the DPI or request a smaller viewport"
+    )]
+    OutputTooLarge {
+        /// Requested output width in pixels.
+        width: u32,
+        /// Requested output height in pixels.
+        height: u32,
+        /// `width * height` as `u64` (computed with widening to avoid overflow).
+        pixels: u64,
+        /// The configured maximum number of pixels per render call.
+        max_pixels: u64,
+    },
+
+    /// The requested viewport (tile) rectangle is not fully contained
+    /// within the full-page raster it would be cropped from.
+    #[error(
+        "viewport at ({x},{y}) of size {width}x{height} is out of bounds for a \
+         page rendered at {page_width}x{page_height} px"
+    )]
+    ViewportOutOfBounds {
+        /// Requested viewport left offset, in device pixels.
+        x: u32,
+        /// Requested viewport top offset, in device pixels.
+        y: u32,
+        /// Requested viewport width, in device pixels.
+        width: u32,
+        /// Requested viewport height, in device pixels.
+        height: u32,
+        /// Full-page raster width, in device pixels, at the requested DPI.
+        page_width: u32,
+        /// Full-page raster height, in device pixels, at the requested DPI.
+        page_height: u32,
+    },
+
+    /// The requested viewport had a zero width or height.
+    #[error("viewport width and height must both be greater than zero")]
+    EmptyViewport,
+
+    /// `dpi` was not a finite, positive number.
+    #[error("invalid DPI value: {0} (must be finite and > 0)")]
+    InvalidDpi(f32),
+}
+
+/// Errors related to embedded TrueType/OpenType font loading, subsetting,
+/// and CID/Type0 composite font construction (`fonts` feature). See
+/// [`crate::font::truetype`], [`crate::font::subset`], and
+/// [`crate::font::cid`].
+#[cfg(feature = "fonts")]
+#[derive(Debug, Error)]
+pub enum FontError {
+    /// Failed to load/validate a TrueType/OpenType font program.
+    #[error("failed to load font: {0}")]
+    Load(#[from] crate::font::truetype::FontLoadError),
+
+    /// Failed to subset a font program to its used glyphs.
+    #[error("failed to subset font: {0}")]
+    Subset(#[from] crate::font::subset::SubsetError),
 }
 
 /// A specialized Result type for PDF operations.

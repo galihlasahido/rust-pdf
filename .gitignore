@@ -27,6 +27,12 @@ target/
 *.so
 *.dll
 
+# Rendered raster output produced by tests/render_tests.rs for manual
+# visual inspection (PNG files, potentially large).
+/tests/output/render/
+
 # Test generated files are in tests/output/ and already ignored by /tests/output/*.pdf
 # PEM files in tests/output/
 /tests/output/*.pem
+/rust-pdf-implementation-prompts.md
+/rust-pdf-workflow.js
