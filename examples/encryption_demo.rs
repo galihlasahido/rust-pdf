@@ -1,7 +1,8 @@
 //! Demonstrates AES-256 password protection on a document this crate
-//! creates (README.md's "Password protection" quick start). Note this is
-//! write-only: this crate has no code path to *open* an existing
-//! encrypted PDF (see README.md's "Known limitations").
+//! creates (README.md's "Password protection" quick start). See
+//! `open_encrypted_pdf_demo.rs` for reopening the encrypted output with
+//! `EditableDocument::from_bytes_with_password` (`parser encryption`
+//! features).
 //!
 //! Run with:
 //! ```text
@@ -23,7 +24,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             EncryptionConfig::aes256()
                 .user_password("user123")
                 .owner_password("owner456")
-                .permissions(Permissions::default().allow_printing(true).allow_copying(false)),
+                .permissions(
+                    Permissions::default()
+                        .allow_printing(true)
+                        .allow_copying(false),
+                ),
         )
         .page(page)
         .build()?;

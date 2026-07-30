@@ -46,14 +46,22 @@ PDF/font/ICC-profile can do, and what mitigates it), see
   `apply_edit`, `save_document`, `fill_form`, `add_annotation`,
   `sign_document`) on a shared worker-thread pool, with structured
   (never-panicking) errors and progress events.
-- **Not** a general-purpose arbitrary-PDF consumer: reading an
-  **encrypted** PDF is not supported anywhere in the read/render/edit
-  path (`ParserError::EncryptedPdf`/`RenderError::PasswordRequired`
-  unconditionally) — the `encryption` feature is write-only (it produces
-  encrypted output for documents this crate creates, it does not open
-  password-protected input). `html` and `office` are Cargo features that
-  exist in `Cargo.toml` but have **no corresponding module** — declared,
-  aspirational surface area, not implemented functionality.
+- **Not** a general-purpose arbitrary-PDF consumer: an **encrypted** PDF
+  can only be opened if it uses one of the two algorithms this crate's own
+  `EditableDocument::save_encrypted_to_bytes` can itself produce — AES-128
+  (`/V 4 /R 4`) or AES-256 (`/V 5 /R 6`) — via the `_with_password` entry
+  points (`PdfReader::from_file_with_password`,
+  `EditableDocument::open_with_password`,
+  `PdfRenderer::open_file_with_password`, and their `_bytes` counterparts;
+  `encryption` feature). Anything else (legacy RC4, `/V 1`/`/V 2`, a
+  non-`Standard` security handler) still fails closed with
+  `ParserError::UnsupportedEncryption` rather than a silent mis-decrypt,
+  and the plain no-password entry points (`PdfReader::from_file`, etc.)
+  still reject *any* encrypted document outright with
+  `ParserError::EncryptedPdf`/`RenderError::PasswordRequired`. `html` and
+  `office` are Cargo features that exist in `Cargo.toml` but have **no
+  corresponding module** — declared, aspirational surface area, not
+  implemented functionality.
 
 ## Features
 
@@ -68,9 +76,11 @@ PDF/font/ICC-profile can do, and what mitigates it), see
   handful of pages does not pull the whole file into process memory
   (measured: see `tests/large_file_rss_bench.rs`).
 - **Editing an existing PDF** (`editor::EditableDocument`) — insert/
-  delete/move/rotate/extract pages, append documents, byte-level content
-  replace, incremental save (ISO 32000-1 §7.5.6, appends only the delta)
-  or full rewrite with compacted/compressed object streams.
+  delete/move/rotate/extract pages, append (merge) documents — including
+  importing the source document's bookmark/outline tree, with page
+  destinations remapped to land correctly — byte-level content replace,
+  incremental save (ISO 32000-1 §7.5.6, appends only the delta) or full
+  rewrite with compacted/compressed object streams.
 - **Redaction** — permanently removes text runs and images intersecting a
   page area (or a literal text needle) from the object graph — not just a
   visual overlay — prunes now-unused `/ToUnicode` entries, and records an
@@ -97,11 +107,20 @@ PDF/font/ICC-profile can do, and what mitigates it), see
 - **Rendering** — rasterize a page to an `image::RgbaImage` at any DPI,
   full-page or a device-pixel tile/viewport (for zoom/pan), plus cached
   thumbnails. 100% pure Rust, no native binary/FFI at all.
-- **Encryption** — AES-256 password protection with permission flags,
-  for documents this crate creates (write-only, see above).
-- **Digital signatures** — sign with X.509 certificates (RSA/ECDSA),
-  verify signatures, incremental (add-a-signature-without-invalidating-
-  earlier-ones) signing, PAdES timestamping.
+- **Encryption** — AES-128/256 password protection with permission flags
+  for documents this crate creates, and opening those same two schemes
+  back up given the password (see "Not a general-purpose arbitrary-PDF
+  consumer" above for the exact scope).
+- **Digital signatures** — sign with X.509 certificates, RSA or ECDSA
+  (P-256/P-384/P-521); verify signatures (including certificate chain
+  validation and certification-signature/DocMDP level); incremental
+  (add-a-signature-without-invalidating-earlier-ones) signing; PAdES
+  B/B-T/B-LT/B-LTA levels (timestamping, a Document Security Store for
+  revocation material, and archive timestamps); OCSP/CRL request-building
+  and response-parsing (network transport is caller-supplied — this crate
+  does no I/O of its own); DocMDP certification signatures (permission
+  levels 1-3); signing via a `RemoteSigner` trait for HSM/KMS-backed keys
+  that never have to enter this process.
 - **Tauri integration** — an async command layer wired directly to
   `tauri::generate_handler!`, backed by a plain worker-thread pool (no
   native-library-driven "actor" thread needed, since the renderer itself
@@ -123,7 +142,8 @@ list. The headline ones:
 | JBIG2 / JPX (JPEG2000) images | No pure-Rust decoder exists for either; the renderer paints a documented mid-grey placeholder and records a warning — never a crash or silent blank. |
 | Type1 / bare (unwrapped) CFF font programs | `ttf-parser` cannot parse these; no glyph ink is painted for that font (text position still advances correctly), with a recorded warning. Real `sfnt`/OpenType containers with CFF-flavored outlines *are* supported — only bare/unwrapped Type1/CFF is affected. |
 | ICC color management | `ICCBased` color spaces are approximated (resolved to `/Alternate` or guessed from `/N`), not truly color-managed; `Lab` is unsupported. Every use records a warning. |
-| Encrypted PDFs | Cannot be opened for reading, editing, or rendering at all — no password path exists anywhere in the read pipeline. |
+| Encrypted PDFs | Only AES-128 (`/V 4 /R 4`) and AES-256 (`/V 5 /R 6`) can be opened, via the `_with_password` entry points and a correct password. Legacy RC4/`/V 1`/`/V 2`/non-`Standard` handlers still fail closed (`ParserError::UnsupportedEncryption`), and the plain no-password entry points still reject any encrypted document outright. |
+| OCSP/CRL revocation checking | This crate builds OCSP requests and parses OCSP/CRL responses, but does no network I/O itself — fetching from a responder/distribution-point URL is the caller's responsibility (inject a transport implementing `OcspTransport`/`CrlTransport`). |
 | Patterns / shadings | Not painted; selecting a Pattern color space leaves the current color unchanged and records a warning. |
 | Tiled rendering | Still rasterizes the whole page internally before cropping the requested tile, so memory use is bounded by full-page size, not tile size. |
 
@@ -169,8 +189,8 @@ rendering/crypto). Enable what you need:
 | `compression` | Flate/zlib stream compression | `flate2` |
 | `images` | JPEG/PNG image embedding | `image` |
 | `parser` | Read existing PDFs (`PdfReader`), memory-mapped for large files, plus the `editor::EditableDocument` in-place editing API | `nom`, `memmap2`, `jpeg-decoder` |
-| `encryption` | AES-256 password protection (write-only, see "Known limitations") | `aes`, `cbc`, `sha2`, `md-5`, `rand`, `zeroize` |
-| `signatures` | Digital signatures (RSA/ECDSA), verification, PAdES timestamping | `cms`, `x509-cert`, `rsa`, `p256`, `ecdsa`, `der`, `spki` (pulls in `encryption`) |
+| `encryption` | AES-128/256 password protection: produce encrypted output, and open AES-128/256-encrypted input given a password (see "Known limitations" for exact scope) | `aes`, `cbc`, `sha2`, `md-5`, `rand`, `zeroize` |
+| `signatures` | Digital signatures (RSA/ECDSA P-256/P-384/P-521), verification, PAdES B/B-T/B-LT/B-LTA, OCSP/CRL codecs, DocMDP certification, `RemoteSigner` (HSM/KMS) | `cms`, `x509-cert`, `rsa`, `p256`, `p384`, `p521`, `ecdsa`, `der`, `spki` (pulls in `encryption`) |
 | `fonts` | Embedded TrueType/OpenType fonts, Type 0/CID composite fonts (CJK), subsetting | `ttf-parser`, `subsetter` |
 | `native-render` | Content-stream interpreter + 2D rasterizer, single content stream in (no document/page-tree access of its own) | `tiny-skia`, `ttf-parser` (pulls in `parser`, `fonts`) |
 | `render` | Whole-document page rasterization (`render::PdfRenderer`): resolves the page tree/`/MediaBox`/`/Resources` via this crate's own parser/editor, then rasterizes via `native-render` | `native-render` + `images` |
@@ -265,6 +285,35 @@ doc.save_full_rewrite("edited_report.pdf")?;
 let renderer = rust_pdf::render::PdfRenderer::open_file("edited_report.pdf")?;
 let image = renderer.render_page(0, 150.0, None)?;
 image.save("edited_report_page0.png")?;
+```
+
+### Merging documents
+
+Requires `features = ["parser"]`. `append_document` imports the source
+document's bookmark/outline tree too, not just its pages — destinations
+are remapped to point at where those pages actually land. Full, run
+source at
+[`examples/merge_documents_demo.rs`](examples/merge_documents_demo.rs)
+(verified with `cargo run --features parser --example merge_documents_demo`):
+
+```rust
+use rust_pdf::editor::Destination;
+use rust_pdf::prelude::*;
+
+let mut report = EditableDocument::from_bytes(report_pdf_bytes)?;
+report.add_bookmark(None, "Q1 Report", Destination::fit(0))?;
+
+let mut appendix = EditableDocument::from_bytes(appendix_pdf_bytes)?;
+appendix.add_bookmark(None, "Appendix A", Destination::fit(0))?;
+
+report.append_document(&appendix)?;
+
+assert_eq!(report.page_count()?, 2);
+let bookmarks = report.list_bookmarks()?;
+assert_eq!(bookmarks[0].title, "Q1 Report");
+assert_eq!(bookmarks[1].title, "Appendix A"); // imported, page remapped to 1
+
+report.save_full_rewrite("merged_report.pdf")?;
 ```
 
 ### Forms: fill and flatten
@@ -379,8 +428,7 @@ for. Using an embedded (`fonts`-feature) font instead avoids this.
 
 Requires `features = ["encryption"]`. Full, run source at
 [`examples/encryption_demo.rs`](examples/encryption_demo.rs) (verified with
-`cargo run --features encryption --example encryption_demo`). Write-only,
-see "Known limitations":
+`cargo run --features encryption --example encryption_demo`):
 
 ```rust
 use rust_pdf::prelude::*;
@@ -404,6 +452,34 @@ let doc = DocumentBuilder::new()
     .page(page)
     .build()?;
 ```
+
+### Opening password-protected PDFs
+
+Requires `features = ["parser", "encryption"]`. Scoped to exactly the two
+algorithms `EncryptionConfig` above can itself produce — AES-128 (`/V 4
+/R 4`) and AES-256 (`/V 5 /R 6`); anything else fails closed with
+`ParserError::UnsupportedEncryption`, a wrong password with
+`ParserError::IncorrectPassword`. Full, run source at
+[`examples/open_encrypted_pdf_demo.rs`](examples/open_encrypted_pdf_demo.rs)
+(verified with `cargo run --features "parser encryption" --example open_encrypted_pdf_demo`):
+
+```rust
+use rust_pdf::prelude::*;
+
+// The plain no-password entry point still refuses an encrypted document
+// outright, regardless of whether a correct password even exists.
+let err = EditableDocument::from_bytes(encrypted_bytes.clone()).err().unwrap();
+assert!(matches!(err, PdfError::Parser(rust_pdf::error::ParserError::EncryptedPdf)));
+
+// The `_with_password` entry points actually try to decrypt.
+let doc = EditableDocument::from_bytes_with_password(encrypted_bytes, "user123")?;
+let text = doc.extract_page_text(doc.page_id_at(0)?)?;
+assert!(text.contains("Confidential"));
+```
+
+`render::PdfRenderer::open_file_with_password`/`open_bytes_with_password`
+and `parser::PdfReader::from_file_with_password`/`from_bytes_with_password`
+offer the same contract at their respective layers.
 
 ### Digital signatures
 
@@ -436,6 +512,72 @@ let signed_pdf = DocumentSigner::new(doc)
 
 std::fs::write("signed.pdf", signed_pdf)?;
 ```
+
+### Advanced signing: ECDSA curves, DocMDP certification, remote/HSM signing
+
+Requires `features = ["signatures"]`. Full, run source at
+[`examples/advanced_signatures_demo.rs`](examples/advanced_signatures_demo.rs)
+(verified with `cargo run --features signatures --example advanced_signatures_demo`):
+
+```rust
+use rust_pdf::signatures::{
+    Certificate, CertificationLevel, IncrementalSigner, PrivateKey, RemoteSigner,
+    SignatureAlgorithm, SignatureConfig, SignatureResult, SignatureVerifier,
+};
+
+// ECDSA beyond the default P-256 curve: EcdsaP384Sha384/EcdsaP521Sha512
+// are picked the same way as any other SignatureAlgorithm.
+let signed = IncrementalSigner::new(pdf_bytes)
+    .certificate(cert)
+    .private_key(key)
+    .algorithm(SignatureAlgorithm::EcdsaP384Sha384)
+    .sign()?;
+
+// DocMDP certification signature (ISO 32000-1 12.8.2.2): only valid as
+// the document's first signature; level maps to /P = 1/2/3.
+let config = SignatureConfig::new()
+    .algorithm(SignatureAlgorithm::RsaSha256)
+    .certify(CertificationLevel::FormFillingAnnotationsAndSigning);
+let certified = IncrementalSigner::new(pdf_bytes)
+    .certificate(cert)
+    .private_key(key)
+    .config(config)
+    .sign()?;
+let results = SignatureVerifier::new(certified).verify()?;
+assert_eq!(
+    results[0].certification_level,
+    Some(CertificationLevel::FormFillingAnnotationsAndSigning)
+);
+
+// Signing via an HSM/KMS: implement `RemoteSigner` instead of loading a
+// `PrivateKey` into this process at all -- `sign_digest` is where a real
+// integration calls out to the remote service.
+#[derive(Debug)]
+struct MyRemoteSigner { /* ... */ }
+impl RemoteSigner for MyRemoteSigner {
+    fn sign_digest(&self, digest: &[u8], algorithm: SignatureAlgorithm) -> SignatureResult<Vec<u8>> {
+        todo!("call out to your HSM/KMS with `digest`")
+    }
+    fn certificate(&self) -> &Certificate {
+        todo!("the certificate corresponding to the remote key")
+    }
+}
+let signed = IncrementalSigner::new(pdf_bytes)
+    .remote_signer(std::sync::Arc::new(MyRemoteSigner { /* ... */ }))
+    .algorithm(SignatureAlgorithm::RsaSha256)
+    .sign()?;
+```
+
+OCSP/CRL revocation-material request-building and response-parsing
+(`signatures::{build_ocsp_request, parse_ocsp_response, parse_crl,
+is_certificate_revoked}`) and PAdES B-LTA archive timestamps
+(`signatures::embed_document_timestamp`) round out revocation/long-term
+validation — see those functions' own doc comments for the exact codec
+API, and
+[`tests/pades_lta_tests.rs`](tests/pades_lta_tests.rs)/[`tests/remote_signer_tests.rs`](tests/remote_signer_tests.rs)
+for complete, fully-offline-simulated end-to-end tests (an in-process
+fake TSA/OCSP responder rather than live network calls, since this crate
+does no network I/O of its own — see "Known limitations").
 
 ### Tauri desktop-app integration
 
@@ -563,7 +705,7 @@ let custom = PageBuilder::custom(400.0, 600.0); // points, 72pt = 1 inch
 ## Running Tests
 
 ```bash
-# Run everything (721+ unit tests plus integration suites)
+# Run everything (850+ unit tests plus integration suites)
 cargo test --all-features
 
 # Feature-scoped
@@ -636,7 +778,10 @@ Runnable, `cargo run`-verified examples in [`examples/`](examples/):
 | `pdfa_quickstart_demo` | `parser` | Minimal PDF/A-2b conversion + validation |
 | `pdfa_convert_demo` | `full` | Fuller PDF/A-1b/2b/3b + PDF/UA-1 + PDF/X sample generation for external (veraPDF) validation |
 | `digital_signature_example` | `signatures` | Signing with a certificate/private key, single and multi-signature |
-| `encryption_demo` | `encryption` | AES-256 password protection |
+| `advanced_signatures_demo` | `signatures` | ECDSA P-384 signing, DocMDP certification signatures, signing via the `RemoteSigner` trait |
+| `encryption_demo` | `encryption` | AES-128/256 password protection |
+| `open_encrypted_pdf_demo` | `parser encryption` | Reopening an AES-encrypted PDF with the correct/wrong/no password |
+| `merge_documents_demo` | `parser` | `append_document` merging pages and importing the source's bookmark tree, page destinations remapped |
 | `read_existing_pdf_demo` | `parser` | Read-only `PdfReader` API (page count, version, trailer, catalog) |
 | `redaction_example` | `full` | Permanent redaction (`apply_redaction` + full-rewrite) proven by checking raw AND decoded bytes are gone, plus reading back the audit trail |
 | `annotations_and_structure_example` | `full` | Six annotation kinds (highlight/underline/free-text/stamp/text/popup), a named-destination outline tree, and a tagged structure tree for PDF/UA, all re-verified by reopening the saved file |
